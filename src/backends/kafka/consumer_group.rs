@@ -2615,15 +2615,69 @@ mod tests {
         assert_eq!(faults.take_errors(), 1);
     }
 
-    /// A FIFO registration failure is recorded like any member exit: one
-    /// error, no flag, and the shutdown tally reads it.
-    #[test]
-    fn a_fifo_registration_failure_counts_one_error() {
-        let faults = MemberFaults::default();
-        faults.record(ordinary_error());
-        assert_eq!(faults.take_errors(), 1);
-        assert_eq!(faults.take_errors(), 0, "taken once");
-        assert!(!faults.is_fatal());
+    /// The FIFO spawner's registration-failure arm, driven through
+    /// `new_fifo`: a FIFO member whose options the shard spawner refuses ends
+    /// before any shard exists, and that exit reaches the shutdown tally as
+    /// one ordinary error. The refusal here is a commit interval, which a
+    /// FIFO consumer never reads; `spawn_fifo_shards` refuses it before it
+    /// contacts a broker, so the client is an offline one and nothing
+    /// connects. The registry's `register_fifo` refuses the interval earlier;
+    /// `new_fifo` does not, which is what lets this test reach the arm.
+    #[tokio::test]
+    async fn a_refused_fifo_registration_reaches_the_shutdown_tally() {
+        use serde::{Deserialize, Serialize};
+
+        use crate::define_sequenced_topic;
+        use crate::metadata::MessageMetadata;
+        use crate::outcome::Outcome;
+        use crate::topology::{SequenceFailure, TopologyBuilder};
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Entry {
+            key: String,
+        }
+
+        define_sequenced_topic!(
+            RefusedFifo,
+            Entry,
+            |msg| msg.key.clone(),
+            TopologyBuilder::new("fifo-refused-registration")
+                .sequenced(SequenceFailure::FailAll)
+                .hold_queue(Duration::from_millis(50))
+                .dlq()
+                .build()
+        );
+
+        struct AckAll;
+        impl MessageHandler<RefusedFifo> for AckAll {
+            type Context = ();
+            async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
+                Outcome::Ack
+            }
+        }
+
+        // Port 1 is never listening; the refusal returns before any I/O.
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        let mut group = KafkaConsumerGroup::new_fifo::<RefusedFifo, AckAll>(
+            "fifo-refused-registration",
+            client,
+            KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::from_secs(1)),
+            CancellationToken::new(),
+            || AckAll,
+            (),
+        );
+        group.start();
+        wait_until_no_member_is_alive(&group).await;
+
+        let tally = group.shutdown_with_tally().await;
+        assert_eq!(
+            tally.errors, 1,
+            "the refused registration is one member error in the tally"
+        );
+        assert_eq!(tally.panics, 0);
+        assert!(!group.faults.is_fatal(), "a refusal is an ordinary error");
     }
 
     /// The two error snapshots of `drain_into`: an error a member records
