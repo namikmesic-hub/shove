@@ -292,8 +292,33 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
                 .run_until_timeout_with_report(signal, drain_timeout)
                 .await;
         };
+        let client = self.client;
+        run_with_autoscaler(
+            self.inner,
+            move |registry, auto_token| B::spawn_autoscaler(&client, registry, config, auto_token),
+            signal,
+            drain_timeout,
+        )
+        .await
+    }
+}
 
-        let mut inner = self.inner;
+/// The autoscaling run behind [`ConsumerGroup::run_until_timeout_with_report`]:
+/// start `inner`, share it with the autoscaler task `spawn` starts, wait for
+/// `signal`, the registry's token or a member's fatal error, then stop the
+/// autoscaler and drain. Free of the backend so the fatal path can be driven
+/// with a stand-in autoscaler.
+pub(crate) async fn run_with_autoscaler<R, S>(
+    mut inner: R,
+    spawn: impl FnOnce(Arc<Mutex<R>>, CancellationToken) -> tokio::task::JoinHandle<()>,
+    signal: S,
+    drain_timeout: Duration,
+) -> RunReport
+where
+    R: RegistryImpl + 'static,
+    S: Future<Output = ()> + Send + 'static,
+{
+    {
         // Token we race the external signal against; cancelling it cascades to
         // consumers exactly as the non-autoscaling path's broker token does.
         let consumer_token = inner.cancellation_token();
@@ -311,8 +336,7 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // Dedicated token so we can stop the autoscaler *before* draining
         // consumers (ordering required by the shutdown contract).
         let auto_token = CancellationToken::new();
-        let handle =
-            B::spawn_autoscaler(&self.client, registry.clone(), config, auto_token.clone());
+        let handle = spawn(registry.clone(), auto_token.clone());
 
         // Wait for the external signal, an externally-triggered cancel, or a
         // member that ended with a fatal error.

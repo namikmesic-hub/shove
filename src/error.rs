@@ -65,12 +65,20 @@ pub enum ShoveError {
     /// ([`is_fatal`](Self::is_fatal)) and not retryable, so a consumer that
     /// reconnects on transient errors returns it instead.
     ///
-    /// The records behind the uncommitted positions are redelivered to the
-    /// next member of the group, which is at-least-once delivery made
-    /// visible. The error is not raised for a position the member never
-    /// tried to commit: an acknowledged offset on a partition a rebalance
-    /// revoked is dropped with the partition and redelivered by its new
-    /// owner, silently, as before.
+    /// The next member of the group resumes each partition from the last
+    /// position the broker accepted, which an earlier asynchronous commit
+    /// may have advanced past some of the records this commit covered; the
+    /// records from that position on are redelivered, which is at-least-once
+    /// delivery made visible. The error is not raised for a position the
+    /// member never tried to commit: an acknowledged offset on a partition a
+    /// rebalance revoked is dropped with the partition and redelivered by
+    /// its new owner, silently, as before.
+    ///
+    /// Why the result is surfaced at all: Apache Kafka's Java consumer also
+    /// commits synchronously inside `close()`, and only logs a failure, while
+    /// librdkafka's `rd_kafka_consumer_close` returns the error code. shove
+    /// follows librdkafka and returns it, because a process that gates its
+    /// restart on the exit code cannot read a log line.
     #[error(
         "final offset commit on '{topic}' did not land for {}: {kind}",
         format_offsets(offsets)
@@ -96,8 +104,9 @@ pub enum ShoveError {
 #[non_exhaustive]
 pub enum CommitFailure {
     /// The coordinator answered the commit with an error, carried as text.
-    /// Nothing landed. Also used, with a message that says so, when the
-    /// commit thread ended without reporting a result.
+    /// This commit did not land; the broker keeps the last position it
+    /// accepted. Also used, with a message that says so, when the commit
+    /// thread ended without reporting a result.
     ///
     /// The text is librdkafka's rendering of the broker's answer: the error
     /// code and its description, and nothing else. It never carries a
@@ -105,14 +114,16 @@ pub enum CommitFailure {
     /// identifier taken from one, so it is safe to log and to return as is.
     #[error("rejected: {0}")]
     Rejected(String),
-    /// The commit had no answer within the shutdown deadline it carries.
-    /// The result is unknown: the detached commit thread may still land it
-    /// after the consumer has returned.
-    #[error("no answer within the {0:?} shutdown deadline; the result is unknown")]
+    /// The commit had no answer within the time it carries: the shutdown
+    /// deadline, or the shorter time the loop waited when the owning run's
+    /// drain timed out first and ended the wait. The result is unknown: the
+    /// detached commit thread may still land it after the consumer has
+    /// returned.
+    #[error("no answer after waiting {0:?}; the result is unknown")]
     Deadline(Duration),
-    /// No thread could be spawned to run the commit, so nothing was
-    /// committed and the consumer's close moved off the runtime by itself.
-    #[error("no thread could be spawned for the commit; nothing was committed")]
+    /// No thread could be spawned to run the commit, so this commit was
+    /// never made and the consumer's close moved off the runtime by itself.
+    #[error("no thread could be spawned for the commit; this commit was never made")]
     NoThread,
 }
 
@@ -230,12 +241,12 @@ mod tests {
         };
         assert_eq!(
             deadline.to_string(),
-            "final offset commit on 'orders' did not land for [0@8]: no answer within the 20s \
-             shutdown deadline; the result is unknown"
+            "final offset commit on 'orders' did not land for [0@8]: no answer after waiting \
+             20s; the result is unknown"
         );
         assert_eq!(
             CommitFailure::NoThread.to_string(),
-            "no thread could be spawned for the commit; nothing was committed"
+            "no thread could be spawned for the commit; this commit was never made"
         );
     }
 

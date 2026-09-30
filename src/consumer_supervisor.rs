@@ -492,6 +492,48 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
 mod tests {
     use super::*;
 
+    /// The fatal channel keeps arrival order: a run takes the first error
+    /// through `next_fatal` and the rest through `drain_fatal`, in order.
+    #[tokio::test]
+    async fn fatal_errors_come_out_in_arrival_order() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut rx = Some(rx);
+        for name in ["first", "second", "third"] {
+            tx.send(ShoveError::Topology(name.into())).unwrap();
+        }
+        let first = next_fatal(&mut rx).await;
+        assert_eq!(first.to_string(), "topology error: first");
+        let mut rest = Vec::new();
+        drain_fatal(&mut rx, &mut rest);
+        let rest: Vec<String> = rest.iter().map(ToString::to_string).collect();
+        assert_eq!(rest, ["topology error: second", "topology error: third"]);
+    }
+
+    /// `next_fatal` never resolves without a channel, or on a channel whose
+    /// senders are gone: a run must not end with nothing to report.
+    #[tokio::test]
+    async fn next_fatal_stays_pending_without_a_channel_or_a_sender() {
+        use std::future::poll_fn;
+        use std::task::Poll;
+
+        let mut none = None;
+        let fut = next_fatal(&mut none);
+        let mut fut = std::pin::pin!(fut);
+        assert!(poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_pending())).await);
+
+        let (tx, rx) = mpsc::unbounded_channel::<ShoveError>();
+        drop(tx);
+        let mut closed = Some(rx);
+        {
+            let fut = next_fatal(&mut closed);
+            let mut fut = std::pin::pin!(fut);
+            assert!(poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_pending())).await);
+        }
+        let mut rest = Vec::new();
+        drain_fatal(&mut closed, &mut rest);
+        assert!(rest.is_empty());
+    }
+
     #[test]
     fn clean_outcome_has_exit_code_zero() {
         assert_eq!(SupervisorOutcome::default().exit_code(), 0);

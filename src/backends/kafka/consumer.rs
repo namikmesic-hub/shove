@@ -47,6 +47,8 @@ use crate::routing::{
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{HoldQueue, Kafka, ShoveError};
+
+use super::consumer_group::MemberFaults;
 // These four are only read back by `batch_consumer_options_tests` below, to
 // pin that `BatchConsumerOptions` (now a `pub type` alias of the generic
 // `BatchConsumerOptions<Kafka>`) still defaults to the same shared constants
@@ -2817,6 +2819,70 @@ pub(super) fn reject_fifo_commit_interval(queue: &str) -> ShoveError {
     ))
 }
 
+/// A final commit in flight, armed while the receive loop waits for its
+/// result.
+///
+/// The wait ends one of three ways. The thread answers, or the loop's own
+/// `SHUTDOWN_COMMIT_DEADLINE` passes: both settle through the shutdown arm,
+/// which disarms this guard. Or the loop's task is aborted, because the
+/// owning run's drain timed out before the commit answered: the abort drops
+/// the loop's future mid-wait, and with it this guard, which then records
+/// the commit as unresolved through the member's fault counters. The run's
+/// report so carries the commit with `CommitFailure::Deadline` and the time
+/// the loop waited, instead of a bare `timed_out` that hides it. Without a
+/// group's counters, on the direct and supervisor paths, the guard records
+/// nothing.
+struct PendingFinalCommit {
+    faults: Option<MemberFaults>,
+    topic: String,
+    offsets: Vec<(i32, i64)>,
+    started: Instant,
+    armed: bool,
+}
+
+impl PendingFinalCommit {
+    /// Armed only when there is a commit to lose: no offsets, no commit.
+    fn arm(faults: Option<MemberFaults>, topic: &str, offsets: &[(i32, i64)]) -> Self {
+        Self {
+            faults,
+            topic: topic.to_string(),
+            offsets: offsets.to_vec(),
+            started: Instant::now(),
+            armed: !offsets.is_empty(),
+        }
+    }
+
+    /// The result is in hand and the shutdown arm reports it; nothing is
+    /// left for the drop to say.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingFinalCommit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(faults) = self.faults.as_ref() else {
+            return;
+        };
+        let waited = self.started.elapsed();
+        tracing::error!(
+            queue = %self.topic,
+            ?waited,
+            offsets = ?self.offsets,
+            "the run's drain ended before the final offset commit answered; the member ends \
+             with ShoveError::Commit and the result unknown"
+        );
+        faults.record(ShoveError::Commit {
+            topic: std::mem::take(&mut self.topic),
+            offsets: std::mem::take(&mut self.offsets),
+            kind: CommitFailure::Deadline(waited),
+        });
+    }
+}
+
 /// Run the receive loop's final `CommitMode::Sync` commit, and the consumer's
 /// close, on a dedicated thread that owns the consumer, waiting at most
 /// `SHUTDOWN_COMMIT_DEADLINE` for the commit's result.
@@ -2937,8 +3003,8 @@ where
         tracing::error!(
             queue,
             error = %e,
-            "could not spawn the final commit thread; nothing commits, and the records behind \
-             the uncommitted positions are redelivered"
+            "could not spawn the final commit thread; this commit is never made, and redelivery \
+             starts from the last position the broker accepted"
         );
         close_off_runtime_or_leak(consumer, queue, spawn);
         return Err(CommitFailure::NoThread);
@@ -2958,8 +3024,8 @@ where
                 queue,
                 deadline = ?SHUTDOWN_COMMIT_DEADLINE,
                 "final offset commit did not finish within the shutdown deadline; \
-                 giving up on its result, the records behind the uncommitted positions may be \
-                 redelivered"
+                 giving up on its result, redelivery may start from the last position the \
+                 broker accepted"
             );
             Err(CommitFailure::Deadline(SHUTDOWN_COMMIT_DEADLINE))
         }
@@ -4303,6 +4369,7 @@ impl KafkaConsumer {
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
+        let member_faults = options.kafka_member_faults.clone();
         let max_retries = options.max_retries;
         let prefetch_count = options.prefetch_count.max(1);
         let handler_timeout = options.handler_timeout;
@@ -4363,6 +4430,7 @@ impl KafkaConsumer {
             let ctx = ctx.clone();
             let client = client.clone();
             let processing = processing.clone();
+            let member_faults = member_faults.clone();
             let shutdown = shutdown.clone();
             let group_id = group_id.clone();
             let semaphore = semaphore.clone();
@@ -4610,7 +4678,12 @@ impl KafkaConsumer {
                             // the runtime nor the process: `SHUTDOWN_COMMIT_DEADLINE`
                             // bounds how long this loop waits for its result, and
                             // past it the thread finishes on its own.
+                            // Armed across the wait: if the owning run's
+                            // drain aborts this task first, the guard reports
+                            // the commit as unresolved instead of losing it.
+                            let pending = PendingFinalCommit::arm(member_faults.clone(), queue, &offsets);
                             let committed = final_commit_off_runtime(consumer, tpl, queue).await;
+                            pending.disarm();
                             match committed {
                                 Ok(()) => {
                                     for discard in discards {
@@ -4645,9 +4718,9 @@ impl KafkaConsumer {
                                         queue,
                                         error = %kind,
                                         ?offsets,
-                                        "final offset commit failed during shutdown; the records behind \
-                                         these positions are redelivered, and the consumer ends with \
-                                         ShoveError::Commit"
+                                        "final offset commit failed during shutdown; redelivery starts \
+                                         from the last position the broker accepted, and the consumer \
+                                         ends with ShoveError::Commit"
                                     );
                                     return Err(ShoveError::Commit {
                                         topic: queue.to_string(),
@@ -9730,6 +9803,60 @@ mod final_commit_thread_tests {
         );
         // Let the thread finish; its late answer has nobody listening.
         let _ = release_tx.send(());
+    }
+
+    /// The guard for a final commit whose wait the owning run's drain aborts:
+    /// dropped while armed, it records the commit as unresolved through the
+    /// member's counters, with the time waited as the `Deadline`.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_final_commit_dropped_mid_wait_is_recorded_as_unresolved() {
+        let faults = MemberFaults::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        faults.attach_sink(tx);
+        let pending = PendingFinalCommit::arm(Some(faults.clone()), "orders", &[(0, 7), (2, 3)]);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        drop(pending);
+
+        assert!(
+            faults.is_fatal(),
+            "the unresolved commit is fatal like any other"
+        );
+        let Ok(ShoveError::Commit {
+            topic,
+            offsets,
+            kind: CommitFailure::Deadline(waited),
+        }) = rx.try_recv()
+        else {
+            panic!("the run's channel carries the unresolved commit");
+        };
+        assert_eq!(topic, "orders");
+        assert_eq!(offsets, vec![(0, 7), (2, 3)]);
+        assert_eq!(waited, Duration::from_secs(3), "the time the loop waited");
+    }
+
+    /// Disarmed once the result is in hand, the guard says nothing: the
+    /// shutdown arm reports that result itself.
+    #[tokio::test]
+    async fn a_disarmed_final_commit_guard_records_nothing() {
+        let faults = MemberFaults::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        faults.attach_sink(tx);
+        PendingFinalCommit::arm(Some(faults.clone()), "orders", &[(0, 7)]).disarm();
+        assert!(!faults.is_fatal());
+        assert!(rx.try_recv().is_err(), "nothing reported after a disarm");
+    }
+
+    /// With nothing to commit there is no commit to lose, and without a
+    /// group's counters there is nowhere to report: neither records.
+    #[tokio::test]
+    async fn a_final_commit_guard_with_nothing_to_report_records_nothing() {
+        let faults = MemberFaults::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        faults.attach_sink(tx);
+        drop(PendingFinalCommit::arm(Some(faults.clone()), "orders", &[]));
+        assert!(!faults.is_fatal());
+        assert!(rx.try_recv().is_err());
+        drop(PendingFinalCommit::arm(None, "orders", &[(0, 7)]));
     }
 
     /// The offsets `ShoveError::Commit` carries are the commit's positions in

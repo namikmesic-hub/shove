@@ -20,10 +20,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rdkafka::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::{DefaultProducerContext, FutureProducer, FutureRecord};
 use rdkafka::types::{RDKafkaApiKey, RDKafkaRespErr};
+use rdkafka::{ClientConfig, Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 use shove::broker::Broker;
 use shove::consumer_group::ConsumerGroupConfig;
@@ -37,6 +38,8 @@ use shove::{CommitFailure, ConsumerGroup, RunReport, ShoveError};
 use tokio::time::Instant;
 
 const TOPIC: &str = "kafka-final-commit-mock";
+/// The group the topic's default configuration joins: `{queue}-consumer`.
+const GROUP_ID: &str = "kafka-final-commit-mock-consumer";
 /// Markers that must never appear in the error a failed commit reports.
 const KEY_MARKER: &str = "record-key-marker-7f3a";
 const PAYLOAD_MARKER: &str = "record-payload-marker-2c9e";
@@ -48,6 +51,9 @@ const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 /// How long the run may take past the shutdown deadline before the test
 /// gives up on it.
 const DEADLINE_MARGIN: Duration = Duration::from_secs(20);
+/// A drain timeout wide enough that the loop's own commit deadline, not the
+/// drain, ends a commit that never answers.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Order {
@@ -150,28 +156,76 @@ async fn produce_marked_record(bootstrap: &str) {
         .expect("produce to the mock cluster");
 }
 
-/// Runs the group with the report, delivers the marked record, applies
-/// `before_stop` to the mock cluster, stops the run and returns the report
-/// with how long the stop took.
+/// The group's committed position on the topic's one partition, read
+/// through a raw consumer that never joins the group. `None` before the
+/// first accepted commit.
+async fn committed_position(bootstrap: &str) -> Option<i64> {
+    let bootstrap = bootstrap.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let probe: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap)
+            .set("group.id", GROUP_ID)
+            .create()
+            .expect("probe consumer");
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition(TOPIC, 0);
+        let committed = probe
+            .committed_offsets(tpl, Duration::from_secs(5))
+            .expect("read the committed offsets");
+        committed
+            .elements()
+            .iter()
+            .find(|e| e.partition() == 0)
+            .and_then(|e| match e.offset() {
+                Offset::Offset(offset) => Some(offset),
+                _ => None,
+            })
+    })
+    .await
+    .expect("probe task")
+}
+
+/// Polls the broker until the group's committed position is `expected`.
+async fn wait_for_committed_position(bootstrap: &str, expected: i64) {
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    while committed_position(bootstrap).await != Some(expected) {
+        assert!(
+            Instant::now() < deadline,
+            "the broker did not accept the commit at {expected} within {DELIVERY_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Runs the group with the report and `drain_timeout`, delivers the marked
+/// record, waits until the broker has accepted the asynchronous commit of
+/// its position, applies `before_stop` to the mock cluster, stops the run
+/// and returns the report with how long the stop took.
 async fn stop_after_one_record(
     mock: &MockCluster<'static, DefaultProducerContext>,
+    drain_timeout: Duration,
     before_stop: impl FnOnce(&MockCluster<'static, DefaultProducerContext>),
 ) -> (RunReport, Duration) {
     let broker = connect(mock).await;
     let (group, handler) = register_group(&broker).await;
     let token = group.cancellation_token();
-    let run = tokio::spawn(group.run_until_timeout_with_report(
-        token.clone().cancelled_owned(),
-        SHUTDOWN_COMMIT_DEADLINE + DEADLINE_MARGIN,
-    ));
+    let run = tokio::spawn(
+        group.run_until_timeout_with_report(token.clone().cancelled_owned(), drain_timeout),
+    );
 
-    produce_marked_record(&mock.bootstrap_servers()).await;
+    let bootstrap = mock.bootstrap_servers();
+    produce_marked_record(&bootstrap).await;
     wait_until(
         || handler.count() == 1,
         DELIVERY_TIMEOUT,
         "the record reaching the handler",
     )
     .await;
+    // The first completion is committed asynchronously as soon as the gate
+    // opens. Only once the broker has accepted it does the injection below
+    // meet the final commit and no other, and the position it leaves behind
+    // is known.
+    wait_for_committed_position(&bootstrap, 1).await;
 
     before_stop(mock);
     let stopped_at = Instant::now();
@@ -205,7 +259,7 @@ fn the_commit_error(report: &RunReport) -> (&[(i32, i64)], &CommitFailure) {
 #[tokio::test]
 async fn a_rejected_final_commit_ends_the_member_with_a_commit_error_the_run_reports() {
     let mock = mock_cluster();
-    let (report, _took) = stop_after_one_record(&mock, |mock| {
+    let (report, _took) = stop_after_one_record(&mock, DRAIN_TIMEOUT, |mock| {
         // From here every OffsetCommit is refused. Several answers are
         // pushed so a retry meets the same one.
         mock.request_errors(
@@ -229,6 +283,50 @@ async fn a_rejected_final_commit_ends_the_member_with_a_commit_error_the_run_rep
     assert!(!report.outcome.timed_out, "{:?}", report.outcome);
     assert!(!report.outcome.is_clean(), "{:?}", report.outcome);
     assert_eq!(report.outcome.exit_code(), 1);
+
+    // What the rejection leaves behind: the position the broker accepted
+    // earlier, from which the next member replays. The error says this
+    // commit did not land, not that nothing did.
+    assert_eq!(
+        committed_position(&mock.bootstrap_servers()).await,
+        Some(1),
+        "the earlier accepted commit stays the group's position"
+    );
+}
+
+/// The owning run's drain can end before the final commit answers: the
+/// member is aborted, and the report still carries the commit, unresolved,
+/// with the time the loop waited as its `Deadline`, beside `timed_out`. The
+/// mock broker's round-trip time is raised past the drain timeout, so
+/// neither the commit nor the drain can finish in time.
+#[tokio::test]
+async fn a_drain_timeout_before_the_commit_answers_still_reports_the_unresolved_commit() {
+    const SHORT_DRAIN: Duration = Duration::from_secs(3);
+    let mock = mock_cluster();
+    let (report, took) = stop_after_one_record(&mock, SHORT_DRAIN, |mock| {
+        mock.broker_round_trip_time(-1, SHUTDOWN_COMMIT_DEADLINE + DEADLINE_MARGIN * 2)
+            .expect("raise the mock broker's round-trip time");
+    })
+    .await;
+
+    assert!(report.outcome.timed_out, "{:?}", report.outcome);
+    let (_offsets, kind) = the_commit_error(&report);
+    let CommitFailure::Deadline(waited) = kind else {
+        panic!("an unresolved commit is reported as Deadline: {kind:?}");
+    };
+    assert!(
+        *waited < SHUTDOWN_COMMIT_DEADLINE,
+        "the loop waited only for the drain window, not its own deadline: {waited:?}"
+    );
+    assert!(
+        *waited <= took,
+        "the wait is within the stop: {waited:?} of {took:?}"
+    );
+    assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
+    assert!(
+        took < SHUTDOWN_COMMIT_DEADLINE,
+        "the run returned on its drain timeout, took {took:?}"
+    );
 }
 
 /// The error a rejected commit reports carries the broker's error code and
@@ -238,7 +336,7 @@ async fn a_rejected_final_commit_ends_the_member_with_a_commit_error_the_run_rep
 #[tokio::test]
 async fn a_rejected_commit_report_carries_no_record_payload_or_key() {
     let mock = mock_cluster();
-    let (report, _took) = stop_after_one_record(&mock, |mock| {
+    let (report, _took) = stop_after_one_record(&mock, DRAIN_TIMEOUT, |mock| {
         mock.request_errors(
             RDKafkaApiKey::OffsetCommit,
             &[RDKafkaRespErr::RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED; 8],
@@ -265,10 +363,7 @@ async fn run_until_timeout_reports_a_rejected_final_commit_as_one_error() {
     let broker = connect(&mock).await;
     let (group, handler) = register_group(&broker).await;
     let token = group.cancellation_token();
-    let run = tokio::spawn(group.run_until_timeout(
-        token.clone().cancelled_owned(),
-        SHUTDOWN_COMMIT_DEADLINE + DEADLINE_MARGIN,
-    ));
+    let run = tokio::spawn(group.run_until_timeout(token.clone().cancelled_owned(), DRAIN_TIMEOUT));
 
     produce_marked_record(&mock.bootstrap_servers()).await;
     wait_until(
@@ -277,6 +372,7 @@ async fn run_until_timeout_reports_a_rejected_final_commit_as_one_error() {
         "the record reaching the handler",
     )
     .await;
+    wait_for_committed_position(&mock.bootstrap_servers(), 1).await;
 
     mock.request_errors(
         RDKafkaApiKey::OffsetCommit,
@@ -300,7 +396,7 @@ async fn run_until_timeout_reports_a_rejected_final_commit_as_one_error() {
 #[tokio::test]
 async fn a_final_commit_past_the_deadline_ends_the_member_with_the_deadline_kind() {
     let mock = mock_cluster();
-    let (report, took) = stop_after_one_record(&mock, |mock| {
+    let (report, took) = stop_after_one_record(&mock, DRAIN_TIMEOUT, |mock| {
         mock.broker_round_trip_time(-1, SHUTDOWN_COMMIT_DEADLINE + DEADLINE_MARGIN * 2)
             .expect("raise the mock broker's round-trip time");
     })

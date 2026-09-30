@@ -669,6 +669,8 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_commit_interval: self.kafka_commit_interval,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            #[cfg(feature = "kafka")]
+            kafka_member_faults: None,
             broadcast_start: self.broadcast_start,
             retry_strategy: self.retry_strategy,
             #[cfg(feature = "kafka-schema-registry")]
