@@ -385,6 +385,19 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::drop_probe;
 
+    /// Test-only counter (see the `test-support` feature) on the pause of the
+    /// whole assignment the receive loop takes at the top of a pass, for tests
+    /// that tell it from the pause the receive arm takes on a record.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::pause_probe;
+
+    /// Test-only seam (see the `test-support` feature): the receive loop's
+    /// housekeeping interval, for tests that bound a revoke's reach by it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::housekeeping_interval_for_test;
+
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.
     #[cfg(feature = "test-support")]

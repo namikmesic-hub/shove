@@ -26,6 +26,7 @@ use shove::outcome::Outcome;
 use shove::topic::Topic;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -35,6 +36,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::fmt::MakeWriter;
 
 // ---------------------------------------------------------------------------
 // WaitableCounter
@@ -322,6 +324,32 @@ shove::define_topic!(
         .build()
 );
 
+// A stop while the whole assignment is paused behind an in-place wait, with
+// a record put back: the wait is long enough that the stop lands inside it.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalStopPausedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-stop-paused")
+        .external()
+        .hold_queue(Duration::from_secs(30))
+        .allow_message_loss()
+        .build()
+);
+
+// The pause the loop takes at the top of a pass once the sole permit holder
+// waits, with a short cycle so a released hold is acked soon after.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalTopPauseTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-top-pause")
+        .external()
+        .hold_queue(Duration::from_secs(3))
+        .allow_message_loss()
+        .build()
+);
+
 // Two partitions and two permits: a record held for a permit must be
 // checked again against a wait that began meanwhile.
 #[cfg(feature = "test-support")]
@@ -516,6 +544,13 @@ impl TestBroker {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The bound for a wait that spans a group rebalance: a join or a leave, a
+/// revoke the coordinator forces and the rejoin behind it. The broker paces
+/// each in seconds, and a Docker host running several brokers at once
+/// stretches them further.
+#[cfg(feature = "test-support")]
+const REBALANCE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// `(partition, offset, timestamp_ms)` for one delivery.
 type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
@@ -1128,11 +1163,60 @@ macro_rules! order_recorder_for {
 #[cfg(feature = "test-support")]
 order_recorder_for!(
     ExternalStopOrderTopic,
+    ExternalStopPausedTopic,
+    ExternalTopPauseTopic,
     ExternalRebalanceOrderTopic,
     ExternalForcedRevokeTopic,
     ExternalRevokeWaitTopic,
     ExternalTwoPermitTopic,
 );
+
+/// A `tracing` writer that stamps each write with the instant it arrived, so
+/// a test can measure the consumer's own reactions against its own log
+/// lines. The `fmt` layer writes one event per call, so each entry is one
+/// line.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+struct StampedLogs(Arc<std::sync::Mutex<Vec<(Instant, String)>>>);
+
+#[cfg(feature = "test-support")]
+impl StampedLogs {
+    /// The instants of the lines that contain every one of `needles`, in
+    /// arrival order.
+    fn instants_with(&self, needles: &[&str]) -> Vec<Instant> {
+        self.0
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .iter()
+            .filter(|(_, line)| needles.iter().all(|needle| line.contains(needle)))
+            .map(|(at, _)| *at)
+            .collect()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl io::Write for StampedLogs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer mutex poisoned")
+            .push((Instant::now(), String::from_utf8_lossy(buf).into_owned()));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl<'a> MakeWriter<'a> for StampedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// A snapshot of an [`OrderRecorder`] log.
 #[cfg(feature = "test-support")]
@@ -1177,22 +1261,53 @@ async fn poll_until(what: &str, timeout: Duration, mut condition: impl FnMut() -
 }
 
 /// The member ids the broker lists for `group` right now.
+///
+/// A coordinator that is moving or loading answers the probe with an error
+/// that means "ask again"; those are retried within `timeout`, as
+/// `wait_for_stable_group` retries them, and the last one is reported if the
+/// deadline passes. Any other error is a broken probe and fails at once.
 #[cfg(feature = "test-support")]
-fn group_member_ids(brokers: &str, group: &str) -> Vec<String> {
+async fn group_member_ids(brokers: &str, group: &str, timeout: Duration) -> Vec<String> {
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    fn is_transient(code: RDKafkaErrorCode) -> bool {
+        matches!(
+            code,
+            RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut
+        )
+    }
 
     let probe: BaseConsumer = rdkafka::ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()
         .expect("failed to create group probe");
-    let list = probe
-        .fetch_group_list(Some(group), Duration::from_secs(10))
-        .expect("failed to fetch group list");
-    list.groups()
-        .iter()
-        .find(|g| g.name() == group)
-        .map(|g| g.members().iter().map(|m| m.id().to_string()).collect())
-        .unwrap_or_default()
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last_error = match probe.fetch_group_list(Some(group), Duration::from_secs(10)) {
+            Ok(list) => {
+                return list
+                    .groups()
+                    .iter()
+                    .find(|g| g.name() == group)
+                    .map(|g| g.members().iter().map(|m| m.id().to_string()).collect())
+                    .unwrap_or_default();
+            }
+            Err(KafkaError::GroupListFetch(code)) if is_transient(code) => {
+                KafkaError::GroupListFetch(code)
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "the coordinator did not list group {group} within {timeout:?}; \
+             last coordinator error: {last_error}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Send the coordinator a LeaveGroup request on `member_id`'s behalf, as an
@@ -3921,21 +4036,23 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
         handler.clone(),
         shutdown.clone(),
     );
-    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
 
     // Offsets 0 and 1 are acked and committed first, so offset 2 is
     // dispatched the instant it arrives and offset 3 lands behind it.
     publish_raw_to(tb.brokers(), TOPIC, 0, &record(0)).await;
     publish_raw_to(tb.brokers(), TOPIC, 0, &record(1)).await;
-    poll_until("offsets 0 and 1 are committed", TIMEOUT, || {
+    poll_until("offsets 0 and 1 are committed", REBALANCE_TIMEOUT, || {
         committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(2)
     })
     .await;
     publish_raw_to(tb.brokers(), TOPIC, 0, &record(2)).await;
     publish_raw_to(tb.brokers(), TOPIC, 0, &record(3)).await;
-    poll_until("offset 2 is deferred and waits in place", TIMEOUT, || {
-        handler.defers() >= 1
-    })
+    poll_until(
+        "offset 2 is deferred and waits in place",
+        REBALANCE_TIMEOUT,
+        || handler.defers() >= 1,
+    )
     .await;
 
     shutdown.cancel();
@@ -3972,9 +4089,11 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
         acking,
         shutdown.clone(),
     );
-    poll_until("the restart handled offsets 2 and 3", TIMEOUT, || {
-        deliveries(&restarted_log).len() >= 2
-    })
+    poll_until(
+        "the restart handled offsets 2 and 3",
+        REBALANCE_TIMEOUT,
+        || deliveries(&restarted_log).len() >= 2,
+    )
     .await;
     let seen: Vec<i64> = deliveries(&restarted_log)
         .iter()
@@ -3987,6 +4106,256 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
     );
     shutdown.cancel();
     running.await.unwrap().unwrap();
+}
+
+/// The stop in the paused state. The head defers with nothing else in the
+/// loop's hand, the next record arrives once the wait holds the sole permit
+/// and is put back by the receive arm, and the assignment is paused; or the
+/// loop paused it at the top of a pass first and the record was never
+/// fetched. The stop then finds the shutdown token and the resume arm's
+/// permit ready together and must take the stop: the put-back record is
+/// never handed to a handler, nothing is committed, and a restart delivers
+/// both records in order.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_stop_while_the_assignment_is_paused_never_hands_over_the_put_back_record() {
+    use shove::kafka::{drop_probe, pause_probe, put_back_probe};
+
+    const TOPIC: &str = "kafka-external-stop-paused";
+    const GROUP: &str = "kafka-external-stop-paused-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let record = |offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("r{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler = OrderRecorder::new("a", log.clone()).holding(0, 0);
+    let shutdown = CancellationToken::new();
+    let running = spawn_single_permit_in_place_member::<ExternalStopPausedTopic, _>(
+        tb.client(),
+        handler.clone(),
+        shutdown.clone(),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(0)).await;
+    poll_until(
+        "the head is deferred and waits in place",
+        REBALANCE_TIMEOUT,
+        || handler.defers() >= 1,
+    )
+    .await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(1)).await;
+    poll_until(
+        "the assignment is paused, with record 1 put back or never fetched",
+        REBALANCE_TIMEOUT,
+        || put_back_probe::paused_receive() >= 1 || pause_probe::top_of_loop() >= 1,
+    )
+    .await;
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
+
+    let seen: Vec<i64> = deliveries(&log).iter().map(|d| d.offset).collect();
+    assert_eq!(
+        seen,
+        vec![0],
+        "the stop handed record 1 to no handler: {:#?}",
+        deliveries(&log)
+    );
+    assert_eq!(
+        drop_probe::permit_wait_shutdown(),
+        0,
+        "record 1 was not in the loop's hand: the pause held it at the broker or put it back"
+    );
+    assert_eq!(
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0),
+        None,
+        "nothing completed, so nothing is committed"
+    );
+
+    let restarted_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let acking = OrderRecorder::new("restart", restarted_log.clone());
+    let shutdown = CancellationToken::new();
+    let running = spawn_single_permit_in_place_member::<ExternalStopPausedTopic, _>(
+        tb.client(),
+        acking,
+        shutdown.clone(),
+    );
+    poll_until(
+        "the restart handled both records",
+        REBALANCE_TIMEOUT,
+        || deliveries(&restarted_log).len() >= 2,
+    )
+    .await;
+    let seen: Vec<i64> = deliveries(&restarted_log)
+        .iter()
+        .map(|d| d.offset)
+        .collect();
+    assert_eq!(
+        seen,
+        vec![0, 1],
+        "the restart delivers the head, then the record behind it"
+    );
+    shutdown.cancel();
+    running.await.unwrap().unwrap();
+}
+
+/// The loop pauses its whole assignment at the top of a pass once every
+/// permit is held and one holder waits in place, so a record published
+/// during the wait stays at the broker instead of being fetched and put
+/// back. The head defers and the loop pauses; a second record is published;
+/// the hold comes off and the wait ends within its cycle, the assignment
+/// resumes and the second record arrives, never having been put back.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn the_whole_assignment_is_paused_at_the_top_of_the_loop_once_the_sole_permit_holder_waits() {
+    use shove::kafka::{pause_probe, put_back_probe};
+
+    const TOPIC: &str = "kafka-external-top-pause";
+    const GROUP: &str = "kafka-external-top-pause-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let record = |offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("r{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler = OrderRecorder::new("a", log.clone()).holding(0, 0);
+    let shutdown = CancellationToken::new();
+    let running = spawn_single_permit_in_place_member::<ExternalTopPauseTopic, _>(
+        tb.client(),
+        handler.clone(),
+        shutdown.clone(),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(0)).await;
+    poll_until(
+        "the loop paused its assignment at the top of a pass behind the head's wait",
+        REBALANCE_TIMEOUT,
+        || pause_probe::top_of_loop() >= 1,
+    )
+    .await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(1)).await;
+
+    handler.release();
+    poll_until(
+        "the head is acked and the record behind it arrives once the assignment resumed",
+        REBALANCE_TIMEOUT,
+        || deliveries(&log).iter().any(|d| d.offset == 1),
+    )
+    .await;
+    let log = deliveries(&log);
+    assert_eq!(
+        log.iter().map(|d| d.offset).collect::<Vec<_>>().last(),
+        Some(&1),
+        "record 1 came last: {log:#?}"
+    );
+    assert_eq!(
+        put_back_probe::paused_receive(),
+        0,
+        "record 1 was never fetched during the pause, so it was never put back"
+    );
+    assert_eq!(
+        put_back_probe::permit_wait(),
+        0,
+        "record 1 never waited for a permit either"
+    );
+
+    shutdown.cancel();
+    running.await.unwrap().unwrap();
+}
+
+/// A revoke reaches the waiting task through the rebalance wake, not through
+/// the housekeeping tick. The member's own log lines are stamped as they
+/// arrive: the wait ends within a fraction of the housekeeping interval after
+/// the revoke callback ran, while the assignment is paused and nothing else
+/// wakes the loop.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_revoke_reaches_the_waiting_task_before_the_next_housekeeping_tick() {
+    use shove::kafka::{drop_probe, housekeeping_interval_for_test};
+
+    const TOPIC: &str = "kafka-external-revoke-wait";
+    const GROUP: &str = "kafka-external-revoke-wait-consumer";
+    let logs = StampedLogs::default();
+    tracing_subscriber::fmt()
+        .with_env_filter("shove=debug")
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .try_init()
+        .expect("this test owns the process's subscriber");
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let record = |offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("r{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(0)).await;
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let a = OrderRecorder::new("a", log.clone()).holding(0, 0);
+    let shutdown = CancellationToken::new();
+    let running = spawn_single_permit_in_place_member::<ExternalRevokeWaitTopic, _>(
+        tb.client(),
+        a.clone(),
+        shutdown.clone(),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+    poll_until(
+        "the head is deferred and waits in place",
+        REBALANCE_TIMEOUT,
+        || a.defers() >= 1,
+    )
+    .await;
+    let members = group_member_ids(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+    assert_eq!(members.len(), 1, "one member: {members:?}");
+
+    leave_group_on_behalf_of(tb.brokers(), GROUP, &members[0]).await;
+    poll_until("the wait ends at the revoke", REBALANCE_TIMEOUT, || {
+        drop_probe::in_place_revoked() >= 1
+    })
+    .await;
+
+    let revoked_at = logs
+        .instants_with(&["rebalance: partitions revoked", TOPIC, "[0]"])
+        .first()
+        .copied()
+        .expect("the revoke callback logged the partition");
+    let ended_at = logs
+        .instants_with(&["revoked during an in-place wait", TOPIC])
+        .first()
+        .copied()
+        .expect("the wait logged its end");
+    let bound = housekeeping_interval_for_test() / 5;
+    assert!(
+        ended_at >= revoked_at && ended_at - revoked_at < bound,
+        "the wait ended {:?} after the revoke callback; the wake must beat the {:?} housekeeping tick by far",
+        ended_at.saturating_duration_since(revoked_at),
+        housekeeping_interval_for_test()
+    );
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
 }
 
 /// The order invariant with two permits, on the record the loop holds while
@@ -4034,7 +4403,7 @@ async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_m
             .run::<ExternalTwoPermitTopic, _>(h, (), options)
             .await
     });
-    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
 
     for offset in 0..3 {
         publish_raw_to(tb.brokers(), TOPIC, 0, &record(0, offset)).await;
@@ -4071,13 +4440,17 @@ async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_m
     // The hold comes off: 0's wait ends within its cycle, the partition
     // resumes, and 2 arrives.
     handler.release();
-    poll_until("record 2 arrives once partition 0 resumed", TIMEOUT, || {
-        deliveries(&log)
-            .iter()
-            .any(|d| d.partition == 0 && d.offset == 2)
-    })
+    poll_until(
+        "record 2 arrives once partition 0 resumed",
+        REBALANCE_TIMEOUT,
+        || {
+            deliveries(&log)
+                .iter()
+                .any(|d| d.partition == 0 && d.offset == 2)
+        },
+    )
     .await;
-    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, TIMEOUT).await;
+    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, REBALANCE_TIMEOUT).await;
 
     let log = deliveries(&log);
     assert_eq!(
@@ -4150,8 +4523,11 @@ async fn cooperative_rebalance_does_not_commit_past_deferred_head() {
         a.clone(),
         shutdown_a.clone(),
     );
-    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
-    poll_until("A defers a head record", TIMEOUT, || a.defers() >= 1).await;
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+    poll_until("A defers a head record", REBALANCE_TIMEOUT, || {
+        a.defers() >= 1
+    })
+    .await;
     for partition in 0..2 {
         assert_eq!(
             committed_offset(tb.brokers(), GROUP, TOPIC, partition),
@@ -4210,13 +4586,15 @@ async fn cooperative_rebalance_does_not_commit_past_deferred_head() {
 
     shutdown_b.cancel();
     running_b.await.unwrap().unwrap();
-    poll_until("the moved partition returns to A", TIMEOUT, || {
-        group_state(tb.brokers(), GROUP) == ("Stable".to_string(), 1)
-    })
+    poll_until(
+        "the moved partition returns to A",
+        REBALANCE_TIMEOUT,
+        || group_state(tb.brokers(), GROUP) == ("Stable".to_string(), 1),
+    )
     .await;
 
     a.release();
-    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, TIMEOUT).await;
+    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, REBALANCE_TIMEOUT).await;
     for partition in 0..2 {
         assert_eq!(
             committed_offset(tb.brokers(), GROUP, TOPIC, partition),
@@ -4281,9 +4659,12 @@ async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_
         a.clone(),
         shutdown_a.clone(),
     );
-    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
-    poll_until("A defers the head record", TIMEOUT, || a.defers() >= 1).await;
-    let members = group_member_ids(tb.brokers(), GROUP);
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+    poll_until("A defers the head record", REBALANCE_TIMEOUT, || {
+        a.defers() >= 1
+    })
+    .await;
+    let members = group_member_ids(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
     assert_eq!(members.len(), 1, "A is the only member: {members:?}");
     let a_member_id = members[0].clone();
 
@@ -4311,9 +4692,11 @@ async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_
     // from here, and A's old wait, a 30 s delay, can end only at the revoke.
     a.release();
 
-    poll_until("A's in-place wait ended at the revoke", TIMEOUT, || {
-        drop_probe::in_place_revoked() >= 1
-    })
+    poll_until(
+        "A's in-place wait ended at the revoke",
+        REBALANCE_TIMEOUT,
+        || drop_probe::in_place_revoked() >= 1,
+    )
     .await;
     poll_until(
         "the partition's next owner is handed the head from the committed position",
@@ -4350,7 +4733,7 @@ async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_
 
     shutdown_b.cancel();
     running_b.await.unwrap().unwrap();
-    poll_until("the partition is A's alone", TIMEOUT, || {
+    poll_until("the partition is A's alone", REBALANCE_TIMEOUT, || {
         group_state(tb.brokers(), GROUP) == ("Stable".to_string(), 1)
     })
     .await;
@@ -4414,17 +4797,19 @@ async fn a_revoke_ends_the_in_place_wait_holding_the_sole_permit() {
         a.clone(),
         shutdown.clone(),
     );
-    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
-    poll_until("the head is deferred and waits in place", TIMEOUT, || {
-        a.defers() >= 1
-    })
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+    poll_until(
+        "the head is deferred and waits in place",
+        REBALANCE_TIMEOUT,
+        || a.defers() >= 1,
+    )
     .await;
-    let members = group_member_ids(tb.brokers(), GROUP);
+    let members = group_member_ids(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
     assert_eq!(members.len(), 1, "one member: {members:?}");
 
     leave_group_on_behalf_of(tb.brokers(), GROUP, &members[0]).await;
 
-    poll_until("the wait ends at the revoke", TIMEOUT, || {
+    poll_until("the wait ends at the revoke", REBALANCE_TIMEOUT, || {
         drop_probe::in_place_revoked() >= 1
     })
     .await;

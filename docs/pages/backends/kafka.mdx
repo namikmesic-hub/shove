@@ -170,14 +170,21 @@ A shutdown during a wait completes nothing: the record stays uncommitted and is 
 A waiting handler holds its slot for the whole delay, the contract a broadcast subscription has always had.
 Size `prefetch_count` for the number of records you accept to have waiting at once.
 
-One invariant holds for a consumer with one slot, `with_prefetch_count(1)` or `with_concurrent_processing(false)`: while a record of a partition waits in place, no later record of that partition reaches the handler.
+One invariant holds for a consumer with one slot, set with `with_prefetch_count(1)` or `with_concurrent_processing(false)`.
+While a record of a partition waits in place, no later record of that partition reaches the handler.
 It holds while the consumer runs, on a stop, on a wait cut short, and across a rebalance.
-On a stop the consumer takes no new record: a record it had already fetched when shutdown fired is not handed over during the drain, and is redelivered after the restart, behind the record that was waiting.
-On a revoke every in-place wait on the revoked partition ends at once with nothing completed, and the partition's new owner, or this member after a reassign, is handed the record again from the committed offset.
+On a stop the consumer takes no new record.
+A record it had already fetched when shutdown fired is not handed over during the drain.
+It is redelivered after the restart, behind the record that was waiting.
+On a revoke every in-place wait on the revoked partition ends at once with nothing completed.
+The partition's new owner, or this member after a reassign, is handed the record again from the committed offset.
 A revoke reaches a waiting handler during any wait the consumer polls through, a wait for a slot or a schema registry outage included.
-A handler that finishes after its partition moved away and came back cannot settle the new assignment's delivery of the same offset: a completion is stamped with the assignment it was made under, and one from an earlier assignment is dropped.
-With more slots, a record of the partition already handed to a handler when a lower record of it starts to wait keeps running beside the wait.
-A record of that partition the consumer has not handed over yet waits behind it: the record is handed back to the broker, that partition alone is paused, and it is resumed once no record of it waits any more, so the other partitions keep flowing.
+A completion is stamped with the assignment it was made under, and one from an earlier assignment is dropped.
+So a handler that finishes after its partition moved away and came back cannot settle the new assignment's delivery of the same offset.
+With more slots, a record already handed to a handler keeps running beside a wait that a lower record of its partition starts later.
+A record of that partition the consumer has not handed over yet waits behind it.
+The record is handed back to the broker and that partition alone is paused, so the other partitions keep flowing.
+The partition is resumed once no record of it waits any more.
 
 `external()` is incompatible with `sequenced()` and with every topic-config method.
 Those are `with_topic_config`, `with_retention`, `with_retention_forever`, `with_retention_bytes`, `with_cleanup_policy` and `with_max_message_bytes`.
@@ -452,7 +459,8 @@ A trailing control record is different: with nothing delivered after it, the com
 An idle transactional topic therefore reads a lag of 1 until the next record arrives, and nothing is redelivered.
 
 On shutdown the consumer first waits for its in-flight handlers to finish.
-That wait is bounded by the handler timeout and by any in-place delays.
+That wait is bounded by the handler timeout.
+An in-place delay does not extend it: shutdown cuts the delay short at once, and the record stays uncommitted.
 It then drains the republish queue and commits its final position **synchronously**.
 The commit runs on a dedicated thread that also owns the consumer's close.
 The thread is spawned before it is handed the consumer, so a failed spawn never closes the consumer on the runtime thread.
@@ -473,6 +481,8 @@ What that means for replay:
 - After a rebalance, a moved partition replays from its last accepted commit.
 - After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
   A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
+  A record the consumer had fetched but not yet handed to a handler is not handled during the drain.
+  It stays uncommitted too, and is redelivered after the restart behind the records that were in flight.
   So is the last batch when the final commit hits its deadline.
   An asynchronous commit librdkafka was still retrying can also land after the final one.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.

@@ -26,6 +26,19 @@ pub use consumer::completion_probe;
 pub use consumer::drop_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
+pub use consumer::pause_probe;
+
+/// Test-only seam (see the `test-support` feature): how often the concurrent
+/// receive loop wakes on its own to drain rebalance events, so a test that
+/// proves a revoke reached a waiting task without that wake asserts against
+/// the constant itself rather than a hand-copied value.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn housekeeping_interval_for_test() -> std::time::Duration {
+    consumer::HOUSEKEEPING_INTERVAL
+}
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub(crate) use consumer_group::validate_commit_interval;

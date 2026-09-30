@@ -594,6 +594,29 @@ shove::define_topic!(
     Event,
     TopologyBuilder::new("kafka-sr-outage-assign").dlq().build()
 );
+// A revoke that lands while the receive loop waits out a registry outage.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    StallRevokeTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-stall-revoke")
+        .dlq()
+        .build()
+);
+// An infra-owned topic with two partitions for the in-place shape with two
+// permits: a partition paused behind a head that waits in place must stay
+// paused when a registry stall on the other partition ends. The hold is long
+// enough that the head still waits when the stall ends.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    PendingPauseTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-pending-pause")
+        .external()
+        .hold_queue(Duration::from_secs(20))
+        .allow_message_loss()
+        .build()
+);
 shove::define_topic!(
     BatchRewindPutBackTopic,
     Event,
@@ -680,6 +703,153 @@ recorder_for!(
     FifoSilentTopic,
     BroadcastSilentTopic
 );
+#[cfg(feature = "test-support")]
+recorder_for!(StallRevokeTopic);
+
+/// Records every delivery as `(partition, offset, id)` and defers the head
+/// of partition 0 for as long as it lives; everything else is acked.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct HoldHeadRecorder {
+    seen: Arc<Mutex<Vec<(i32, i64, u32)>>>,
+    defers: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "test-support")]
+impl HoldHeadRecorder {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            defers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn seen(&self) -> Vec<(i32, i64, u32)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl MessageHandler<PendingPauseTopic> for HoldHeadRecorder {
+    type Context = ();
+    async fn handle(&self, msg: Event, meta: MessageMetadata, _: &()) -> Outcome {
+        let partition = meta.partition.expect("Kafka reports the partition");
+        let offset = meta.offset.expect("Kafka reports the offset");
+        self.seen.lock().unwrap().push((partition, offset, msg.id));
+        if partition == 0 && offset == 0 {
+            self.defers.fetch_add(1, Ordering::SeqCst);
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// The member ids the broker lists for `group`, retrying the coordinator
+/// answers that mean "ask again" within `timeout`.
+#[cfg(feature = "test-support")]
+async fn group_member_ids(brokers: &str, group: &str, timeout: Duration) -> Vec<String> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    fn is_transient(code: RDKafkaErrorCode) -> bool {
+        matches!(
+            code,
+            RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut
+        )
+    }
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create group probe");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last_error = match probe.fetch_group_list(Some(group), Duration::from_secs(10)) {
+            Ok(list) => {
+                return list
+                    .groups()
+                    .iter()
+                    .find(|g| g.name() == group)
+                    .map(|g| g.members().iter().map(|m| m.id().to_string()).collect())
+                    .unwrap_or_default();
+            }
+            Err(KafkaError::GroupListFetch(code)) if is_transient(code) => {
+                KafkaError::GroupListFetch(code)
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "the coordinator did not list group {group} within {timeout:?}; \
+             last coordinator error: {last_error}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Send the coordinator a LeaveGroup request on `member_id`'s behalf, so it
+/// takes the member's partitions away while the member still believes it
+/// holds them: a revoke the member did not ask for. LeaveGroup version 1,
+/// hand-framed, as `tests/kafka_integration.rs` frames it.
+#[cfg(feature = "test-support")]
+async fn leave_group_on_behalf_of(brokers: &str, group: &str, member_id: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        let len = i16::try_from(s.len()).expect("a short string");
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    const LEAVE_GROUP_API_KEY: i16 = 13;
+    const CORRELATION_ID: i32 = 7;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&LEAVE_GROUP_API_KEY.to_be_bytes());
+    body.extend_from_slice(&1i16.to_be_bytes());
+    body.extend_from_slice(&CORRELATION_ID.to_be_bytes());
+    put_string(&mut body, "shove-test-leave-group");
+    put_string(&mut body, group);
+    put_string(&mut body, member_id);
+    let mut frame = i32::try_from(body.len())
+        .expect("a short frame")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&body);
+
+    let mut stream = tokio::net::TcpStream::connect(brokers)
+        .await
+        .expect("failed to connect to the coordinator");
+    stream
+        .write_all(&frame)
+        .await
+        .expect("failed to send LeaveGroup");
+    let mut size = [0u8; 4];
+    stream
+        .read_exact(&mut size)
+        .await
+        .expect("failed to read the LeaveGroup response size");
+    let size = usize::try_from(i32::from_be_bytes(size)).expect("a positive size");
+    let mut response = vec![0u8; size];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("failed to read the LeaveGroup response");
+    let correlation = i32::from_be_bytes(response[0..4].try_into().unwrap());
+    assert_eq!(
+        correlation, CORRELATION_ID,
+        "the response answers our request"
+    );
+    let error_code = i16::from_be_bytes(response[8..10].try_into().unwrap());
+    assert_eq!(
+        error_code, 0,
+        "the coordinator refused the LeaveGroup with error code {error_code}"
+    );
+}
 
 /// Records every delivery and returns `Defer` for the first one it sees,
 /// then `Ack`.
@@ -2552,6 +2722,188 @@ recorder_for!(HungLookupTopic);
 /// gives up. Bounded at a third of the interval, the lookup becomes
 /// `Unavailable`, the stall wait polls, and the member is still in its
 /// group well past the interval.
+/// A revoke that lands while the receive loop waits out a registry outage
+/// on a record ends that wait: the record is left to the partition's owner
+/// with nothing completed. Once the registry answers again, the owner, this
+/// member under a fresh assignment, is handed the record and handles it
+/// once.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_revoke_during_a_registry_stall_leaves_the_record_to_its_owner() {
+    use shove::kafka::drop_probe;
+
+    const TOPIC: &str = "kafka-sr-outage-stall-revoke";
+    const GROUP: &str = "kafka-sr-outage-stall-revoke-consumer";
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status, hits) = mock_registry("kafka-sr-outage-stall-revoke-value", 503).await;
+    let client = tb.client().await;
+    let body = serde_json::to_vec(&Event { id: 1 }).unwrap();
+    publish_raw(&tb.brokers, TOPIC, &frame_json(FLAKY_ID, &body)).await;
+
+    let handler = Recorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<StallRevokeTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_concurrent_processing(false)
+                    .with_prefetch_count(1)
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+    wait_for_group_members(&tb.brokers, GROUP, 1, TIMEOUT).await;
+    wait_for_hits_above(&hits, 0, TIMEOUT).await;
+    let members = group_member_ids(&tb.brokers, GROUP, TIMEOUT).await;
+    assert_eq!(members.len(), 1, "one member: {members:?}");
+
+    leave_group_on_behalf_of(&tb.brokers, GROUP, &members[0]).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while drop_probe::registry_stall_revoked() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the revoke did not end the registry wait within {TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        handler.seen(),
+        Vec::<u32>::new(),
+        "the stalled record reached no handler"
+    );
+
+    // The registry answers again; the rejoined member is handed the record
+    // from the committed position and handles it once.
+    status.store(200, Ordering::SeqCst);
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "delivered once the registry answers"
+    );
+    wait_for_lag(&client, TOPIC, GROUP, 0, TIMEOUT).await;
+    assert_eq!(handler.seen(), vec![1], "handled once");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+}
+
+/// A registry stall's resume skips a partition paused behind an in-place
+/// wait. With two permits, the head of partition 0 waits in place and the
+/// record behind it is put back with the partition paused; a record on
+/// partition 1 then stalls on the registry, which pauses the whole
+/// assignment. When the registry answers, only partition 1 resumes: the
+/// record behind the head is not fetched and put back again, so it is put
+/// back once in all, and it reaches no handler while the head waits.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_registry_recovery_leaves_a_partition_paused_behind_its_in_place_wait() {
+    use shove::kafka::put_back_probe;
+
+    const TOPIC: &str = "kafka-sr-outage-pending-pause";
+    const GROUP: &str = "kafka-sr-outage-pending-pause-consumer";
+    let tb = TestBroker::start().await;
+    create_topic(&tb.brokers, TOPIC, 2).await;
+    let (registry, status, hits) = mock_registry("kafka-sr-outage-pending-pause-value", 503).await;
+    let client = tb.client().await;
+    let event = |id: u32| serde_json::to_vec(&Event { id }).unwrap();
+
+    let handler = HoldHeadRecorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<PendingPauseTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_concurrent_processing(true)
+                    .with_prefetch_count(2)
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+    wait_for_group_members(&tb.brokers, GROUP, 1, TIMEOUT).await;
+
+    // The head of partition 0 waits in place, then the record behind it is
+    // put back and partition 0 alone is paused.
+    publish_raw_to(&tb.brokers, TOPIC, 0, &frame_json(HEALTHY_ID, &event(1))).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while handler.defers.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the head was not deferred");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    publish_raw_to(&tb.brokers, TOPIC, 0, &frame_json(HEALTHY_ID, &event(2))).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while put_back_probe::pending_order() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the record behind the waiting head was not put back"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A record on partition 1 stalls on the registry, which pauses the whole
+    // assignment; then the registry answers and the stall ends.
+    publish_raw_to(&tb.brokers, TOPIC, 1, &frame_json(FLAKY_ID, &event(3))).await;
+    wait_for_hits_above(&hits, 0, TIMEOUT).await;
+    status.store(200, Ordering::SeqCst);
+    let deadline = Instant::now() + TIMEOUT;
+    while !handler.seen().contains(&(1, 0, 3)) {
+        assert!(
+            Instant::now() < deadline,
+            "the stalled record was not handled once the registry answered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Partition 1 flows on; by the time this record is handled, a partition
+    // 0 wrongly resumed would have fetched the record behind the head and
+    // put it back a second time.
+    publish_raw_to(&tb.brokers, TOPIC, 1, &frame_json(HEALTHY_ID, &event(4))).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while !handler.seen().contains(&(1, 1, 4)) {
+        assert!(
+            Instant::now() < deadline,
+            "partition 1 did not keep flowing after the stall"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        put_back_probe::pending_order(),
+        1,
+        "the record behind the head was put back once: partition 0 stayed paused through the stall's end"
+    );
+    let seen = handler.seen();
+    assert!(
+        seen.iter()
+            .all(|&(partition, offset, _)| !(partition == 0 && offset == 1)),
+        "the record behind the waiting head reached no handler: {seen:?}"
+    );
+    assert_eq!(
+        seen.iter().filter(|&&(p, o, _)| p == 0 && o == 0).count(),
+        1,
+        "the head was handed over once and waits since: {seen:?}"
+    );
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
+}
+
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_hung_registry_lookup_keeps_the_member_in_its_group() {
