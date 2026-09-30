@@ -815,7 +815,7 @@ impl KafkaConsumerGroup {
     /// false after a member ended with a fatal error: that error ends the run
     /// that owns this group, so a member added in the window before the run
     /// cancels the group would only meet the same shutdown, exactly as
-    /// [`ensure_min`](Self::ensure_min) refuses to replace one.
+    /// `ensure_min` refuses to replace one.
     pub fn scale_up(&mut self) -> bool {
         if self.faults.is_fatal() {
             debug!(
