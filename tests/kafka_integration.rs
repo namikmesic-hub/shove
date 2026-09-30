@@ -4410,7 +4410,7 @@ async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_m
     }
     poll_until(
         "record 2, held for a permit, is put back once 0 waits and 1's permit frees",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || put_back_probe::pending_order() >= 1,
     )
     .await;
@@ -4425,7 +4425,7 @@ async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_m
     publish_raw_to(tb.brokers(), TOPIC, 1, &record(1, 0)).await;
     poll_until(
         "partition 1 is handled while partition 0 is paused",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || deliveries(&log).iter().any(|d| d.partition == 1),
     )
     .await;
@@ -4545,7 +4545,7 @@ async fn cooperative_rebalance_does_not_commit_past_deferred_head() {
     );
     poll_until(
         "B handles a record of the partition it took",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || deliveries(&log).iter().any(|d| d.member == "b"),
     )
     .await;
@@ -4561,7 +4561,7 @@ async fn cooperative_rebalance_does_not_commit_past_deferred_head() {
     );
     poll_until(
         "B completes every record of the moved partition",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || {
             deliveries(&log)
                 .iter()
@@ -4574,7 +4574,7 @@ async fn cooperative_rebalance_does_not_commit_past_deferred_head() {
     .await;
     poll_until(
         "the moved partition's commit moves past the head once its new owner completed it",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || committed_offset(tb.brokers(), GROUP, TOPIC, moved) == Some(4),
     )
     .await;
@@ -4677,7 +4677,7 @@ async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_
     );
     poll_until(
         "B joined and the group is stable with two members",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || group_state(tb.brokers(), GROUP) == ("Stable".to_string(), 2),
     )
     .await;
@@ -4698,9 +4698,14 @@ async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_
         || drop_probe::in_place_revoked() >= 1,
     )
     .await;
+    assert_eq!(
+        drop_probe::permit_wait_revoked(),
+        1,
+        "the record A held for a permit behind the head was dropped at the revoke, not handed over"
+    );
     poll_until(
         "the partition's next owner is handed the head from the committed position",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || deliveries(&log).len() > before_revoke.len(),
     )
     .await;
@@ -4716,7 +4721,7 @@ async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_
     let new_owner = handed_over.member;
     poll_until(
         "the commit moves past the head once the new owner completed it and the rest",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(4),
     )
     .await;
@@ -4740,7 +4745,7 @@ async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_
     publish_raw_to(tb.brokers(), TOPIC, 0, &record(4)).await;
     poll_until(
         "A handles the record published after the partition returned",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || deliveries(&log).iter().any(|d| d.offset == 4),
     )
     .await;
@@ -4815,7 +4820,7 @@ async fn a_revoke_ends_the_in_place_wait_holding_the_sole_permit() {
     .await;
     poll_until(
         "the rejoined member is handed the head again as a fresh delivery",
-        TIMEOUT,
+        REBALANCE_TIMEOUT,
         || {
             deliveries(&log)
                 .iter()
@@ -4830,6 +4835,11 @@ async fn a_revoke_ends_the_in_place_wait_holding_the_sole_permit() {
     assert!(
         log.iter().all(|d| d.offset == 0),
         "offset 1 waits behind the head throughout: {log:#?}"
+    );
+    assert_eq!(
+        drop_probe::permit_wait_revoked(),
+        1,
+        "offset 1, held for the permit behind the head, was dropped at the revoke"
     );
     assert!(
         log.iter().all(|d| !d.redelivered),

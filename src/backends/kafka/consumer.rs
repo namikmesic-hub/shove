@@ -628,7 +628,7 @@ impl OffsetTracker {
     /// The tracker goes so a reassigned partition re-seeds `next_to_commit`
     /// from the first offset actually delivered under the new assignment.
     /// The broker's committed offset decides where delivery resumes, so
-    /// seeding from delivery is correct — while a stale seed (left from
+    /// seeding from delivery is correct, while a stale seed (left from
     /// before the partition moved away and another member committed on it)
     /// would make `drain_committable` wait for a contiguous run that never
     /// arrives, stalling commits on the partition forever. An assignment
@@ -692,7 +692,7 @@ impl OffsetTracker {
         // be dropped by librdkafka without surfacing an error
         // (observed against a real broker: commits submitted
         // between the revoke and assign phases of a cooperative
-        // rebalance vanish — no commit_callback ever fires).
+        // rebalance vanish, and no commit_callback ever fires).
         // Re-offer every retained partition's position once the
         // dust settles; re-committing an already-committed offset
         // is a broker-side no-op. The rebalance always ends with
@@ -2548,8 +2548,8 @@ struct RebalanceSender {
 impl RebalanceSender {
     fn send(&self, event: RebalanceEvent) {
         // A closed channel means the receive loop is gone (shutdown or
-        // reconnect teardown, or a consumer that keeps no tracker) — nothing
-        // to notify.
+        // reconnect teardown, or a consumer that keeps no tracker), so there
+        // is nothing to notify.
         let _ = self.events.send(event);
         self.wake.notify_one();
     }
@@ -9572,6 +9572,28 @@ mod permit_wait_tests {
             "the drain applied the revoke to the tracker"
         );
         assert_eq!(h.semaphore.available_permits(), 1, "no permit is kept");
+    }
+
+    /// The fallback under the permit arm: a revoke queued without its wake,
+    /// which no production sender does, is still read once the permit frees,
+    /// so the record of a revoked partition is not handed over on that path
+    /// either.
+    #[tokio::test]
+    async fn a_revoke_queued_without_a_wake_is_read_when_the_permit_frees() {
+        let mut h = Harness::new();
+        let held = h.semaphore.clone().acquire_owned().await.unwrap();
+        // The event alone, on the channel; the wake stays unsignalled.
+        h.rebalance_tx
+            .events
+            .send(RebalanceEvent::Revoke(vec![0]))
+            .unwrap();
+        drop(held);
+        assert!(
+            matches!(h.wait(false).await, PermitWait::Revoked),
+            "the permit arm reads the queued revoke before it hands the permit over"
+        );
+        assert!(!h.tracker.is_current(0, h.epoch));
+        assert_eq!(h.semaphore.available_permits(), 1, "the permit went back");
     }
 
     /// A revoke of another partition is applied and the wait goes on to
