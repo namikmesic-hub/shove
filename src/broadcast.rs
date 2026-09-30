@@ -4,13 +4,13 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::BroadcastImpl;
 use crate::backend::capability::HasBroadcast;
 use crate::consumer::ConsumerOptions;
-use crate::consumer_supervisor::{SupervisorOutcome, tally_join_result};
+use crate::consumer_supervisor::{RunReport, SupervisorOutcome, tally_join_result};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
@@ -306,34 +306,83 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
     /// timeout the surviving tasks are aborted and
     /// [`SupervisorOutcome::timed_out`] is set — backends release their
     /// subscription from a drop guard, so the abort path reaps too.
-    pub async fn run_until_timeout<S>(
-        mut self,
-        signal: S,
-        drain_timeout: Duration,
-    ) -> SupervisorOutcome
+    ///
+    /// A subscription that ends with a fatal error
+    /// ([`ShoveError::is_fatal`]) ends the run the way `signal` does. The
+    /// same run as
+    /// [`run_until_timeout_with_report`](Self::run_until_timeout_with_report),
+    /// which also returns those errors; this returns its `outcome`.
+    pub async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        tokio::select! {
-            _ = signal => { self.shutdown.cancel(); }
-            _ = self.shutdown.cancelled() => {}
-        }
+        self.run_until_timeout_with_report(signal, drain_timeout)
+            .await
+            .outcome
+    }
 
+    /// [`run_until_timeout`](Self::run_until_timeout), plus the fatal
+    /// errors that ended the run.
+    ///
+    /// A subscription that ends with an error for which
+    /// [`ShoveError::is_fatal`] is true ends the run: every other
+    /// subscription is cancelled and drained as on the stop signal, the
+    /// error counts one under [`SupervisorOutcome::errors`], and it is
+    /// returned in [`RunReport::fatal`] in arrival order. Every other error
+    /// ends the subscription alone and is only counted, as before; a broker
+    /// outage in particular is a reconnect, not a stop. No broadcast loop
+    /// commits offsets, so on this version no subscription ends with
+    /// [`ShoveError::Commit`]; the path exists for the fatal errors a later
+    /// version adds.
+    pub async fn run_until_timeout_with_report<S>(
+        mut self,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> RunReport
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
         let mut errors = 0usize;
         let mut panics = 0usize;
+        let mut fatal = Vec::new();
+
+        // Until the stop: the signal, the token, or a subscription that ends
+        // on its own. An ordinary end is tallied here instead of at the
+        // drain, and a fatal one is the stop itself.
+        let mut signal = std::pin::pin!(signal);
+        loop {
+            tokio::select! {
+                _ = &mut signal => {
+                    self.shutdown.cancel();
+                    break;
+                }
+                _ = self.shutdown.cancelled() => break,
+                res = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    let Some(res) = res else { continue };
+                    if tally_or_collect(res, &mut errors, &mut panics, &mut fatal) {
+                        tracing::error!(
+                            "a broadcast subscription ended with a fatal error; stopping the run"
+                        );
+                        self.shutdown.cancel();
+                        break;
+                    }
+                }
+            }
+        }
 
         let drain = {
             let tasks = &mut self.tasks;
             let errors = &mut errors;
             let panics = &mut panics;
+            let fatal = &mut fatal;
             async move {
                 while let Some(res) = tasks.join_next().await {
-                    tally_join_result(res, errors, panics);
+                    tally_or_collect(res, errors, panics, fatal);
                 }
             }
         };
 
-        match tokio::time::timeout(drain_timeout, drain).await {
+        let outcome = match tokio::time::timeout(drain_timeout, drain).await {
             Ok(()) => SupervisorOutcome {
                 errors,
                 panics,
@@ -346,7 +395,7 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
                 );
                 self.tasks.abort_all();
                 while let Some(res) = self.tasks.join_next().await {
-                    tally_join_result(res, &mut errors, &mut panics);
+                    tally_or_collect(res, &mut errors, &mut panics, &mut fatal);
                 }
                 SupervisorOutcome {
                     errors,
@@ -354,6 +403,30 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
                     timed_out: true,
                 }
             }
+        };
+        RunReport { outcome, fatal }
+    }
+}
+
+/// [`tally_join_result`], except that a fatal error is also kept for the
+/// report: it counts one error, like any other, and is pushed onto `fatal`.
+/// Returns whether the subscription ended with a fatal error.
+fn tally_or_collect(
+    res: std::result::Result<Result<()>, JoinError>,
+    errors: &mut usize,
+    panics: &mut usize,
+    fatal: &mut Vec<ShoveError>,
+) -> bool {
+    match res {
+        Ok(Err(e)) if e.is_fatal() => {
+            tracing::error!(error = %e, "broadcast subscription ended with a fatal error");
+            *errors += 1;
+            fatal.push(e);
+            true
+        }
+        other => {
+            tally_join_result(other, errors, panics);
+            false
         }
     }
 }

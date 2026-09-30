@@ -445,6 +445,8 @@ An idle transactional topic therefore reads a lag of 1 until the next record arr
 On shutdown the consumer first waits for its in-flight handlers to finish.
 That wait is bounded by the handler timeout and by any in-place delays.
 It then drains the republish queue and commits its final position **synchronously**.
+That commit carries every partition's current position, whether or not an earlier asynchronous commit already offered it.
+It therefore confirms every safe position, including one an asynchronous commit still in flight may not have landed.
 The commit runs on a dedicated thread that also owns the consumer's close.
 The thread is spawned before it is handed the consumer, so a failed spawn never closes the consumer on the runtime thread.
 If no thread can be spawned, nothing commits and the close moves to a second, close-only thread.
@@ -453,8 +455,19 @@ The leaked consumer keeps heartbeating, so while the process lives its partition
 Once the process exits, the broker drops the member after the session timeout, as after a crash.
 The consumer waits for that commit for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
 The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
-Past the deadline the consumer logs that the batch may be redelivered and returns.
 The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
+
+A final commit that does not land ends the member with `ShoveError::Commit` instead of a clean exit.
+The error names the topic, the position the commit carried per partition, and a `CommitFailure`.
+`Rejected` carries the broker's answer, `Deadline` means nothing answered within the 20 s, and `NoThread` means no thread could be spawned for the commit.
+`Rejected` and `NoThread` say nothing landed; `Deadline` says the result is unknown, because the detached thread may still land the commit.
+The error carries positions and the broker's error text only, never a record's payload, key or headers.
+The error is fatal: a consumer group run ends on it without waiting for its stop signal, drains the other members, and counts it once under `SupervisorOutcome::errors`.
+`run_until_timeout_with_report` returns it typed in `RunReport::fatal`, and `exit_code()` is 1 where it was 0 before 0.16.
+With autoscaling on, the member is not replaced.
+A member with nothing to commit has no commit to fail and still ends clean.
+An acknowledged offset on a partition a rebalance revoked before the stop is not part of the final commit and raises no error.
+Its tracker went with the partition, and the new owner redelivers the record, which is at-least-once delivery as before.
 
 What that means for replay:
 
@@ -464,7 +477,7 @@ What that means for replay:
 - After a rebalance, a moved partition replays from its last accepted commit.
 - After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
   A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
-  So is the last batch when the final commit hits its deadline.
+  So are the records behind the positions of a final commit that was rejected or hit its deadline, and the member reports that with `ShoveError::Commit`.
   An asynchronous commit librdkafka was still retrying can also land after the final one.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.
 

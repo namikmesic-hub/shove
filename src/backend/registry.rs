@@ -8,9 +8,10 @@
 
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{RunReport, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
@@ -115,4 +116,35 @@ pub(crate) trait RegistryImpl: Send {
     ) -> impl Future<Output = SupervisorOutcome> + Send
     where
         S: Future<Output = ()> + Send + 'static;
+
+    /// The receiver of the fatal errors this registry's members end with
+    /// ([`ShoveError::is_fatal`]), taken once by the run that owns the
+    /// registry so it can end on the first such error. `None`, the default,
+    /// for a backend whose members report none: that run ends on its stop
+    /// signal alone.
+    fn take_fatal_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<ShoveError>> {
+        None
+    }
+
+    /// [`run_until_timeout`](Self::run_until_timeout) with the fatal errors
+    /// that ended the run beside the outcome. The default wraps
+    /// `run_until_timeout` with an empty `fatal`, for a backend whose
+    /// members report no fatal error; a backend with a fatal path overrides
+    /// it to select on its fatal channel beside the stop signal.
+    fn run_until_timeout_with_report<S>(
+        self,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> impl Future<Output = RunReport> + Send
+    where
+        S: Future<Output = ()> + Send + 'static,
+        Self: Sized,
+    {
+        async move {
+            RunReport {
+                outcome: self.run_until_timeout(signal, drain_timeout).await,
+                fatal: Vec::new(),
+            }
+        }
+    }
 }

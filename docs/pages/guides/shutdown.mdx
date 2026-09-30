@@ -67,6 +67,25 @@ impl SupervisorOutcome {
 
 The priority ordering for `exit_code()` is: `timed_out` (3) > `panics` (2) > `errors` (1) > clean (0).
 
+## Fatal errors and `RunReport`
+
+Most consumer task errors end that task alone: the run keeps waiting for its signal, and the error is counted at the drain.
+A **fatal** error (`ShoveError::is_fatal()`) ends the run instead.
+The group or subscriber cancels its other tasks, drains them and returns without waiting for its signal, and autoscaling does not replace the member.
+On this version the one fatal error is `ShoveError::Commit`: a Kafka member whose final offset commit did not land when it stopped, see [Kafka → Offset commit semantics](/backends/kafka#offset-commit-semantics).
+`run_until_timeout` counts it under `errors`, so `exit_code()` is `1`.
+`run_until_timeout_with_report` on `ConsumerGroup` and `BroadcastSubscriber` returns a `RunReport` with the same `outcome` and the fatal errors themselves in `fatal`, for a process that decides from the error rather than from the code:
+
+```rust,no_run
+let report = group
+    .run_until_timeout_with_report(signal, Duration::from_secs(30))
+    .await;
+for error in &report.fatal {
+    tracing::error!(%error, "a member ended the run");
+}
+std::process::exit(report.outcome.exit_code());
+```
+
 ## exit\_code() mapping
 
 | Field state | exit_code() | Meaning |

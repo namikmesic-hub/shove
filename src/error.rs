@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::batch::BatchFailure;
 
 /// Errors that can occur during pub/sub operations.
@@ -50,6 +52,77 @@ pub enum ShoveError {
     /// [`Publisher::publish_batch`]: crate::publisher::Publisher::publish_batch
     #[error("batch publish: {0}")]
     PartialBatch(Box<BatchFailure>),
+
+    /// The final offset commit of a stopping consumer did not land.
+    ///
+    /// The Kafka receive loop returns this from its shutdown arm when the
+    /// synchronous commit it issues after the handler drain is rejected,
+    /// misses the shutdown deadline, or has no thread to run on. The member
+    /// ends with this error instead of a clean exit: a group run counts it
+    /// under [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors),
+    /// ends on it without an external stop, and returns it in
+    /// [`RunReport::fatal`](crate::RunReport::fatal). It is fatal
+    /// ([`is_fatal`](Self::is_fatal)) and not retryable, so a consumer that
+    /// reconnects on transient errors returns it instead.
+    ///
+    /// The records behind the uncommitted positions are redelivered to the
+    /// next member of the group, which is at-least-once delivery made
+    /// visible. The error is not raised for a position the member never
+    /// tried to commit: an acknowledged offset on a partition a rebalance
+    /// revoked is dropped with the partition and redelivered by its new
+    /// owner, silently, as before.
+    #[error(
+        "final offset commit on '{topic}' did not land for {}: {kind}",
+        format_offsets(offsets)
+    )]
+    Commit {
+        /// The topic the member consumed.
+        topic: String,
+        /// The offsets the consumer tried to commit, per partition: one
+        /// `(partition, offset)` pair per partition the member held, the
+        /// offset exclusive as Kafka commits it. Never empty: a member with
+        /// nothing to commit has no commit to fail.
+        offsets: Vec<(i32, i64)>,
+        /// Rejected by the coordinator, or unknown after the deadline.
+        kind: CommitFailure,
+    },
+}
+
+/// Why the final offset commit of a stopping consumer did not land; the
+/// `kind` of [`ShoveError::Commit`].
+///
+/// `#[non_exhaustive]`: match with a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CommitFailure {
+    /// The coordinator answered the commit with an error, carried as text.
+    /// Nothing landed. Also used, with a message that says so, when the
+    /// commit thread ended without reporting a result.
+    ///
+    /// The text is librdkafka's rendering of the broker's answer: the error
+    /// code and its description, and nothing else. It never carries a
+    /// record's payload, key or headers, nor a personal or account
+    /// identifier taken from one, so it is safe to log and to return as is.
+    #[error("rejected: {0}")]
+    Rejected(String),
+    /// The commit had no answer within the shutdown deadline it carries.
+    /// The result is unknown: the detached commit thread may still land it
+    /// after the consumer has returned.
+    #[error("no answer within the {0:?} shutdown deadline; the result is unknown")]
+    Deadline(Duration),
+    /// No thread could be spawned to run the commit, so nothing was
+    /// committed and the consumer's close moved off the runtime by itself.
+    #[error("no thread could be spawned for the commit; nothing was committed")]
+    NoThread,
+}
+
+/// `[p0@o0, p1@o1]`, the `offsets` of [`ShoveError::Commit`] in its message.
+fn format_offsets(offsets: &[(i32, i64)]) -> String {
+    let pairs: Vec<String> = offsets
+        .iter()
+        .map(|(partition, offset)| format!("{partition}@{offset}"))
+        .collect();
+    format!("[{}]", pairs.join(", "))
 }
 
 impl ShoveError {
@@ -66,6 +139,17 @@ impl ShoveError {
             ShoveError::PartialBatch(f) => f.source().is_retryable(),
             _ => false,
         }
+    }
+
+    /// Returns `true` for an error that ends the run owning the consumer it
+    /// came from: a consumer group's or a broadcast subscriber's
+    /// `run_until_timeout` cancels its siblings, drains and returns when a
+    /// member ends with one, and autoscaling does not replace that member.
+    /// Every other error ends the member alone, as before.
+    ///
+    /// True for [`Commit`](Self::Commit). A fatal error is never retryable.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, ShoveError::Commit { .. })
     }
 }
 
@@ -122,6 +206,61 @@ mod tests {
             source: inner,
         };
         assert!(!err.is_retryable());
+    }
+
+    fn commit_error() -> ShoveError {
+        ShoveError::Commit {
+            topic: "orders".into(),
+            offsets: vec![(0, 8), (3, 12)],
+            kind: CommitFailure::Rejected("Broker: Group authorization failed".into()),
+        }
+    }
+
+    #[test]
+    fn display_commit_error_names_the_topic_the_offsets_and_the_kind() {
+        assert_eq!(
+            commit_error().to_string(),
+            "final offset commit on 'orders' did not land for [0@8, 3@12]: \
+             rejected: Broker: Group authorization failed"
+        );
+        let deadline = ShoveError::Commit {
+            topic: "orders".into(),
+            offsets: vec![(0, 8)],
+            kind: CommitFailure::Deadline(Duration::from_secs(20)),
+        };
+        assert_eq!(
+            deadline.to_string(),
+            "final offset commit on 'orders' did not land for [0@8]: no answer within the 20s \
+             shutdown deadline; the result is unknown"
+        );
+        assert_eq!(
+            CommitFailure::NoThread.to_string(),
+            "no thread could be spawned for the commit; nothing was committed"
+        );
+    }
+
+    /// A failed final commit ends the owning run and is never retried: a
+    /// reconnect would rejoin the group with the position still uncommitted
+    /// and read as a clean member.
+    #[test]
+    fn commit_error_is_fatal_and_not_retryable() {
+        let err = commit_error();
+        assert!(err.is_fatal());
+        assert!(!err.is_retryable());
+    }
+
+    /// Only `Commit` is fatal: a connection error keeps reconnecting and a
+    /// topology error keeps ending the member alone.
+    #[test]
+    fn every_other_error_is_not_fatal() {
+        for err in [
+            ShoveError::Connection("channel closed".into()),
+            ShoveError::Topology("missing exchange".into()),
+            ShoveError::Validation("too large".into()),
+            ShoveError::Unknown("boom".into()),
+        ] {
+            assert!(!err.is_fatal(), "{err}");
+        }
     }
 
     /// `PartialBatch` has no retryability of its own — it inherits the

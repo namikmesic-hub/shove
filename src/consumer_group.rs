@@ -11,7 +11,7 @@ use crate::autoscaler::AutoscalerConfig;
 use crate::backend::RegistryImpl;
 use crate::backend::capability::HasCoordinatedGroups;
 use crate::broadcast::reject_broadcast;
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{RunReport, SupervisorOutcome, drain_fatal, next_fatal};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 #[cfg(feature = "kafka")]
@@ -249,18 +249,58 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         self
     }
 
+    /// Run every registered group until `signal` resolves, the group's
+    /// cancellation token fires, or a member ends with a fatal error, then
+    /// drain in-flight work for up to `drain_timeout` and return the tally.
+    ///
+    /// The same run as
+    /// [`run_until_timeout_with_report`](Self::run_until_timeout_with_report),
+    /// which also returns the fatal errors themselves; this returns its
+    /// `outcome`.
     pub async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
+        self.run_until_timeout_with_report(signal, drain_timeout)
+            .await
+            .outcome
+    }
+
+    /// [`run_until_timeout`](Self::run_until_timeout), plus the fatal
+    /// errors that ended the run.
+    ///
+    /// A member that ends with an error for which
+    /// [`ShoveError::is_fatal`] is true ends the
+    /// run: every group is cancelled and drained as on the stop signal, the
+    /// error counts one under [`SupervisorOutcome::errors`], and it is
+    /// returned in [`RunReport::fatal`] in arrival order. With autoscaling
+    /// on, the member is not replaced. Every other error ends the member
+    /// alone and is only counted, as before. On Kafka the one fatal error is
+    /// [`ShoveError::Commit`], a final offset
+    /// commit that did not land when a member stopped.
+    pub async fn run_until_timeout_with_report<S>(
+        self,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> RunReport
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
         let Some(config) = self.autoscaler else {
-            return self.inner.run_until_timeout(signal, drain_timeout).await;
+            return self
+                .inner
+                .run_until_timeout_with_report(signal, drain_timeout)
+                .await;
         };
 
         let mut inner = self.inner;
         // Token we race the external signal against; cancelling it cascades to
         // consumers exactly as the non-autoscaling path's broker token does.
         let consumer_token = inner.cancellation_token();
+        // Taken before the registry is shared with the autoscaler, so the
+        // select below owns the one receiver of the members' fatal errors.
+        let mut fatal_rx = inner.take_fatal_receiver();
+        let mut fatal = Vec::new();
         inner.start_all();
 
         let registry = Arc::new(Mutex::new(inner));
@@ -270,11 +310,20 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         let handle =
             B::spawn_autoscaler(&self.client, registry.clone(), config, auto_token.clone());
 
-        // Wait for the external signal or an externally-triggered cancel.
+        // Wait for the external signal, an externally-triggered cancel, or a
+        // member that ended with a fatal error.
         let mut signal_task = tokio::spawn(signal);
         tokio::select! {
             _ = consumer_token.cancelled() => { signal_task.abort(); }
             res = &mut signal_task => { let _ = res; }
+            e = next_fatal(&mut fatal_rx) => {
+                tracing::error!(
+                    error = %e,
+                    "a consumer group member ended with a fatal error; stopping the run"
+                );
+                fatal.push(e);
+                signal_task.abort();
+            }
         }
 
         // Stop the autoscaler first; bounded-join so a stuck metrics poll can't
@@ -315,7 +364,8 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
 
         let mut outcome = inner.drain_until_timeout(drain_timeout).await;
         outcome.panics += autoscaler_panics;
-        outcome
+        drain_fatal(&mut fatal_rx, &mut fatal);
+        RunReport { outcome, fatal }
     }
 }
 

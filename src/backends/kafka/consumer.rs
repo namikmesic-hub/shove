@@ -35,7 +35,7 @@ use crate::broadcast::BroadcastStart;
 use crate::consumer::RetryStrategy;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
-use crate::error::Result;
+use crate::error::{CommitFailure, Result};
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
@@ -384,6 +384,30 @@ impl PartitionTracker {
         }
     }
 
+    /// The shutdown drain: the current commit position and the discards it
+    /// retires, whether or not an earlier drain offered the same position.
+    ///
+    /// `drain_committable` offers a position only on new progress or after
+    /// a rejected commit, which is right for the asynchronous cadence: a
+    /// position offered once is in flight, and offering it again would only
+    /// add a request. At shutdown that rule left a hole. The last
+    /// asynchronous commit may still be in flight, or a rebalance may have
+    /// dropped it without a callback, and with no new completion the final
+    /// `Sync` commit had nothing to confirm. Re-offering every position
+    /// makes that commit confirm every safe position. A commit of an
+    /// already committed offset is a broker-side no-op, as the rebalance
+    /// re-offer in `OffsetTracker::apply_rebalance_events` relies on, and
+    /// the position never lowers, see `position`.
+    fn drain_all(&mut self) -> (i64, Vec<TerminalDiscard>) {
+        let next = self.position();
+        self.next_to_commit = self.next_to_commit.max(next);
+        self.dirty = false;
+        // `next` is exclusive, so everything strictly below it is covered.
+        let remainder = self.pending_discards.split_off(&next);
+        let covered = std::mem::replace(&mut self.pending_discards, remainder);
+        (next, covered.into_values().collect())
+    }
+
     /// How long this partition has been continuously dirty, or `None` if
     /// it's currently clean.
     fn stuck_for(&self, now: Instant) -> Option<Duration> {
@@ -566,6 +590,39 @@ impl OffsetTracker {
         }
         tpl.map(|tpl| (tpl, discards))
     }
+
+    /// Every partition's current position for the final commit at shutdown,
+    /// see `PartitionTracker::drain_all`, with the discards those positions
+    /// retire. `None` when no partition is tracked: the member has nothing
+    /// to commit.
+    fn drain_all(&mut self) -> Option<(TopicPartitionList, Vec<TerminalDiscard>)> {
+        let mut tpl: Option<TopicPartitionList> = None;
+        let mut discards = Vec::new();
+        for (&partition, tracker) in &mut self.partitions {
+            let (commit_offset, covered) = tracker.drain_all();
+            discards.extend(covered);
+            tpl.get_or_insert_with(TopicPartitionList::new)
+                .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
+                .ok();
+        }
+        tpl.map(|tpl| (tpl, discards))
+    }
+}
+
+/// The `(partition, offset)` pairs a commit carries, in partition order, for
+/// `ShoveError::Commit::offsets` and the shutdown diagnostics. Positions
+/// only: nothing of the records behind them.
+fn committed_offsets(tpl: &TopicPartitionList) -> Vec<(i32, i64)> {
+    let mut offsets: Vec<(i32, i64)> = tpl
+        .elements()
+        .iter()
+        .filter_map(|e| match e.offset() {
+            Offset::Offset(offset) => Some((e.partition(), offset)),
+            _ => None,
+        })
+        .collect();
+    offsets.sort_unstable();
+    offsets
 }
 
 // ---------------------------------------------------------------------------
@@ -2770,11 +2827,14 @@ pub(super) fn reject_fifo_commit_interval(queue: &str) -> ShoveError {
 /// thread is spawned before it is handed the consumer, and a spawn failure
 /// disposes of the consumer off the runtime too; see
 /// [`final_commit_on_thread`] and [`close_off_runtime_or_leak`].
+///
+/// The `Err` is the [`CommitFailure`] the shutdown arm reports in
+/// `ShoveError::Commit`: the broker's answer, the deadline, or no thread.
 async fn final_commit_off_runtime(
     consumer: Arc<KafkaStreamConsumer>,
     tpl: Option<TopicPartitionList>,
     queue: &str,
-) -> KafkaResult<()> {
+) -> std::result::Result<(), CommitFailure> {
     final_commit_on_thread(consumer, tpl, queue, &mut |name, body| {
         #[cfg(feature = "test-support")]
         if final_commit_spawn_probe::refused() {
@@ -2836,16 +2896,22 @@ impl FinalCommit for Arc<KafkaStreamConsumer> {
 /// A closure that owned the consumer would be dropped inside a failed
 /// `spawn`, on this thread, and `rd_kafka_consumer_close` would run right
 /// here, which is the one thing this function exists to prevent. When no
-/// thread can be spawned nothing commits: the failure is reported the way a
-/// rejected commit is, so the caller settles its discards as survived, and
-/// the consumer goes to [`close_off_runtime_or_leak`], never to a drop on
-/// this thread.
+/// thread can be spawned nothing commits: the failure is reported as
+/// [`CommitFailure::NoThread`], so the caller settles its discards as
+/// survived, and the consumer goes to [`close_off_runtime_or_leak`], never
+/// to a drop on this thread.
+///
+/// The other two kinds: the broker's answer to the commit is
+/// [`CommitFailure::Rejected`] with librdkafka's text for it, and a commit
+/// with no answer within `SHUTDOWN_COMMIT_DEADLINE` is
+/// [`CommitFailure::Deadline`], its result unknown because the thread keeps
+/// waiting for it.
 async fn final_commit_on_thread<C, S>(
     consumer: C,
     tpl: Option<TopicPartitionList>,
     queue: &str,
     spawn: &mut S,
-) -> KafkaResult<()>
+) -> std::result::Result<(), CommitFailure>
 where
     C: FinalCommit,
     S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
@@ -2871,27 +2937,31 @@ where
         tracing::error!(
             queue,
             error = %e,
-            "could not spawn the final commit thread; nothing commits, the batch may be redelivered"
+            "could not spawn the final commit thread; nothing commits, and the records behind \
+             the uncommitted positions are redelivered"
         );
         close_off_runtime_or_leak(consumer, queue, spawn);
-        return Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail));
+        return Err(CommitFailure::NoThread);
     }
     match tokio::time::timeout(SHUTDOWN_COMMIT_DEADLINE, done_rx).await {
-        Ok(Ok(result)) => result,
+        // librdkafka's text for the broker's answer: the error code and its
+        // description, and nothing of the records behind the positions.
+        Ok(Ok(result)) => result.map_err(|e| CommitFailure::Rejected(e.to_string())),
         Ok(Err(_recv)) => {
             tracing::warn!(queue, "final commit thread ended without a result");
-            Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
+            Err(CommitFailure::Rejected(
+                "the final commit thread ended without reporting a result".to_string(),
+            ))
         }
         Err(_elapsed) => {
             tracing::warn!(
                 queue,
                 deadline = ?SHUTDOWN_COMMIT_DEADLINE,
                 "final offset commit did not finish within the shutdown deadline; \
-                 giving up on its result, the batch may be redelivered"
+                 giving up on its result, the records behind the uncommitted positions may be \
+                 redelivered"
             );
-            Err(KafkaError::ConsumerCommit(
-                RDKafkaErrorCode::RequestTimedOut,
-            ))
+            Err(CommitFailure::Deadline(SHUTDOWN_COMMIT_DEADLINE))
         }
     }
 }
@@ -4517,10 +4587,17 @@ impl KafkaConsumer {
                                 tracker.mark_complete(completion);
                             }
                             tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
-                            let (tpl, discards) = match tracker.drain_committable() {
+                            // Every partition's current position, whether or
+                            // not an earlier asynchronous drain offered it:
+                            // the final `Sync` commit confirms every safe
+                            // position, including one an in-flight
+                            // asynchronous commit may not have landed. See
+                            // `PartitionTracker::drain_all`.
+                            let (tpl, discards) = match tracker.drain_all() {
                                 Some((tpl, discards)) => (Some(tpl), discards),
                                 None => (None, Vec::new()),
                             };
+                            let offsets = tpl.as_ref().map(committed_offsets).unwrap_or_default();
                             // The commit and the consumer's close both block:
                             // `CommitMode::Sync` waits for the coordinator, and
                             // `Drop` runs `rd_kafka_consumer_close`. A frozen
@@ -4539,15 +4616,46 @@ impl KafkaConsumer {
                                     for discard in discards {
                                         discard.confirm();
                                     }
+                                    return Ok(());
                                 }
-                                Err(e) => {
-                                    tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
+                                Err(kind) => {
                                     for discard in discards {
                                         discard.survived();
                                     }
+                                    if offsets.is_empty() {
+                                        // Nothing was offered, so no commit
+                                        // failed: only the close could not run
+                                        // on the commit thread, and
+                                        // `close_off_runtime_or_leak` has dealt
+                                        // with that.
+                                        tracing::warn!(
+                                            queue,
+                                            error = %kind,
+                                            "no final offset commit to make; the consumer ends clean"
+                                        );
+                                        return Ok(());
+                                    }
+                                    // The member ends with the failure instead
+                                    // of a clean exit. `Commit` is not
+                                    // retryable, so `run_with_reconnect`
+                                    // returns it, and it is fatal, so a group
+                                    // run ends on it and does not replace the
+                                    // member.
+                                    tracing::error!(
+                                        queue,
+                                        error = %kind,
+                                        ?offsets,
+                                        "final offset commit failed during shutdown; the records behind \
+                                         these positions are redelivered, and the consumer ends with \
+                                         ShoveError::Commit"
+                                    );
+                                    return Err(ShoveError::Commit {
+                                        topic: queue.to_string(),
+                                        offsets,
+                                        kind,
+                                    });
                                 }
                             }
-                            return Ok(());
                         }
                         fault = fault_rx.recv() => {
                             // `None` cannot happen while `fault_tx` lives in
@@ -7538,6 +7646,109 @@ mod offset_tracker_tests {
         }
     }
 
+    /// The shutdown drain re-offers the position an asynchronous drain has
+    /// already offered: the last asynchronous commit may still be in flight,
+    /// and with no new completion `drain_committable` would give the final
+    /// `Sync` commit nothing to confirm.
+    #[test]
+    fn the_shutdown_drain_re_offers_a_position_an_earlier_drain_offered() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        for offset in 0..5 {
+            tracker.track_received(0, offset);
+        }
+        for offset in 0..5 {
+            tracker.mark_complete(Completion::plain(0, offset));
+        }
+        let offered = drain_tpl(&mut tracker).expect("progress to 5 is offered");
+        assert_eq!(committed_offset(&offered, 0), Some(5));
+
+        assert!(
+            tracker.drain_committable().is_none(),
+            "nothing new completed, so the asynchronous drain offers nothing"
+        );
+
+        let (again, discards) = tracker
+            .drain_all()
+            .expect("the shutdown drain offers every partition");
+        assert_eq!(committed_offset(&again, 0), Some(5));
+        assert!(discards.is_empty());
+    }
+
+    /// The shutdown drain covers every partition the member holds, each at
+    /// its own position, including one with nothing completed under this
+    /// assignment, whose position is the offset it started at.
+    #[test]
+    fn the_shutdown_drain_offers_every_partitions_current_position() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 10);
+        tracker.mark_complete(Completion::plain(0, 10));
+        // Delivered and still in flight: the position is the offset itself.
+        tracker.track_received(1, 7);
+        // 4 completed behind 3, which is still in flight and holds the position.
+        tracker.track_received(2, 3);
+        tracker.track_received(2, 4);
+        tracker.mark_complete(Completion::plain(2, 4));
+
+        let (tpl, discards) = tracker.drain_all().expect("three partitions");
+        assert_eq!(committed_offset(&tpl, 0), Some(11));
+        assert_eq!(committed_offset(&tpl, 1), Some(7));
+        assert_eq!(committed_offset(&tpl, 2), Some(3));
+        assert!(discards.is_empty());
+    }
+
+    /// The discards below the offered position ride the shutdown drain, so
+    /// the final commit's result settles them as an asynchronous one would.
+    #[test]
+    fn the_shutdown_drain_hands_out_the_discards_its_positions_retire() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.track_received(0, 1);
+        tracker.mark_complete(terminal(0));
+
+        let (tpl, discards) = tracker.drain_all().expect("partition 0");
+        assert_eq!(committed_offset(&tpl, 0), Some(1), "1 is still in flight");
+        assert_eq!(discards.len(), 1, "the discard riding offset 0 is covered");
+        for discard in discards {
+            discard.survived();
+        }
+    }
+
+    /// A partition revoked while its work is pending leaves the final
+    /// commit: its tracker is dropped with the partition, so the member
+    /// commits nothing it no longer owns and the new owner redelivers. The
+    /// partition the member keeps commits its own position.
+    #[test]
+    fn a_partition_revoked_while_work_is_pending_is_not_in_the_final_commit() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 5);
+        tracker.track_received(0, 6);
+        tracker.mark_complete(Completion::plain(0, 5));
+        tracker.track_received(1, 2);
+        tracker.mark_complete(Completion::plain(1, 2));
+
+        // Partition 0 moves to another member with offset 6 still in flight,
+        // and its late completion arrives after the move.
+        tracker.remove(0);
+        tracker.mark_complete(Completion::plain(0, 6));
+
+        let (tpl, discards) = tracker.drain_all().expect("partition 1 remains");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            None,
+            "a revoked partition is not in the final commit"
+        );
+        assert_eq!(committed_offset(&tpl, 1), Some(3));
+        assert!(discards.is_empty());
+    }
+
+    /// A member that never held a partition has nothing to commit, so the
+    /// shutdown arm makes no commit and ends clean.
+    #[test]
+    fn the_shutdown_drain_offers_nothing_with_no_partition() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        assert!(tracker.drain_all().is_none());
+    }
+
     /// The discard surfaces on the drain that commits past its offset, and
     /// not before — a gap holding the commit back also holds the accounting.
     #[test]
@@ -9276,10 +9487,12 @@ mod final_commit_thread_tests {
         },
     }
 
-    /// Stands in for the consumer: a commit succeeds and is recorded with
-    /// its offsets, and the drop reports the thread it ran on.
+    /// Stands in for the consumer: a commit answers as `answer` says and is
+    /// recorded with its offsets, and the drop reports the thread it ran on.
     struct DropProbe {
         events: std_mpsc::Sender<Event>,
+        /// `None` for a commit that lands; the broker's error otherwise.
+        answer: Option<KafkaError>,
     }
 
     impl FinalCommit for DropProbe {
@@ -9293,6 +9506,23 @@ mod final_commit_thread_tests {
                 thread: std::thread::current().id(),
                 offsets,
             });
+            match &self.answer {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// Stands in for a consumer whose commit does not answer, like a commit
+    /// to a frozen coordinator: `commit_sync` blocks until `release` is
+    /// signalled or dropped.
+    struct BlockingProbe {
+        release: std_mpsc::Receiver<()>,
+    }
+
+    impl FinalCommit for BlockingProbe {
+        fn commit_sync(&self, _tpl: &TopicPartitionList) -> KafkaResult<()> {
+            let _ = self.release.recv();
             Ok(())
         }
     }
@@ -9308,8 +9538,12 @@ mod final_commit_thread_tests {
     }
 
     fn probe() -> (DropProbe, std_mpsc::Receiver<Event>) {
+        probe_answering(None)
+    }
+
+    fn probe_answering(answer: Option<KafkaError>) -> (DropProbe, std_mpsc::Receiver<Event>) {
         let (events, seen) = std_mpsc::channel();
-        (DropProbe { events }, seen)
+        (DropProbe { events, answer }, seen)
     }
 
     /// `std::thread::Builder`, as production uses it.
@@ -9412,13 +9646,7 @@ mod final_commit_thread_tests {
         let result =
             final_commit_on_thread(probe, Some(one_offset()), "orders", &mut failing_spawner(1))
                 .await;
-        assert!(
-            matches!(
-                result,
-                Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
-            ),
-            "{result:?}"
-        );
+        assert_eq!(result, Err(CommitFailure::NoThread));
         let events = events_until_the_drop(&seen);
         let [Event::Drop { thread, name }] = events.as_slice() else {
             panic!("the drop and no commit: {events:?}");
@@ -9445,18 +9673,75 @@ mod final_commit_thread_tests {
             &mut failing_spawner(usize::MAX),
         )
         .await;
-        assert!(
-            matches!(
-                result,
-                Err(KafkaError::ConsumerCommit(RDKafkaErrorCode::Fail))
-            ),
-            "{result:?}"
-        );
+        assert_eq!(result, Err(CommitFailure::NoThread));
         assert_eq!(
             seen.try_recv().ok(),
             None,
             "no commit and no close: the handle must be leaked, never closed on the runtime thread"
         );
+    }
+
+    /// A commit the coordinator rejects is reported as `Rejected` with
+    /// librdkafka's text for the broker's answer, and the consumer still
+    /// closes on the thread after it. This is the failure the shutdown arm
+    /// turns into `ShoveError::Commit` instead of a clean exit.
+    #[tokio::test]
+    async fn a_rejected_commit_is_reported_with_the_brokers_text_and_the_close_still_runs() {
+        let (probe, seen) = probe_answering(Some(KafkaError::ConsumerCommit(
+            RDKafkaErrorCode::GroupAuthorizationFailed,
+        )));
+        let result =
+            final_commit_on_thread(probe, Some(one_offset()), "orders", &mut real_spawner()).await;
+        let Err(CommitFailure::Rejected(text)) = result else {
+            panic!("a rejected commit is reported as Rejected: {result:?}");
+        };
+        assert!(
+            text.contains("Group authorization failed"),
+            "the broker's text is carried: {text}"
+        );
+        let events = events_until_the_drop(&seen);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::Commit { .. }, Event::Drop { .. }]
+            ),
+            "the commit, then the close: {events:?}"
+        );
+    }
+
+    /// A commit with no answer within `SHUTDOWN_COMMIT_DEADLINE` is reported
+    /// as `Deadline` carrying that deadline, while the thread keeps waiting
+    /// for the answer. Paused time: the deadline elapses as soon as nothing
+    /// else can make progress, which is at once, so the test does not wait
+    /// the real 20 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_past_the_deadline_is_reported_as_the_deadline() {
+        let (release_tx, release) = std_mpsc::channel::<()>();
+        let result = final_commit_on_thread(
+            BlockingProbe { release },
+            Some(one_offset()),
+            "orders",
+            &mut real_spawner(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err(CommitFailure::Deadline(SHUTDOWN_COMMIT_DEADLINE))
+        );
+        // Let the thread finish; its late answer has nobody listening.
+        let _ = release_tx.send(());
+    }
+
+    /// The offsets `ShoveError::Commit` carries are the commit's positions in
+    /// partition order, whatever order the partition list holds them in.
+    #[test]
+    fn committed_offsets_lists_the_positions_in_partition_order() {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset("orders", 3, Offset::Offset(12))
+            .expect("a literal partition offset");
+        tpl.add_partition_offset("orders", 0, Offset::Offset(8))
+            .expect("a literal partition offset");
+        assert_eq!(committed_offsets(&tpl), vec![(0, 8), (3, 12)]);
     }
 }
 
