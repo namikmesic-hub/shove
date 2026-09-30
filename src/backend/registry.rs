@@ -126,6 +126,15 @@ pub(crate) trait RegistryImpl: Send {
         None
     }
 
+    /// Cancel every group this registry owns, and nothing else: the stop a
+    /// fatal member error triggers. The stop signal cancels the registry's
+    /// [`cancellation_token`](Self::cancellation_token), which on a backend
+    /// whose registries share their client's token stops every registry on
+    /// that client; a fatal error must stay inside the run that owns the
+    /// member. The default does nothing, for a backend whose members report
+    /// no fatal error: its drain cancels each group in turn anyway.
+    fn cancel_groups(&mut self) {}
+
     /// [`run_until_timeout`](Self::run_until_timeout) with the fatal errors
     /// that ended the run beside the outcome. The default wraps
     /// `run_until_timeout` with an empty `fatal`, for a backend whose

@@ -301,6 +301,10 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // select below owns the one receiver of the members' fatal errors.
         let mut fatal_rx = inner.take_fatal_receiver();
         let mut fatal = Vec::new();
+        // Whether the stop below came from a member's fatal error, whose
+        // scope is this run's groups and not the token they share with every
+        // other registry on the client.
+        let mut ended_by_fatal = false;
         inner.start_all();
 
         let registry = Arc::new(Mutex::new(inner));
@@ -322,6 +326,7 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
                     "a consumer group member ended with a fatal error; stopping the run"
                 );
                 fatal.push(e);
+                ended_by_fatal = true;
                 signal_task.abort();
             }
         }
@@ -349,7 +354,7 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         }
 
         // Autoscaler task (and its registry Arc clone) is now gone: sole owner.
-        let inner = Arc::try_unwrap(registry)
+        let mut inner = Arc::try_unwrap(registry)
             .unwrap_or_else(|_| unreachable!("autoscaler joined; registry Arc must be sole-owned"))
             .into_inner();
 
@@ -359,8 +364,14 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // concurrently before any sequential per-group drain begins.
         // Without this, drain_all_into cancels groups one at a time as it
         // iterates, so groups 2..N keep consuming until the sequential drain
-        // reaches them.
-        consumer_token.cancel();
+        // reaches them. A fatal member error stops this run's groups and
+        // nothing else: the token above is the client's, shared with every
+        // other registry on it.
+        if ended_by_fatal {
+            inner.cancel_groups();
+        } else {
+            consumer_token.cancel();
+        }
 
         let mut outcome = inner.drain_until_timeout(drain_timeout).await;
         outcome.panics += autoscaler_panics;

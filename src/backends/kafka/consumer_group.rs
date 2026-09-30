@@ -799,8 +799,19 @@ impl KafkaConsumerGroup {
             .retain_mut(|handle| !harvest_if_finished(handle, panic_count, queue));
     }
 
-    /// Spawn one additional consumer. Returns false at max capacity.
+    /// Spawn one additional consumer. Returns false at max capacity, and
+    /// false after a member ended with a fatal error: that error ends the run
+    /// that owns this group, so a member added in the window before the run
+    /// cancels the group would only meet the same shutdown, exactly as
+    /// [`ensure_min`](Self::ensure_min) refuses to replace one.
     pub fn scale_up(&mut self) -> bool {
+        if self.faults.is_fatal() {
+            debug!(
+                group = %self.queue,
+                "scale_up rejected: a member ended with a fatal error"
+            );
+            return false;
+        }
         self.prune_finished();
         if self.consumers.len() >= self.config.max_consumers as usize {
             debug!(group = %self.queue, max = self.config.max_consumers, "scale_up rejected: at max capacity");
@@ -1071,6 +1082,11 @@ impl KafkaConsumerGroup {
 pub struct KafkaConsumerGroupRegistry {
     pub(crate) groups: HashMap<String, KafkaConsumerGroup>,
     client: Option<KafkaClient>,
+    /// The client's shutdown token, the parent of every group token this
+    /// registry creates. The run's stop signal cancels it, and so stops every
+    /// registry on the same client, as before; a fatal member error cancels
+    /// only this registry's groups, see [`cancel_groups`](Self::cancel_groups).
+    shutdown_token: CancellationToken,
     /// The channel every group's members report a fatal error on. The run
     /// that owns this registry takes `fatal_rx` once and selects on it
     /// beside its stop signal; `fatal_tx` lives as long as the registry so
@@ -1091,9 +1107,11 @@ pub struct KafkaConsumerGroupRegistry {
 impl KafkaConsumerGroupRegistry {
     pub fn new(client: KafkaClient) -> Self {
         let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
+        let shutdown_token = client.shutdown_token();
         Self {
             groups: HashMap::new(),
             client: Some(client),
+            shutdown_token,
             fatal_tx,
             fatal_rx: Some(fatal_rx),
             default_handler_timeout: None,
@@ -1101,11 +1119,15 @@ impl KafkaConsumerGroupRegistry {
         }
     }
 
-    /// Create a registry from a pre-populated map of groups (for testing).
+    /// Create a registry from a pre-populated map of groups (for testing),
+    /// with `shutdown_token` standing in for the client's shutdown token.
     /// Each group's members report into this registry's fatal channel, as
     /// `register` arranges for a group it builds.
     #[cfg(test)]
-    pub(crate) fn from_groups(groups: HashMap<String, KafkaConsumerGroup>) -> Self {
+    pub(crate) fn from_groups(
+        groups: HashMap<String, KafkaConsumerGroup>,
+        shutdown_token: CancellationToken,
+    ) -> Self {
         let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
         for group in groups.values() {
             group.faults.attach_sink(fatal_tx.clone());
@@ -1113,6 +1135,7 @@ impl KafkaConsumerGroupRegistry {
         Self {
             groups,
             client: None,
+            shutdown_token,
             fatal_tx,
             fatal_rx: Some(fatal_rx),
             default_handler_timeout: None,
@@ -1153,10 +1176,20 @@ impl KafkaConsumerGroupRegistry {
     /// Used by `RegistryImpl::cancellation_token` and `run_until_timeout`
     /// to coordinate graceful shutdown with the broker's lifecycle.
     pub(crate) fn client_shutdown_token(&self) -> CancellationToken {
-        self.client
-            .as_ref()
-            .map(|c| c.shutdown_token())
-            .unwrap_or_default()
+        self.shutdown_token.clone()
+    }
+
+    /// Cancel every group this registry owns, and nothing else.
+    ///
+    /// The fatal path's stop. The client's shutdown token is shared by every
+    /// registry built from that client, so cancelling it for one member's
+    /// fatal error would stop sibling registries that have nothing to do
+    /// with it. Each group token is a child of that token, so a client
+    /// shutdown still reaches every group as before.
+    pub(crate) fn cancel_groups(&self) {
+        for group in self.groups.values() {
+            group.group_token.cancel();
+        }
     }
 
     /// The receiver of the fatal errors this registry's members end with,
@@ -1793,7 +1826,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "default_handler_timeout must be positive")]
     fn with_default_handler_timeout_zero_panics() {
-        let registry = KafkaConsumerGroupRegistry::from_groups(HashMap::new());
+        let registry =
+            KafkaConsumerGroupRegistry::from_groups(HashMap::new(), CancellationToken::new());
         let _ = registry.with_default_handler_timeout(Duration::ZERO);
     }
 
@@ -2207,7 +2241,7 @@ mod tests {
             "test-queue".to_string(),
             dying_group(KafkaConsumerGroupConfig::new(1..=1), commit_error),
         );
-        let registry = KafkaConsumerGroupRegistry::from_groups(groups);
+        let registry = KafkaConsumerGroupRegistry::from_groups(groups, CancellationToken::new());
 
         let report = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2245,7 +2279,7 @@ mod tests {
         let faults = group.faults.clone();
         let mut groups = HashMap::new();
         groups.insert("test-queue".to_string(), group);
-        let registry = KafkaConsumerGroupRegistry::from_groups(groups);
+        let registry = KafkaConsumerGroupRegistry::from_groups(groups, CancellationToken::new());
 
         let stop = CancellationToken::new();
         let run = RegistryImpl::run_until_timeout_with_report(
@@ -2280,6 +2314,119 @@ mod tests {
         assert!(report.fatal.is_empty(), "{:?}", report.fatal);
         assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
         assert!(!report.outcome.timed_out);
+    }
+
+    /// A fatal error ends the run that owns the member and nothing else. Two
+    /// registries built from one client share that client's shutdown token,
+    /// the parent of every group token; the fatal path must leave it alone,
+    /// or one member's fatal error would stop every sibling registry on the
+    /// client.
+    #[tokio::test]
+    async fn a_fatal_run_does_not_cancel_a_sibling_registry_on_the_same_client() {
+        use crate::backend::RegistryImpl;
+
+        let client_token = CancellationToken::new();
+        let mut failing = dying_group(KafkaConsumerGroupConfig::new(1..=1), commit_error);
+        failing.group_token = client_token.child_token();
+        let mut sibling = test_group(KafkaConsumerGroupConfig::new(1..=1));
+        sibling.group_token = client_token.child_token();
+        let sibling_token = sibling.group_token.clone();
+        // Only observed, never run: its group token is what the other
+        // registry's fatal error must not reach.
+        let _sibling_registry = KafkaConsumerGroupRegistry::from_groups(
+            HashMap::from([("sibling".to_string(), sibling)]),
+            client_token.clone(),
+        );
+        let registry = KafkaConsumerGroupRegistry::from_groups(
+            HashMap::from([("test-queue".to_string(), failing)]),
+            client_token.clone(),
+        );
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            RegistryImpl::run_until_timeout_with_report(
+                registry,
+                std::future::pending(),
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("the run ends on the fatal error");
+
+        assert_eq!(report.fatal.len(), 1, "{:?}", report.fatal);
+        assert!(
+            !client_token.is_cancelled(),
+            "a fatal member error must not cancel the client's shutdown token"
+        );
+        assert!(
+            !sibling_token.is_cancelled(),
+            "a sibling registry's group must keep running"
+        );
+    }
+
+    /// The control: the stop signal keeps its scope. It cancels the client's
+    /// shutdown token, as it did before, so every registry on the client
+    /// stops together.
+    #[tokio::test]
+    async fn the_stop_signal_still_cancels_the_client_token() {
+        use crate::backend::RegistryImpl;
+
+        let client_token = CancellationToken::new();
+        let mut group = test_group(KafkaConsumerGroupConfig::new(1..=1));
+        group.group_token = client_token.child_token();
+        let registry = KafkaConsumerGroupRegistry::from_groups(
+            HashMap::from([("test-queue".to_string(), group)]),
+            client_token.clone(),
+        );
+
+        let stop = CancellationToken::new();
+        let run = RegistryImpl::run_until_timeout_with_report(
+            registry,
+            stop.clone().cancelled_owned(),
+            Duration::from_secs(1),
+        );
+        stop.cancel();
+        let report = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run ends on its signal");
+        assert!(report.fatal.is_empty());
+        assert!(report.outcome.is_clean(), "{:?}", report.outcome);
+        assert!(
+            client_token.is_cancelled(),
+            "the stop signal cancels the client's shutdown token, as before"
+        );
+    }
+
+    /// The other respawn path: lag-driven `scale_up` refuses a member after a
+    /// fatal member error, as `ensure_min` refuses to replace one.
+    #[tokio::test(start_paused = true)]
+    async fn scale_up_refuses_a_member_after_a_fatal_member_error() {
+        let mut group = dying_group(KafkaConsumerGroupConfig::new(1..=4), commit_error);
+        group.start();
+        wait_until_no_member_is_alive(&group).await;
+        assert!(group.faults.is_fatal());
+
+        assert!(
+            !group.scale_up(),
+            "no member is added after a fatal member error"
+        );
+        assert_eq!(group.active_consumers(), 0);
+        group.shutdown().await;
+    }
+
+    /// The control: an ordinary error leaves `scale_up` as it was.
+    #[tokio::test(start_paused = true)]
+    async fn scale_up_still_adds_a_member_after_an_ordinary_error() {
+        let mut group = dying_group(KafkaConsumerGroupConfig::new(1..=4), ordinary_error);
+        group.start();
+        wait_until_no_member_is_alive(&group).await;
+        assert!(!group.faults.is_fatal());
+
+        assert!(
+            group.scale_up(),
+            "an ordinary error does not block scale_up"
+        );
+        group.shutdown().await;
     }
 
     // -- schema-registry group config (Task 8) --
@@ -2416,7 +2563,7 @@ mod tests {
         }
 
         fn registry() -> KafkaConsumerGroupRegistry {
-            KafkaConsumerGroupRegistry::from_groups(HashMap::new())
+            KafkaConsumerGroupRegistry::from_groups(HashMap::new(), CancellationToken::new())
         }
 
         /// An explicitly-set `concurrent_processing(true)` must fail at

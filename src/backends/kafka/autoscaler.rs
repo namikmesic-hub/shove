@@ -737,7 +737,10 @@ mod tests {
         let mut groups = HashMap::new();
         groups.insert("test-group".to_string(), group);
 
-        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(groups)))
+        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(
+            groups,
+            CancellationToken::new(),
+        )))
     }
 
     #[tokio::test]
@@ -1015,7 +1018,10 @@ mod tests {
 
         let mut groups = HashMap::new();
         groups.insert("test-group".to_string(), group);
-        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(groups)))
+        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(
+            groups,
+            CancellationToken::new(),
+        )))
     }
 
     #[tokio::test]

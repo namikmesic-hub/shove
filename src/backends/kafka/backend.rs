@@ -365,11 +365,17 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
         KafkaConsumerGroupRegistry::take_fatal_receiver(self)
     }
 
+    fn cancel_groups(&mut self) {
+        KafkaConsumerGroupRegistry::cancel_groups(self);
+    }
+
     /// Runs until the stop signal, the client's shutdown token, or the first
     /// fatal error a member ends with (`ShoveError::is_fatal`, on Kafka a
     /// final offset commit that did not land). A fatal error cancels every
-    /// group of this registry, the scope of the run, and the drain then
-    /// collects it and any sibling's into `RunReport::fatal`.
+    /// group of this registry, the scope of the run, and only those: the
+    /// client's shutdown token is shared with every other registry on the
+    /// client, so it is left to the stop signal. The drain then collects the
+    /// error and any sibling's into `RunReport::fatal`.
     async fn run_until_timeout_with_report<S>(
         mut self,
         signal: S,
@@ -394,11 +400,11 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
             e = next_fatal(&mut fatal_rx) => {
                 tracing::error!(
                     error = %e,
-                    "a consumer group member ended with a fatal error; stopping every group"
+                    "a consumer group member ended with a fatal error; stopping every group of this registry"
                 );
                 fatal.push(e);
                 signal_handle.abort();
-                broker_token.cancel();
+                KafkaConsumerGroupRegistry::cancel_groups(&self);
             }
         }
 
