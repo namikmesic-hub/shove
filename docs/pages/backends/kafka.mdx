@@ -467,6 +467,7 @@ The error carries positions and the broker's error text only, never a record's p
 The error is fatal: a consumer group run ends on it without waiting for its stop signal, drains the other members, and counts it once under `SupervisorOutcome::errors`.
 `run_until_timeout_with_report` returns it typed in `RunReport::fatal`, and `exit_code()` is 1 where it was 0 before 0.16.
 With autoscaling on, the member is not replaced.
+A member the autoscaler retires on scale-down makes the same final commit, so its failure ends the run the same way.
 A member with nothing to commit has no commit to fail and still ends clean.
 An acknowledged offset on a partition a rebalance revoked before the stop is not part of the final commit and raises no error.
 Its tracker went with the partition, and the new owner redelivers the record, which is at-least-once delivery as before.

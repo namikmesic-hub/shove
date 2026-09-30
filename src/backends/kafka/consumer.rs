@@ -396,9 +396,10 @@ impl PartitionTracker {
     /// asynchronous commit may still be in flight, or a rebalance may have
     /// dropped it without a callback, and with no new completion the final
     /// `Sync` commit had nothing to confirm. Re-offering every position
-    /// makes that commit confirm every safe position. A commit of an
-    /// already committed offset is a broker-side no-op, as the rebalance
-    /// re-offer in `OffsetTracker::apply_rebalance_events` relies on, and
+    /// makes that commit confirm every safe position. A repeated commit
+    /// keeps the same logical position, though the coordinator still
+    /// appends the request to `__consumer_offsets`, as the rebalance
+    /// re-offer in `OffsetTracker::apply_rebalance_events` relies on; and
     /// the position never lowers, see `position`.
     fn drain_all(&mut self) -> (i64, Vec<TerminalDiscard>) {
         let next = self.position();
@@ -524,7 +525,8 @@ impl OffsetTracker {
                     // rebalance vanish — no commit_callback ever fires).
                     // Re-offer every retained partition's position once the
                     // dust settles; re-committing an already-committed offset
-                    // is a broker-side no-op. The rebalance always ends with
+                    // keeps the same logical position, at the cost of one
+                    // more write to __consumer_offsets. The rebalance always ends with
                     // an assign round, so the last re-offer lands after the
                     // group is stable again.
                     //
@@ -2969,9 +2971,9 @@ impl FinalCommit for Arc<KafkaStreamConsumer> {
 ///
 /// The other two kinds: the broker's answer to the commit is
 /// [`CommitFailure::Rejected`] with librdkafka's text for it, and a commit
-/// with no answer within `SHUTDOWN_COMMIT_DEADLINE` is
-/// [`CommitFailure::Deadline`], its result unknown because the thread keeps
-/// waiting for it.
+/// with no answer within `SHUTDOWN_COMMIT_DEADLINE`, or whose thread ended
+/// without answering, is [`CommitFailure::Deadline`] with the time waited,
+/// its result unknown.
 async fn final_commit_on_thread<C, S>(
     consumer: C,
     tpl: Option<TopicPartitionList>,
@@ -2982,6 +2984,7 @@ where
     C: FinalCommit,
     S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
 {
+    let started = Instant::now();
     let (done_tx, done_rx) = oneshot::channel::<KafkaResult<()>>();
     let handed = hand_to_new_thread(
         spawn,
@@ -3013,11 +3016,14 @@ where
         // librdkafka's text for the broker's answer: the error code and its
         // description, and nothing of the records behind the positions.
         Ok(Ok(result)) => result.map_err(|e| CommitFailure::Rejected(e.to_string())),
+        // The thread died before it could answer: not the broker's verdict,
+        // so not a rejection. The result is unknown, like a missed deadline.
         Ok(Err(_recv)) => {
-            tracing::warn!(queue, "final commit thread ended without a result");
-            Err(CommitFailure::Rejected(
-                "the final commit thread ended without reporting a result".to_string(),
-            ))
+            tracing::warn!(
+                queue,
+                "final commit thread ended without a result; the result is unknown"
+            );
+            Err(CommitFailure::Deadline(started.elapsed()))
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -9586,6 +9592,16 @@ mod final_commit_thread_tests {
         }
     }
 
+    /// Stands in for a consumer whose commit thread dies: `commit_sync`
+    /// panics, so the thread ends without reporting a result.
+    struct PanickingProbe;
+
+    impl FinalCommit for PanickingProbe {
+        fn commit_sync(&self, _tpl: &TopicPartitionList) -> KafkaResult<()> {
+            panic!("the commit thread dies before it can answer");
+        }
+    }
+
     /// Stands in for a consumer whose commit does not answer, like a commit
     /// to a frozen coordinator: `commit_sync` blocks until `release` is
     /// signalled or dropped.
@@ -9857,6 +9873,24 @@ mod final_commit_thread_tests {
         assert!(!faults.is_fatal());
         assert!(rx.try_recv().is_err());
         drop(PendingFinalCommit::arm(None, "orders", &[(0, 7)]));
+    }
+
+    /// A commit thread that dies without answering is not the broker's
+    /// verdict: the result is unknown, and is reported as `Deadline` with
+    /// the time waited, never as `Rejected`.
+    #[tokio::test]
+    async fn a_commit_thread_that_dies_without_answering_is_reported_as_unknown() {
+        let result = final_commit_on_thread(
+            PanickingProbe,
+            Some(one_offset()),
+            "orders",
+            &mut real_spawner(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CommitFailure::Deadline(_))),
+            "a lost result is unknown, not rejected: {result:?}"
+        );
     }
 
     /// The offsets `ShoveError::Commit` carries are the commit's positions in

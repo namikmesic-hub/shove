@@ -105,8 +105,7 @@ pub enum ShoveError {
 pub enum CommitFailure {
     /// The coordinator answered the commit with an error, carried as text.
     /// This commit did not land; the broker keeps the last position it
-    /// accepted. Also used, with a message that says so, when the commit
-    /// thread ended without reporting a result.
+    /// accepted.
     ///
     /// The text is librdkafka's rendering of the broker's answer: the error
     /// code and its description, and nothing else. It never carries a
@@ -115,10 +114,10 @@ pub enum CommitFailure {
     #[error("rejected: {0}")]
     Rejected(String),
     /// The commit had no answer within the time it carries: the shutdown
-    /// deadline, or the shorter time the loop waited when the owning run's
-    /// drain timed out first and ended the wait. The result is unknown: the
-    /// detached commit thread may still land it after the consumer has
-    /// returned.
+    /// deadline, the shorter time the loop waited when the owning run's
+    /// drain timed out first and ended the wait, or the moment the commit
+    /// thread ended without reporting. The result is unknown: the detached
+    /// commit thread may still land it after the consumer has returned.
     #[error("no answer after waiting {0:?}; the result is unknown")]
     Deadline(Duration),
     /// No thread could be spawned to run the commit, so this commit was

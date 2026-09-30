@@ -162,8 +162,9 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// librdkafka retries - minutes - without holding the runtime or the
 /// process. Chosen against the 30 s termination grace Kubernetes gives a
 /// Pod by default, so a consumer that gives up still exits before it is
-/// killed. Past the deadline the loop logs that the batch may be redelivered
-/// and returns; the thread finishes on its own.
+/// killed. Past the deadline the loop gives up on the result and ends the
+/// member with `ShoveError::Commit` of the `Deadline` kind; the thread
+/// finishes on its own.
 pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 
 /// How long a consume loop waits before asking the schema registry again for

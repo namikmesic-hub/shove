@@ -14,8 +14,11 @@
 //! CreateTopics API: each test creates the topic through the mock API, as
 //! infra would, and the record is produced with a raw rdkafka producer so it
 //! carries a key beside its payload.
+//!
+//! `test-support` gates the deadline seam this file reads; both Kafka
+//! coverage rows enable it, so the suite runs in each.
 
-#![cfg(feature = "kafka")]
+#![cfg(all(feature = "kafka", feature = "test-support"))]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use shove::broker::Broker;
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
-use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumerGroupConfig};
+use shove::kafka::{
+    KafkaClient, KafkaConfig, KafkaConsumerGroupConfig, shutdown_commit_deadline_for_test,
+};
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
@@ -45,9 +50,12 @@ const KEY_MARKER: &str = "record-key-marker-7f3a";
 const PAYLOAD_MARKER: &str = "record-payload-marker-2c9e";
 /// A record reaches the handler on a mock cluster in well under this.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
-/// The receive loop's own bound on its final commit, `SHUTDOWN_COMMIT_DEADLINE`
-/// on the Kafka page; the `Deadline` kind carries the value the loop used.
-const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
+/// The receive loop's own bound on its final commit, read through the
+/// `test-support` seam so this file cannot drift from the constant; the
+/// `Deadline` kind carries the value the loop used.
+fn shutdown_commit_deadline() -> Duration {
+    shutdown_commit_deadline_for_test()
+}
 /// How long the run may take past the shutdown deadline before the test
 /// gives up on it.
 const DEADLINE_MARGIN: Duration = Duration::from_secs(20);
@@ -304,7 +312,7 @@ async fn a_drain_timeout_before_the_commit_answers_still_reports_the_unresolved_
     const SHORT_DRAIN: Duration = Duration::from_secs(3);
     let mock = mock_cluster();
     let (report, took) = stop_after_one_record(&mock, SHORT_DRAIN, |mock| {
-        mock.broker_round_trip_time(-1, SHUTDOWN_COMMIT_DEADLINE + DEADLINE_MARGIN * 2)
+        mock.broker_round_trip_time(-1, shutdown_commit_deadline() + DEADLINE_MARGIN * 2)
             .expect("raise the mock broker's round-trip time");
     })
     .await;
@@ -315,7 +323,7 @@ async fn a_drain_timeout_before_the_commit_answers_still_reports_the_unresolved_
         panic!("an unresolved commit is reported as Deadline: {kind:?}");
     };
     assert!(
-        *waited < SHUTDOWN_COMMIT_DEADLINE,
+        *waited < shutdown_commit_deadline(),
         "the loop waited only for the drain window, not its own deadline: {waited:?}"
     );
     assert!(
@@ -324,7 +332,7 @@ async fn a_drain_timeout_before_the_commit_answers_still_reports_the_unresolved_
     );
     assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
     assert!(
-        took < SHUTDOWN_COMMIT_DEADLINE,
+        took < shutdown_commit_deadline(),
         "the run returned on its drain timeout, took {took:?}"
     );
 }
@@ -397,7 +405,7 @@ async fn run_until_timeout_reports_a_rejected_final_commit_as_one_error() {
 async fn a_final_commit_past_the_deadline_ends_the_member_with_the_deadline_kind() {
     let mock = mock_cluster();
     let (report, took) = stop_after_one_record(&mock, DRAIN_TIMEOUT, |mock| {
-        mock.broker_round_trip_time(-1, SHUTDOWN_COMMIT_DEADLINE + DEADLINE_MARGIN * 2)
+        mock.broker_round_trip_time(-1, shutdown_commit_deadline() + DEADLINE_MARGIN * 2)
             .expect("raise the mock broker's round-trip time");
     })
     .await;
@@ -406,7 +414,7 @@ async fn a_final_commit_past_the_deadline_ends_the_member_with_the_deadline_kind
     let CommitFailure::Deadline(deadline) = kind else {
         panic!("a commit without an answer is reported as Deadline: {kind:?}");
     };
-    assert_eq!(*deadline, SHUTDOWN_COMMIT_DEADLINE);
+    assert_eq!(*deadline, shutdown_commit_deadline());
     assert!(
         took + Duration::from_secs(1) >= *deadline,
         "the member waits out the deadline before it gives up, took {took:?}"
