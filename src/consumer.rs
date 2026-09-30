@@ -70,6 +70,21 @@ pub enum RetryStrategy {
     /// waits inside the handler's task, holding its prefetch slot, with the
     /// count kept in memory; NATS naks with the delay and reads the count from
     /// the delivery info. Implied by an external topology.
+    ///
+    /// On Kafka, a consumer with one slot (`with_prefetch_count(1)` or
+    /// `with_concurrent_processing(false)`) keeps each partition in order
+    /// through the wait: while a record of a partition waits in place, no
+    /// later record of that partition reaches the handler, while the
+    /// consumer runs, on a stop, on a wait cut short, and across a
+    /// rebalance. A stop hands no record it had already fetched to a handler
+    /// during the drain; that record is redelivered after the restart, behind
+    /// the one that was waiting. A revoke ends every in-place wait on the
+    /// revoked partition with nothing completed, and the partition's new
+    /// owner is handed the record from the committed offset. With more slots,
+    /// a record already handed to a handler when a lower record of its
+    /// partition starts to wait keeps running beside the wait; one not yet
+    /// handed over waits behind it, with that partition alone paused until
+    /// the wait ends.
     InPlace,
 }
 

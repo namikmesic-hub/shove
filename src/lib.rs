@@ -371,11 +371,19 @@ pub mod kafka {
     pub use crate::backends::kafka::completion_probe;
 
     /// Test-only counters (see the `test-support` feature) on the consumer's
-    /// four `put_back` call sites, for tests that prove a record went back to
+    /// five `put_back` call sites, for tests that prove a record went back to
     /// the broker on the path they drive.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::put_back_probe;
+
+    /// Test-only counters (see the `test-support` feature) on the records a
+    /// consume loop dropped unhandled at a stop or a revoke, and on the
+    /// in-place waits a revoke ended, for tests that prove a record in the
+    /// loop's hand never reached the handler.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::drop_probe;
 
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.

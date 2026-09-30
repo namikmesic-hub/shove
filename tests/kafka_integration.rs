@@ -14,6 +14,7 @@ use shove::SequencedTopic as _;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
+use shove::error::Result as ShoveResult;
 use shove::handler::MessageHandler;
 use shove::kafka::{
     KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig,
@@ -22,7 +23,7 @@ use shove::kafka::{
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
-use shove::topic::Topic as _;
+use shove::topic::Topic;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaContainer};
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -276,6 +278,59 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-external-permit-wait")
         .external()
         .hold_queue(Duration::from_millis(300))
+        .allow_message_loss()
+        .build()
+);
+
+// The in-place order invariant on a stop: a wait long enough that the stop
+// always lands inside it.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalStopOrderTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-stop-order")
+        .external()
+        .hold_queue(Duration::from_secs(30))
+        .allow_message_loss()
+        .build()
+);
+
+// The in-place order invariant across a cooperative rebalance: two
+// partitions so a second member takes one, and a short wait so a held head
+// is re-offered every few seconds and acked soon after its hold is released.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalRebalanceOrderTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-rebalance-order")
+        .external()
+        .hold_queue(Duration::from_secs(3))
+        .allow_message_loss()
+        .build()
+);
+
+// A forced revoke while a head record waits in place, with a second member
+// in the group: a wait long enough that only the revoke can end it.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalForcedRevokeTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-forced-revoke")
+        .external()
+        .hold_queue(Duration::from_secs(30))
+        .allow_message_loss()
+        .build()
+);
+
+// A forced revoke while the sole permit is held by an in-place wait long
+// enough that only the revoke can end it.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalRevokeWaitTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-revoke-wait")
+        .external()
+        .hold_queue(Duration::from_secs(30))
         .allow_message_loss()
         .build()
 );
@@ -951,6 +1006,258 @@ macro_rules! always_for {
 }
 
 always_for!(ExternalRetryTopic, ExternalShutdownTopic);
+
+/// One delivery as an [`OrderRecorder`] saw it: which member handled it, the
+/// record's coordinates, its id, and whether it was an in-place redelivery.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Delivery {
+    member: &'static str,
+    partition: i32,
+    offset: i64,
+    id: String,
+    redelivered: bool,
+}
+
+/// Records every delivery into a log shared by every member of a group, in
+/// arrival order, and defers the records it is told to hold for as long as
+/// it holds them; everything else is acked. The log is what the in-place
+/// order tests assert on, across members and across a stop.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct OrderRecorder {
+    member: &'static str,
+    log: Arc<std::sync::Mutex<Vec<Delivery>>>,
+    /// `(partition, offset)` pairs this member defers while they are listed.
+    hold: Arc<std::sync::Mutex<std::collections::HashSet<(i32, i64)>>>,
+    /// How long the handler runs before it defers a held record, so a test
+    /// can keep the handler in its running state for a while.
+    held_runs_for: Duration,
+    /// How many `Defer` outcomes this member has returned.
+    defers: Arc<AtomicU32>,
+}
+
+#[cfg(feature = "test-support")]
+impl OrderRecorder {
+    fn new(member: &'static str, log: Arc<std::sync::Mutex<Vec<Delivery>>>) -> Self {
+        Self {
+            member,
+            log,
+            hold: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            held_runs_for: Duration::ZERO,
+            defers: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn holding(self, partition: i32, offset: i64) -> Self {
+        self.hold.lock().unwrap().insert((partition, offset));
+        self
+    }
+
+    fn held_running_for(mut self, duration: Duration) -> Self {
+        self.held_runs_for = duration;
+        self
+    }
+
+    /// Stop deferring: every record is acked from the next delivery on.
+    fn release(&self) {
+        self.hold.lock().unwrap().clear();
+    }
+
+    fn defers(&self) -> u32 {
+        self.defers.load(Ordering::SeqCst)
+    }
+
+    async fn record(&self, id: String, meta: &MessageMetadata) -> Outcome {
+        let partition = meta.partition.expect("Kafka reports the partition");
+        let offset = meta.offset.expect("Kafka reports the offset");
+        self.log.lock().unwrap().push(Delivery {
+            member: self.member,
+            partition,
+            offset,
+            id,
+            redelivered: meta.redelivered,
+        });
+        let held = self.hold.lock().unwrap().contains(&(partition, offset));
+        if held {
+            tokio::time::sleep(self.held_runs_for).await;
+            self.defers.fetch_add(1, Ordering::SeqCst);
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+macro_rules! order_recorder_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for OrderRecorder {
+            type Context = ();
+            async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+                self.record(msg.id, &meta).await
+            }
+        }
+    )+};
+}
+
+#[cfg(feature = "test-support")]
+order_recorder_for!(
+    ExternalStopOrderTopic,
+    ExternalRebalanceOrderTopic,
+    ExternalForcedRevokeTopic,
+    ExternalRevokeWaitTopic,
+);
+
+/// A snapshot of an [`OrderRecorder`] log.
+#[cfg(feature = "test-support")]
+fn deliveries(log: &std::sync::Mutex<Vec<Delivery>>) -> Vec<Delivery> {
+    log.lock().unwrap().clone()
+}
+
+/// Every partition was handled in offset order across every member: no
+/// delivery of a partition carries a lower offset than the delivery of that
+/// partition before it. A redelivery of the same offset is in order.
+#[cfg(feature = "test-support")]
+fn assert_each_partition_in_offset_order(log: &[Delivery]) {
+    let mut last: HashMap<i32, &Delivery> = HashMap::new();
+    for delivery in log {
+        if let Some(previous) = last.get(&delivery.partition) {
+            assert!(
+                delivery.offset >= previous.offset,
+                "partition {} handled offset {} (by {}) after offset {} (by {}); full log: {log:#?}",
+                delivery.partition,
+                delivery.offset,
+                delivery.member,
+                previous.offset,
+                previous.member
+            );
+        }
+        last.insert(delivery.partition, delivery);
+    }
+}
+
+/// Poll `condition` every 50 ms until it holds, and panic with `what` once
+/// `timeout` has passed without it.
+#[cfg(feature = "test-support")]
+async fn poll_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {timeout:?} waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The member ids the broker lists for `group` right now.
+#[cfg(feature = "test-support")]
+fn group_member_ids(brokers: &str, group: &str) -> Vec<String> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create group probe");
+    let list = probe
+        .fetch_group_list(Some(group), Duration::from_secs(10))
+        .expect("failed to fetch group list");
+    list.groups()
+        .iter()
+        .find(|g| g.name() == group)
+        .map(|g| g.members().iter().map(|m| m.id().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Send the coordinator a LeaveGroup request on `member_id`'s behalf, as an
+/// operator's tooling could. The coordinator drops the member and rebalances
+/// its partitions away while the member itself still believes it holds them,
+/// until its next heartbeat tells it otherwise: a revoke the member did not
+/// ask for.
+///
+/// LeaveGroup version 1, hand-framed: a request header (api key 13, version
+/// 1, a correlation id, a client id), then the group id and the member id as
+/// length-prefixed strings. The response is the correlation id, a throttle
+/// time and the error code.
+#[cfg(feature = "test-support")]
+async fn leave_group_on_behalf_of(brokers: &str, group: &str, member_id: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        let len = i16::try_from(s.len()).expect("a short string");
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    const LEAVE_GROUP_API_KEY: i16 = 13;
+    const CORRELATION_ID: i32 = 7;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&LEAVE_GROUP_API_KEY.to_be_bytes());
+    body.extend_from_slice(&1i16.to_be_bytes());
+    body.extend_from_slice(&CORRELATION_ID.to_be_bytes());
+    put_string(&mut body, "shove-test-leave-group");
+    put_string(&mut body, group);
+    put_string(&mut body, member_id);
+    let mut frame = i32::try_from(body.len())
+        .expect("a short frame")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&body);
+
+    let mut stream = tokio::net::TcpStream::connect(brokers)
+        .await
+        .expect("failed to connect to the coordinator");
+    stream
+        .write_all(&frame)
+        .await
+        .expect("failed to send LeaveGroup");
+    let mut size = [0u8; 4];
+    stream
+        .read_exact(&mut size)
+        .await
+        .expect("failed to read the LeaveGroup response size");
+    let size = usize::try_from(i32::from_be_bytes(size)).expect("a positive size");
+    let mut response = vec![0u8; size];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("failed to read the LeaveGroup response");
+    let correlation = i32::from_be_bytes(response[0..4].try_into().unwrap());
+    assert_eq!(
+        correlation, CORRELATION_ID,
+        "the response answers our request"
+    );
+    let error_code = i16::from_be_bytes(response[8..10].try_into().unwrap());
+    assert_eq!(
+        error_code, 0,
+        "the coordinator refused the LeaveGroup with error code {error_code}"
+    );
+}
+
+/// Run one member of the group with a single permit and the in-place retry
+/// strategy, both set explicitly: the order invariant under test holds for
+/// a consumer with one permit, and the group defaults (prefetch 10 clamped
+/// to one by nonconcurrent processing) must not be what the test relies on.
+#[cfg(feature = "test-support")]
+fn spawn_single_permit_in_place_member<T, H>(
+    client: KafkaClient,
+    handler: H,
+    shutdown: CancellationToken,
+) -> JoinHandle<ShoveResult<()>>
+where
+    T: Topic,
+    H: MessageHandler<T, Context = ()>,
+{
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_shutdown(shutdown)
+        .with_retry_strategy(RetryStrategy::InPlace)
+        .with_concurrent_processing(false)
+        .with_prefetch_count(1);
+    let consumer = KafkaConsumer::new(client);
+    tokio::spawn(async move { consumer.run::<T, H>(handler, (), options).await })
+}
 
 /// Records the id of every message it is handed.
 #[derive(Clone)]
@@ -3550,6 +3857,458 @@ async fn external_topic_queued_record_keeps_the_member_when_a_running_handler_st
     token.cancel();
     assert!(running.await.unwrap().is_clean());
     broker.close().await;
+}
+
+/// The in-place order invariant on a stop, with one permit: offset 2 is
+/// deferred and waits in place, offset 3 was fetched and waits in the
+/// receive loop's hand for the permit, and the member is stopped. The
+/// cancelled wait frees the permit in the same instant the stop fires, so
+/// the loop must read the stop first and drop offset 3: the handler never
+/// sees it, the position stays at offset 2, and a restart delivers `[2, 3]`
+/// in order.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behind_it() {
+    use shove::kafka::drop_probe;
+
+    const TOPIC: &str = "kafka-external-stop-order";
+    const GROUP: &str = "kafka-external-stop-order-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let record = |offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("r{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Offset 2 runs a second before it defers, so offset 3, published right
+    // behind it, is in the loop's hand waiting for the permit by the time
+    // the in-place wait begins.
+    let handler = OrderRecorder::new("a", log.clone())
+        .holding(0, 2)
+        .held_running_for(Duration::from_secs(1));
+    let shutdown = CancellationToken::new();
+    let running = spawn_single_permit_in_place_member::<ExternalStopOrderTopic, _>(
+        tb.client(),
+        handler.clone(),
+        shutdown.clone(),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    // Offsets 0 and 1 are acked and committed first, so offset 2 is
+    // dispatched the instant it arrives and offset 3 lands behind it.
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(0)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(1)).await;
+    poll_until("offsets 0 and 1 are committed", TIMEOUT, || {
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(2)
+    })
+    .await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(2)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(3)).await;
+    poll_until("offset 2 is deferred and waits in place", TIMEOUT, || {
+        handler.defers() >= 1
+    })
+    .await;
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
+
+    let log_before = deliveries(&log);
+    let seen: Vec<i64> = log_before.iter().map(|d| d.offset).collect();
+    assert_eq!(
+        seen,
+        vec![0, 1, 2],
+        "the handler never saw offset 3 while offset 2 waited: {log_before:#?}"
+    );
+    assert_eq!(
+        drop_probe::permit_wait_shutdown(),
+        1,
+        "offset 3 was in the loop's hand and was dropped at the stop"
+    );
+    assert_eq!(
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0),
+        Some(2),
+        "the position stays at the waiting record"
+    );
+
+    // A fresh member of the same group is handed the waiting record first
+    // and the record fetched behind it second.
+    let restarted_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let acking = OrderRecorder::new("restart", restarted_log.clone());
+    let shutdown = CancellationToken::new();
+    let running = spawn_single_permit_in_place_member::<ExternalStopOrderTopic, _>(
+        tb.client(),
+        acking,
+        shutdown.clone(),
+    );
+    poll_until("the restart handled offsets 2 and 3", TIMEOUT, || {
+        deliveries(&restarted_log).len() >= 2
+    })
+    .await;
+    let seen: Vec<i64> = deliveries(&restarted_log)
+        .iter()
+        .map(|d| d.offset)
+        .collect();
+    assert_eq!(
+        seen,
+        vec![2, 3],
+        "the restart delivers the waiting record, then the one behind it"
+    );
+    shutdown.cancel();
+    running.await.unwrap().unwrap();
+}
+
+/// The in-place order invariant across a cooperative rebalance, with one
+/// permit per member. Member A defers the head of both partitions; member B
+/// joins, takes one partition and completes its records, then leaves; then
+/// A's holds are released. Across both members every partition is handled
+/// in offset order: A's wait on the partition that moved ended at the revoke
+/// instead of running on and handing the head back after B had finished with
+/// the partition. The commit position on the moved partition stays at the
+/// deferred head until its new owner completes it, and only then moves past
+/// it.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cooperative_rebalance_does_not_commit_past_deferred_head() {
+    const TOPIC: &str = "kafka-external-rebalance-order";
+    const GROUP: &str = "kafka-external-rebalance-order-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 2).await;
+    let record = |partition: i32, offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("p{partition}-{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+    for partition in 0..2 {
+        for offset in 0..4 {
+            publish_raw_to(tb.brokers(), TOPIC, partition, &record(partition, offset)).await;
+        }
+    }
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let a = OrderRecorder::new("a", log.clone())
+        .holding(0, 0)
+        .holding(1, 0);
+    let shutdown_a = CancellationToken::new();
+    let running_a = spawn_single_permit_in_place_member::<ExternalRebalanceOrderTopic, _>(
+        tb.client(),
+        a.clone(),
+        shutdown_a.clone(),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+    poll_until("A defers a head record", TIMEOUT, || a.defers() >= 1).await;
+    for partition in 0..2 {
+        assert_eq!(
+            committed_offset(tb.brokers(), GROUP, TOPIC, partition),
+            None,
+            "nothing commits on partition {partition} while its head waits"
+        );
+    }
+
+    let b = OrderRecorder::new("b", log.clone());
+    let shutdown_b = CancellationToken::new();
+    let running_b = spawn_single_permit_in_place_member::<ExternalRebalanceOrderTopic, _>(
+        tb.client(),
+        b,
+        shutdown_b.clone(),
+    );
+    poll_until(
+        "B handles a record of the partition it took",
+        TIMEOUT,
+        || deliveries(&log).iter().any(|d| d.member == "b"),
+    )
+    .await;
+    let first_of_b = deliveries(&log)
+        .into_iter()
+        .find(|d| d.member == "b")
+        .expect("B handled a record");
+    let moved = first_of_b.partition;
+    let kept = 1 - moved;
+    assert_eq!(
+        first_of_b.offset, 0,
+        "the new owner starts at the deferred head, which A never committed"
+    );
+    poll_until(
+        "B completes every record of the moved partition",
+        TIMEOUT,
+        || {
+            deliveries(&log)
+                .iter()
+                .filter(|d| d.member == "b" && d.partition == moved)
+                .map(|d| d.offset)
+                .max()
+                == Some(3)
+        },
+    )
+    .await;
+    poll_until(
+        "the moved partition's commit moves past the head once its new owner completed it",
+        TIMEOUT,
+        || committed_offset(tb.brokers(), GROUP, TOPIC, moved) == Some(4),
+    )
+    .await;
+    assert_eq!(
+        committed_offset(tb.brokers(), GROUP, TOPIC, kept),
+        None,
+        "the partition A kept still waits on its head"
+    );
+
+    shutdown_b.cancel();
+    running_b.await.unwrap().unwrap();
+    poll_until("the moved partition returns to A", TIMEOUT, || {
+        group_state(tb.brokers(), GROUP) == ("Stable".to_string(), 1)
+    })
+    .await;
+
+    a.release();
+    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, TIMEOUT).await;
+    for partition in 0..2 {
+        assert_eq!(
+            committed_offset(tb.brokers(), GROUP, TOPIC, partition),
+            Some(4),
+            "partition {partition} is fully committed once its head was released"
+        );
+    }
+
+    let log = deliveries(&log);
+    assert_each_partition_in_offset_order(&log);
+    let ids: std::collections::HashSet<&str> = log.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(ids.len(), 8, "every record was handled: {log:#?}");
+    let b_first = log
+        .iter()
+        .position(|d| d.member == "b")
+        .expect("B handled a record");
+    assert!(
+        log[b_first..]
+            .iter()
+            .all(|d| !(d.member == "a" && d.partition == moved)),
+        "A handed nothing of the moved partition to its handler after B took it over: {log:#?}"
+    );
+
+    shutdown_a.cancel();
+    running_a.await.unwrap().unwrap();
+}
+
+/// A revoke the member did not ask for: a LeaveGroup request sent on member
+/// A's behalf makes the coordinator take its partition away while A still
+/// waits in place on the head record, with member B in the group. A's wait
+/// must end at the revoke, so A's old task hands the head to no handler.
+/// The partition's next owner, B or A itself under a fresh assignment (the
+/// coordinator's pick, which the test does not force), is handed the head
+/// again from the committed position as a fresh delivery and completes it
+/// and the rest, so the commit moves past the head only then. Once B is gone
+/// and the partition is A's, the next record is delivered once.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_record() {
+    use shove::kafka::drop_probe;
+
+    const TOPIC: &str = "kafka-external-forced-revoke";
+    const GROUP: &str = "kafka-external-forced-revoke-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let record = |offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("r{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+    for offset in 0..4 {
+        publish_raw_to(tb.brokers(), TOPIC, 0, &record(offset)).await;
+    }
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let a = OrderRecorder::new("a", log.clone()).holding(0, 0);
+    let shutdown_a = CancellationToken::new();
+    let running_a = spawn_single_permit_in_place_member::<ExternalForcedRevokeTopic, _>(
+        tb.client(),
+        a.clone(),
+        shutdown_a.clone(),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+    poll_until("A defers the head record", TIMEOUT, || a.defers() >= 1).await;
+    let members = group_member_ids(tb.brokers(), GROUP);
+    assert_eq!(members.len(), 1, "A is the only member: {members:?}");
+    let a_member_id = members[0].clone();
+
+    let b = OrderRecorder::new("b", log.clone());
+    let shutdown_b = CancellationToken::new();
+    let running_b = spawn_single_permit_in_place_member::<ExternalForcedRevokeTopic, _>(
+        tb.client(),
+        b,
+        shutdown_b.clone(),
+    );
+    poll_until(
+        "B joined and the group is stable with two members",
+        TIMEOUT,
+        || group_state(tb.brokers(), GROUP) == ("Stable".to_string(), 2),
+    )
+    .await;
+    let before_revoke = deliveries(&log);
+    assert!(
+        before_revoke.iter().all(|d| d.member == "a"),
+        "the one partition stays with A until it is taken away"
+    );
+
+    leave_group_on_behalf_of(tb.brokers(), GROUP, &a_member_id).await;
+    // Whoever is handed the partition next acks the head: A's hold is off
+    // from here, and A's old wait, a 30 s delay, can end only at the revoke.
+    a.release();
+
+    poll_until("A's in-place wait ended at the revoke", TIMEOUT, || {
+        drop_probe::in_place_revoked() >= 1
+    })
+    .await;
+    poll_until(
+        "the partition's next owner is handed the head from the committed position",
+        TIMEOUT,
+        || deliveries(&log).len() > before_revoke.len(),
+    )
+    .await;
+    let handed_over = deliveries(&log)[before_revoke.len()].clone();
+    assert_eq!(
+        handed_over.offset, 0,
+        "the head, which A never committed: {handed_over:?}"
+    );
+    assert!(
+        !handed_over.redelivered,
+        "a fresh delivery from the broker, not the old wait handing the record back: {handed_over:?}"
+    );
+    let new_owner = handed_over.member;
+    poll_until(
+        "the commit moves past the head once the new owner completed it and the rest",
+        TIMEOUT,
+        || committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(4),
+    )
+    .await;
+    let completed: Vec<i64> = deliveries(&log)[before_revoke.len()..]
+        .iter()
+        .filter(|d| d.member == new_owner)
+        .map(|d| d.offset)
+        .collect();
+    assert_eq!(
+        completed,
+        vec![0, 1, 2, 3],
+        "the new owner completes the head and the records behind it, in order"
+    );
+
+    shutdown_b.cancel();
+    running_b.await.unwrap().unwrap();
+    poll_until("the partition is A's alone", TIMEOUT, || {
+        group_state(tb.brokers(), GROUP) == ("Stable".to_string(), 1)
+    })
+    .await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(4)).await;
+    poll_until(
+        "A handles the record published after the partition returned",
+        TIMEOUT,
+        || deliveries(&log).iter().any(|d| d.offset == 4),
+    )
+    .await;
+
+    let log = deliveries(&log);
+    assert_each_partition_in_offset_order(&log);
+    let returned: Vec<&Delivery> = log.iter().filter(|d| d.offset == 4).collect();
+    assert_eq!(
+        returned.len(),
+        1,
+        "the returning partition delivers the next record once: {log:#?}"
+    );
+    assert_eq!(returned[0].member, "a");
+    assert!(
+        log[before_revoke.len()..].iter().all(|d| !d.redelivered),
+        "the old wait handed the head back to no handler after the revoke: {log:#?}"
+    );
+
+    shutdown_a.cancel();
+    running_a.await.unwrap().unwrap();
+}
+
+/// A revoke that arrives while the sole permit is held by an in-place wait
+/// too long to end on its own. The coordinator drops the member on a
+/// LeaveGroup sent on its behalf, and the member's next heartbeat revokes
+/// its partition. The wait ends within the bound and frees the permit: the
+/// member rejoins, is handed the head again from the committed position as a
+/// fresh delivery, which only the freed permit lets it dispatch, and the old
+/// wait hands nothing back.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_revoke_ends_the_in_place_wait_holding_the_sole_permit() {
+    use shove::kafka::drop_probe;
+
+    const TOPIC: &str = "kafka-external-revoke-wait";
+    const GROUP: &str = "kafka-external-revoke-wait-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    let record = |offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("r{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(0)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &record(1)).await;
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let a = OrderRecorder::new("a", log.clone()).holding(0, 0);
+    let shutdown = CancellationToken::new();
+    let running = spawn_single_permit_in_place_member::<ExternalRevokeWaitTopic, _>(
+        tb.client(),
+        a.clone(),
+        shutdown.clone(),
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+    poll_until("the head is deferred and waits in place", TIMEOUT, || {
+        a.defers() >= 1
+    })
+    .await;
+    let members = group_member_ids(tb.brokers(), GROUP);
+    assert_eq!(members.len(), 1, "one member: {members:?}");
+
+    leave_group_on_behalf_of(tb.brokers(), GROUP, &members[0]).await;
+
+    poll_until("the wait ends at the revoke", TIMEOUT, || {
+        drop_probe::in_place_revoked() >= 1
+    })
+    .await;
+    poll_until(
+        "the rejoined member is handed the head again as a fresh delivery",
+        TIMEOUT,
+        || {
+            deliveries(&log)
+                .iter()
+                .filter(|d| d.offset == 0 && !d.redelivered)
+                .count()
+                >= 2
+        },
+    )
+    .await;
+
+    let log = deliveries(&log);
+    assert!(
+        log.iter().all(|d| d.offset == 0),
+        "offset 1 waits behind the head throughout: {log:#?}"
+    );
+    assert!(
+        log.iter().all(|d| !d.redelivered),
+        "the old wait, a 30 s delay only the revoke could cut short, handed nothing back: {log:#?}"
+    );
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
 }
 
 /// A missing external topic is a startup error, not a silent auto-create:

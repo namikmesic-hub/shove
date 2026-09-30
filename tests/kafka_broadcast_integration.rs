@@ -77,6 +77,17 @@ define_topic!(
         .build()
 );
 
+// A stop during a deferred wait; see
+// `a_stop_during_a_deferred_wait_hands_nothing_over_behind_it`.
+#[cfg(feature = "test-support")]
+define_topic!(
+    StopTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-stop")
+        .broadcast()
+        .build()
+);
+
 // Only `connected_head_broadcast_reads_a_new_partition_from_its_head` uses
 // this topic: that test reads the subscriber's own log lines back by queue
 // name, so no other test may share the name.
@@ -247,6 +258,68 @@ impl MessageHandler<DeferTopic> for DeferOnce {
         } else {
             Outcome::Ack
         }
+    }
+}
+
+/// Counts its calls. The first call runs far past the handler timeout, and
+/// marks the instant its future is dropped, which is when the timeout
+/// resolved the call to the configured outcome; every later call acks at
+/// once.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+struct SlowFirstCall {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "test-support")]
+impl SlowFirstCall {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Sets its flag when dropped while armed, so a handler future the timeout
+/// dropped mid-sleep reports that it was cut short.
+#[cfg(feature = "test-support")]
+struct CutShort {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl CutShort {
+    fn ran_to_the_end(mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for CutShort {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl MessageHandler<StopTopic> for SlowFirstCall {
+    type Context = ();
+    async fn handle(&self, _msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            let cut_short = CutShort {
+                flag: self.timed_out.clone(),
+                armed: true,
+            };
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            cut_short.ran_to_the_end();
+        }
+        Outcome::Ack
     }
 }
 
@@ -1451,6 +1524,77 @@ async fn defer_redelivers_in_place_before_later_records() {
     let _ = sub
         .run_until_timeout(std::future::pending(), Duration::from_secs(10))
         .await;
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// A stop during a deferred wait hands nothing over behind it. Two records
+/// sit on one partition. The first call runs past the handler timeout, which
+/// resolves it to `Defer`, so the record waits in place holding the
+/// subscription's single slot; the second record was read meanwhile and
+/// waits in the loop's hand for that slot. The stop cancels the wait, which
+/// frees the slot in the same instant; the loop must read the stop first and
+/// drop the second record, so the handler saw exactly one call.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
+    use shove::kafka::drop_probe;
+
+    const TOPIC: &str = "kafka-broadcast-stop";
+    let tb = TestBroker::start().await;
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<StopTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+    // Both records are on the topic before the subscription assigns, on one
+    // partition so they are read in this order; a `Head` start reads them
+    // without a settle window.
+    for key in ["1", "2"] {
+        tb.publish_to_partition(TOPIC, 0, &Invalidate { key: key.into() })
+            .await;
+    }
+
+    let broker = tb.broker().await;
+    let handler = SlowFirstCall::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<StopTopic, _>(
+        handler.clone(),
+        ConsumerOptions::new()
+            .with_broadcast_start(BroadcastStart::Head)
+            .with_prefetch_count(1)
+            .with_handler_timeout(Duration::from_millis(300))
+            .with_handler_timeout_outcome(Outcome::Defer),
+    )
+    .expect("failed to subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !handler.timed_out() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        handler.timed_out(),
+        "the first call was not cut short by the handler timeout"
+    );
+    // The first record now waits out its one-second deferral holding the
+    // slot, and the second sits in the loop's hand behind it.
+    sub.cancellation_token().cancel();
+    let outcome = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    assert_eq!(
+        handler.calls(),
+        1,
+        "the stop handed neither the deferred record nor the one behind it to the handler"
+    );
+    assert_eq!(
+        drop_probe::broadcast_shutdown(),
+        1,
+        "the second record was in the loop's hand and was dropped at the stop"
+    );
     broker.close().await;
     publisher_broker.close().await;
 }
