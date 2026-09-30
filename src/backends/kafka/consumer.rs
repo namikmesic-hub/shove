@@ -273,6 +273,23 @@ impl PartitionTracker {
         self.highest_delivered = self.highest_delivered.max(offset);
     }
 
+    /// Forgets a delivery the receive loop tracked and then put back to the
+    /// broker unhandled, so the record arrives again later.
+    ///
+    /// The offset leaves the in-flight set. It was the highest delivered,
+    /// since the loop holds one record at a time and puts back every record
+    /// it receives while it holds one, so the high mark steps down to the
+    /// offset below it: everything under the offset was delivered and either
+    /// completed or is still in flight, and the position stays where it was
+    /// before the record arrived. The record is not a completion, so the
+    /// position never moves past it.
+    fn untrack(&mut self, offset: i64) {
+        self.in_flight.remove(&offset);
+        if self.highest_delivered == offset {
+            self.highest_delivered = offset.saturating_sub(1);
+        }
+    }
+
     fn mark_complete(&mut self, offset: i64, discard: Option<TerminalDiscard>) {
         // Taken out first, whatever the stale check decides: an entry left
         // behind would pin `position()` at its offset for the rest of the
@@ -497,6 +514,15 @@ impl OffsetTracker {
         DeliveryEpoch {
             epoch: current.epoch,
             revoked: current.revoked.clone(),
+        }
+    }
+
+    /// Forgets a delivery the receive loop tracked and then put back
+    /// unhandled, see `PartitionTracker::untrack`. A partition the tracker
+    /// no longer holds has nothing to forget.
+    fn untrack(&mut self, partition: i32, offset: i64) {
+        if let Some(tracker) = self.partitions.get_mut(&partition) {
+            tracker.untrack(offset);
         }
     }
 
@@ -1982,7 +2008,12 @@ fn in_place_delay(hold_queues: &[HoldQueue], attempts: u32, increment: bool) -> 
 #[derive(Default)]
 struct InPlaceWaits {
     count: AtomicUsize,
-    waiting: std::sync::Mutex<HashMap<i32, BTreeSet<i64>>>,
+    /// Per partition, the offsets waiting in place and how many tasks wait
+    /// on each. Two tasks can wait on one offset: a task from an assignment
+    /// that ended and the task of the assignment that replaced it, until the
+    /// first one observes its revoke. Each guard removes only its own count,
+    /// so a guard from the old assignment cannot unlist the new one's wait.
+    waiting: std::sync::Mutex<HashMap<i32, BTreeMap<i64, usize>>>,
     changed: Notify,
 }
 
@@ -1997,7 +2028,7 @@ impl InPlaceWaits {
     fn blocks(&self, partition: i32, offset: i64) -> bool {
         self.lock()
             .get(&partition)
-            .and_then(|offsets| offsets.first().copied())
+            .and_then(|offsets| offsets.keys().next().copied())
             .is_some_and(|lowest| lowest < offset)
     }
 
@@ -2013,7 +2044,7 @@ impl InPlaceWaits {
         self.changed.notified().await;
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i32, BTreeSet<i64>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i32, BTreeMap<i64, usize>>> {
         // The map is touched only under this lock and only by trivial
         // inserts and removes, so a poisoned lock still guards a consistent
         // map.
@@ -2038,7 +2069,12 @@ struct InPlaceWait<'a> {
 impl<'a> InPlaceWait<'a> {
     fn begin(waits: &'a InPlaceWaits, partition: i32, offset: i64) -> Self {
         waits.count.fetch_add(1, Ordering::AcqRel);
-        waits.lock().entry(partition).or_default().insert(offset);
+        *waits
+            .lock()
+            .entry(partition)
+            .or_default()
+            .entry(offset)
+            .or_insert(0) += 1;
         Self {
             waits,
             partition,
@@ -2052,7 +2088,12 @@ impl Drop for InPlaceWait<'_> {
         {
             let mut waiting = self.waits.lock();
             if let Some(offsets) = waiting.get_mut(&self.partition) {
-                offsets.remove(&self.offset);
+                if let Some(waiters) = offsets.get_mut(&self.offset) {
+                    *waiters -= 1;
+                    if *waiters == 0 {
+                        offsets.remove(&self.offset);
+                    }
+                }
                 if offsets.is_empty() {
                     waiting.remove(&self.partition);
                 }
@@ -5621,6 +5662,34 @@ impl KafkaConsumer {
                                 })?,
                             };
 
+                            // Checked again, right before the handler: the
+                            // check before the decode ran on an earlier
+                            // state, and a lower record of this partition
+                            // may have started its wait while this record
+                            // waited for a permit or for the registry. The
+                            // record is tracked by now, so it is untracked
+                            // first and the position stays where it was; the
+                            // permit goes back, the record goes back, and its
+                            // partition alone is paused as above.
+                            if in_place && in_place_waits.blocks(partition, offset) {
+                                #[cfg(feature = "test-support")]
+                                put_back_probe::PENDING_ORDER.fetch_add(1, Ordering::SeqCst);
+                                drop(permit);
+                                tracker.untrack(partition, offset);
+                                put_back(&consumer, queue, partition, offset)?;
+                                consumer
+                                    .pause_partition(queue, partition)
+                                    .map_err(|e| map_kafka_error("pause failed", e))?;
+                                paused_for_pending.insert(partition);
+                                tracing::debug!(
+                                    queue,
+                                    partition,
+                                    offset,
+                                    "a lower record of the partition started to wait in place while this record waited for a permit; put back and partition paused"
+                                );
+                                continue;
+                            }
+
                             let task_client = client.clone();
                             let task_processing = processing.clone();
                             let task_semaphore = semaphore.clone();
@@ -8976,6 +9045,82 @@ mod assignment_epoch_tests {
 }
 
 #[cfg(test)]
+mod untrack_tests {
+    use super::*;
+
+    fn committed_offset(tpl: &TopicPartitionList, partition: i32) -> Option<i64> {
+        tpl.elements()
+            .iter()
+            .find(|e| e.partition() == partition)
+            .and_then(|e| match e.offset() {
+                Offset::Offset(o) => Some(o),
+                _ => None,
+            })
+    }
+
+    /// A record tracked and then put back leaves the position where it was:
+    /// 5 completed, 6 tracked then untracked, and the position is 6, not 7.
+    #[test]
+    fn untracking_a_put_back_record_leaves_the_position_below_it() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 5);
+        tracker.mark_complete(tracker.completion(0, 5));
+        let (tpl, _) = tracker.drain_committable().expect("5 commits");
+        assert_eq!(committed_offset(&tpl, 0), Some(6));
+
+        tracker.track_received(0, 6);
+        tracker.untrack(0, 6);
+        assert!(
+            tracker.drain_committable().is_none(),
+            "nothing new to commit: 6 was never handled"
+        );
+        assert!(!tracker.has_committable());
+
+        // 6 arrives again and completes; only then does the position move.
+        tracker.track_received(0, 6);
+        tracker.mark_complete(tracker.completion(0, 6));
+        let (tpl, _) = tracker.drain_committable().expect("6 commits once handled");
+        assert_eq!(committed_offset(&tpl, 0), Some(7));
+    }
+
+    /// Untracking the record behind an in-flight one keeps the earlier
+    /// record's hold on the position, and the later completions still lift
+    /// it past every record that was handled.
+    #[test]
+    fn untracking_behind_an_in_flight_record_keeps_the_earlier_hold() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 3);
+        tracker.track_received(0, 5);
+        tracker.mark_complete(tracker.completion(0, 5));
+        tracker.track_received(0, 6);
+        tracker.untrack(0, 6);
+        assert!(
+            tracker.drain_committable().is_none(),
+            "3 is still in flight, so nothing commits"
+        );
+
+        tracker.mark_complete(tracker.completion(0, 3));
+        let (tpl, _) = tracker.drain_committable().expect("3 completes");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(6),
+            "3 and 5 were handled and 6 was not, so the position is 6"
+        );
+    }
+
+    /// The first record of an assignment, put back before any completion,
+    /// leaves nothing to commit.
+    #[test]
+    fn untracking_the_first_record_of_an_assignment_commits_nothing() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.untrack(0, 0);
+        assert!(tracker.drain_committable().is_none());
+        assert!(!tracker.has_committable());
+    }
+}
+
+#[cfg(test)]
 mod in_place_waits_tests {
     use super::*;
 
@@ -9019,6 +9164,29 @@ mod in_place_waits_tests {
         assert!(waits.is_waiting(1));
         drop(high);
         assert!(!waits.is_waiting(1));
+    }
+
+    /// Two tasks wait on the same record: one from an assignment that ended,
+    /// one from the assignment that replaced it. The old task's guard, dropped
+    /// after the new task registered, unlists only its own wait, so the new
+    /// wait still holds the later records of the partition back.
+    #[test]
+    fn a_guard_from_an_earlier_assignment_cannot_unlist_the_current_wait() {
+        let waits = InPlaceWaits::default();
+        let old = InPlaceWait::begin(&waits, 0, 0);
+        let current = InPlaceWait::begin(&waits, 0, 0);
+        assert_eq!(waits.count(), 2);
+        assert!(waits.blocks(0, 1));
+
+        drop(old);
+        assert_eq!(waits.count(), 1);
+        assert!(waits.is_waiting(0), "the current wait is still listed");
+        assert!(waits.blocks(0, 1), "(P, 1) still waits behind (P, 0)");
+
+        drop(current);
+        assert_eq!(waits.count(), 0);
+        assert!(!waits.is_waiting(0));
+        assert!(!waits.blocks(0, 1));
     }
 
     /// A wait that ends wakes the loop, so a partition paused behind it is

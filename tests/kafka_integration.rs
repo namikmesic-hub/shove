@@ -322,6 +322,19 @@ shove::define_topic!(
         .build()
 );
 
+// Two partitions and two permits: a record held for a permit must be
+// checked again against a wait that began meanwhile.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalTwoPermitTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-two-permits")
+        .external()
+        .hold_queue(Duration::from_secs(3))
+        .allow_message_loss()
+        .build()
+);
+
 // A forced revoke while the sole permit is held by an in-place wait long
 // enough that only the revoke can end it.
 #[cfg(feature = "test-support")]
@@ -1030,9 +1043,9 @@ struct OrderRecorder {
     log: Arc<std::sync::Mutex<Vec<Delivery>>>,
     /// `(partition, offset)` pairs this member defers while they are listed.
     hold: Arc<std::sync::Mutex<std::collections::HashSet<(i32, i64)>>>,
-    /// How long the handler runs before it defers a held record, so a test
+    /// How long the handler runs on a record before it returns, so a test
     /// can keep the handler in its running state for a while.
-    held_runs_for: Duration,
+    runs_for: Arc<std::sync::Mutex<HashMap<(i32, i64), Duration>>>,
     /// How many `Defer` outcomes this member has returned.
     defers: Arc<AtomicU32>,
 }
@@ -1044,7 +1057,7 @@ impl OrderRecorder {
             member,
             log,
             hold: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            held_runs_for: Duration::ZERO,
+            runs_for: Arc::new(std::sync::Mutex::new(HashMap::new())),
             defers: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -1054,8 +1067,11 @@ impl OrderRecorder {
         self
     }
 
-    fn held_running_for(mut self, duration: Duration) -> Self {
-        self.held_runs_for = duration;
+    fn running_for(self, partition: i32, offset: i64, duration: Duration) -> Self {
+        self.runs_for
+            .lock()
+            .unwrap()
+            .insert((partition, offset), duration);
         self
     }
 
@@ -1078,9 +1094,17 @@ impl OrderRecorder {
             id,
             redelivered: meta.redelivered,
         });
+        let runs_for = self
+            .runs_for
+            .lock()
+            .unwrap()
+            .get(&(partition, offset))
+            .copied();
+        if let Some(duration) = runs_for {
+            tokio::time::sleep(duration).await;
+        }
         let held = self.hold.lock().unwrap().contains(&(partition, offset));
         if held {
-            tokio::time::sleep(self.held_runs_for).await;
             self.defers.fetch_add(1, Ordering::SeqCst);
             Outcome::Defer
         } else {
@@ -1107,6 +1131,7 @@ order_recorder_for!(
     ExternalRebalanceOrderTopic,
     ExternalForcedRevokeTopic,
     ExternalRevokeWaitTopic,
+    ExternalTwoPermitTopic,
 );
 
 /// A snapshot of an [`OrderRecorder`] log.
@@ -3889,7 +3914,7 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
     // the in-place wait begins.
     let handler = OrderRecorder::new("a", log.clone())
         .holding(0, 2)
-        .held_running_for(Duration::from_secs(1));
+        .running_for(0, 2, Duration::from_secs(1));
     let shutdown = CancellationToken::new();
     let running = spawn_single_permit_in_place_member::<ExternalStopOrderTopic, _>(
         tb.client(),
@@ -3960,6 +3985,128 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
         vec![2, 3],
         "the restart delivers the waiting record, then the one behind it"
     );
+    shutdown.cancel();
+    running.await.unwrap().unwrap();
+}
+
+/// The order invariant with two permits, on the record the loop holds while
+/// it waits for a permit. Records 0 and 1 of partition 0 are dispatched
+/// together; 0 runs a second and defers, 1 runs two seconds and acks.
+/// Record 2 arrived meanwhile and waits for a permit; when 1's permit frees,
+/// 0 is waiting, so 2 must be checked again, put back and its partition
+/// paused, not handed over. Partition 1 keeps flowing while partition 0 is
+/// paused, and once 0's hold is released its wait ends, the partition
+/// resumes, and 2 arrives once, put back once in all.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_meanwhile() {
+    use shove::kafka::put_back_probe;
+
+    const TOPIC: &str = "kafka-external-two-permits";
+    const GROUP: &str = "kafka-external-two-permits-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 2).await;
+    let record = |partition: i32, offset: i64| {
+        serde_json::to_vec(&SimpleMessage {
+            id: format!("p{partition}-{offset}"),
+            content: String::new(),
+        })
+        .unwrap()
+    };
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler = OrderRecorder::new("a", log.clone())
+        .holding(0, 0)
+        .running_for(0, 0, Duration::from_secs(1))
+        .running_for(0, 1, Duration::from_secs(2));
+    let shutdown = CancellationToken::new();
+    // Two permits, set explicitly: this is the case the one-permit pause
+    // does not cover.
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_shutdown(shutdown.clone())
+        .with_retry_strategy(RetryStrategy::InPlace)
+        .with_concurrent_processing(true)
+        .with_prefetch_count(2);
+    let consumer = KafkaConsumer::new(tb.client());
+    let h = handler.clone();
+    let running = tokio::spawn(async move {
+        consumer
+            .run::<ExternalTwoPermitTopic, _>(h, (), options)
+            .await
+    });
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    for offset in 0..3 {
+        publish_raw_to(tb.brokers(), TOPIC, 0, &record(0, offset)).await;
+    }
+    poll_until(
+        "record 2, held for a permit, is put back once 0 waits and 1's permit frees",
+        TIMEOUT,
+        || put_back_probe::pending_order() >= 1,
+    )
+    .await;
+    let before: Vec<i64> = deliveries(&log).iter().map(|d| d.offset).collect();
+    assert_eq!(
+        before,
+        vec![0, 1],
+        "record 2 was not handed over while record 0 waited"
+    );
+
+    // Partition 1 keeps flowing while partition 0 is paused behind its wait.
+    publish_raw_to(tb.brokers(), TOPIC, 1, &record(1, 0)).await;
+    poll_until(
+        "partition 1 is handled while partition 0 is paused",
+        TIMEOUT,
+        || deliveries(&log).iter().any(|d| d.partition == 1),
+    )
+    .await;
+    assert!(
+        deliveries(&log)
+            .iter()
+            .all(|d| !(d.partition == 0 && d.offset == 2)),
+        "record 2 still waits behind record 0: {:#?}",
+        deliveries(&log)
+    );
+
+    // The hold comes off: 0's wait ends within its cycle, the partition
+    // resumes, and 2 arrives.
+    handler.release();
+    poll_until("record 2 arrives once partition 0 resumed", TIMEOUT, || {
+        deliveries(&log)
+            .iter()
+            .any(|d| d.partition == 0 && d.offset == 2)
+    })
+    .await;
+    wait_for_zero_lag(&tb.client(), TOPIC, GROUP, TIMEOUT).await;
+
+    let log = deliveries(&log);
+    assert_eq!(
+        log.iter()
+            .filter(|d| d.partition == 0 && d.offset == 2)
+            .count(),
+        1,
+        "record 2 was handled once: {log:#?}"
+    );
+    let redelivered_head = log
+        .iter()
+        .position(|d| d.partition == 0 && d.offset == 0 && d.redelivered)
+        .expect("the head was redelivered in place after its hold came off");
+    let two = log
+        .iter()
+        .position(|d| d.partition == 0 && d.offset == 2)
+        .expect("record 2 was handled");
+    assert!(
+        redelivered_head < two,
+        "record 2 came after the head's wait ended: {log:#?}"
+    );
+    assert_eq!(
+        put_back_probe::pending_order(),
+        1,
+        "record 2 was put back once, not again after the partition resumed"
+    );
+    assert_eq!(committed_offset(tb.brokers(), GROUP, TOPIC, 0), Some(3));
+    assert_eq!(committed_offset(tb.brokers(), GROUP, TOPIC, 1), Some(1));
+
     shutdown.cancel();
     running.await.unwrap().unwrap();
 }
