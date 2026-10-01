@@ -4879,8 +4879,10 @@ struct LoopWaits<'a> {
 /// resume the assignment and hand the next record to a handler during the
 /// drain, behind the record the stop left unhandled, and a record `recv()`
 /// already holds could reach a handler the same way. The order is the
-/// plan's, and the function exists so the order is pinned by a unit test
-/// with every source ready at once; a broker cannot stage that instant.
+/// plan's, and the function exists so unit tests can pin it: one readies
+/// every source at once and reads them out in this order, and others ready
+/// the stop against a record or a freed permit a hundred times over. A
+/// broker cannot stage those instants.
 async fn next_loop_event<M>(waits: LoopWaits<'_>, recv: impl Future<Output = M>) -> LoopEvent<M> {
     let LoopWaits {
         shutdown,
@@ -9276,6 +9278,7 @@ mod loop_select_order_tests {
         fault_tx: mpsc::Sender<ShoveError>,
         fault_rx: mpsc::Receiver<ShoveError>,
         housekeeping: tokio::time::Interval,
+        rebalance_tx: RebalanceSender,
         rebalance_rx: RebalanceReceiver,
         in_place_waits: InPlaceWaits,
         completion_tx: mpsc::Sender<Completion>,
@@ -9283,20 +9286,46 @@ mod loop_select_order_tests {
         semaphore: Arc<Semaphore>,
     }
 
+    /// The arms a test enables or disables for one wait, as the loop does
+    /// from its state.
+    struct Enabled {
+        paused: bool,
+        listen_for_wait_end: bool,
+        commit_due_at: Option<Instant>,
+    }
+
+    impl Enabled {
+        /// Nothing optional enabled: the unpaused loop with no partition
+        /// paused behind a wait and nothing to commit.
+        fn none() -> Self {
+            Self {
+                paused: false,
+                listen_for_wait_end: false,
+                commit_due_at: None,
+            }
+        }
+
+        fn paused(paused: bool) -> Self {
+            Self {
+                paused,
+                ..Self::none()
+            }
+        }
+    }
+
     impl Sources {
-        async fn quiet() -> Self {
+        /// Every source, with the housekeeping interval's immediate first
+        /// tick still pending.
+        fn fresh() -> Self {
             let (fault_tx, fault_rx) = mpsc::channel(1);
             let (completion_tx, completion_rx) = mpsc::channel(4);
-            let (_rebalance_tx, rebalance_rx) = rebalance_channel();
-            let mut housekeeping = tokio::time::interval(Duration::from_secs(3600));
-            // An interval's first tick is immediate; the loop consumes it on
-            // its first pass, as this does.
-            housekeeping.tick().await;
+            let (rebalance_tx, rebalance_rx) = rebalance_channel();
             Self {
                 shutdown: CancellationToken::new(),
                 fault_tx,
                 fault_rx,
-                housekeeping,
+                housekeeping: tokio::time::interval(Duration::from_secs(3600)),
+                rebalance_tx,
                 rebalance_rx,
                 in_place_waits: InPlaceWaits::default(),
                 completion_tx,
@@ -9307,20 +9336,55 @@ mod loop_select_order_tests {
             }
         }
 
+        /// Every source quiet.
+        async fn quiet() -> Self {
+            let mut sources = Self::fresh();
+            // An interval's first tick is immediate; the loop consumes it on
+            // its first pass, as this does.
+            sources.housekeeping.tick().await;
+            sources
+        }
+
+        /// Every source ready at once but the stop: the fault reported, the
+        /// housekeeping tick due, a rebalance event queued, an in-place wait
+        /// ended, a completion queued, and a permit free. The commit
+        /// deadline, the wait-end arm and the resume arm are enabled through
+        /// [`Enabled`] by the test, and the record through its `recv`.
+        fn all_ready() -> Self {
+            let sources = Self::fresh();
+            sources
+                .fault_tx
+                .try_send(ShoveError::Topology("fault".into()))
+                .unwrap();
+            sources.rebalance_tx.send(RebalanceEvent::Assign(vec![0]));
+            drop(InPlaceWait::begin(&sources.in_place_waits, 0, 0));
+            sources.completion_tx.try_send(completion()).unwrap();
+            sources
+        }
+
         /// One wait, with `recv` as the record source.
         async fn next<M>(&mut self, paused: bool, recv: impl Future<Output = M>) -> LoopEvent<M> {
+            self.next_with(Enabled::paused(paused), recv).await
+        }
+
+        /// One wait with the optional arms as `enabled` says.
+        async fn next_with<M>(
+            &mut self,
+            enabled: Enabled,
+            recv: impl Future<Output = M>,
+        ) -> LoopEvent<M> {
             next_loop_event(
                 LoopWaits {
                     shutdown: &self.shutdown,
                     fault_rx: &mut self.fault_rx,
                     housekeeping: &mut self.housekeeping,
-                    commit_due_at: None,
+                    commit_due_at: enabled.commit_due_at,
                     rebalance: &self.rebalance_rx,
                     in_place_waits: &self.in_place_waits,
-                    listen_for_wait_end: false,
+                    listen_for_wait_end: enabled.listen_for_wait_end,
                     completion_rx: &mut self.completion_rx,
                     semaphore: &self.semaphore,
-                    paused,
+                    paused: enabled.paused,
                 },
                 recv,
             )
@@ -9331,6 +9395,21 @@ mod loop_select_order_tests {
     /// A record ready, so one wait of the select has a record to read.
     fn ready_record() -> impl Future<Output = i32> {
         std::future::ready(7)
+    }
+
+    /// The event's variant, for an assertion message.
+    fn variant<M>(event: &LoopEvent<M>) -> &'static str {
+        match event {
+            LoopEvent::Shutdown => "Shutdown",
+            LoopEvent::Fault(_) => "Fault",
+            LoopEvent::Housekeeping => "Housekeeping",
+            LoopEvent::CommitDue => "CommitDue",
+            LoopEvent::RebalanceWoken => "RebalanceWoken",
+            LoopEvent::WaitEnded => "WaitEnded",
+            LoopEvent::Completion(_) => "Completion",
+            LoopEvent::PermitFreed(_) => "PermitFreed",
+            LoopEvent::Record(_) => "Record",
+        }
     }
 
     fn completion() -> Completion {
@@ -9346,6 +9425,100 @@ mod loop_select_order_tests {
     /// order would pass one wait by luck half the time, and all of these
     /// once in two to the hundredth.
     const RUNS: usize = 100;
+
+    /// Every source ready at once, the stop included: the loop reads the
+    /// stop. Without the stop, successive waits read the rest out in the
+    /// documented order, each source consumed by the wait that read it:
+    /// the fault, the housekeeping tick, the commit deadline, the rebalance
+    /// wake, the wait-end wake, the completion, the freed permit, and the
+    /// record last.
+    ///
+    /// The housekeeping tick and the commit deadline are timers, and a
+    /// timer is ready at its first poll only once the time driver has passed
+    /// its deadline; the paused clock is moved past both, so every source is
+    /// ready the instant it is polled.
+    #[tokio::test(start_paused = true)]
+    async fn every_source_ready_at_once_is_read_in_the_documented_order() {
+        let due = Instant::now();
+        let everything = || Enabled {
+            paused: true,
+            listen_for_wait_end: true,
+            commit_due_at: Some(due),
+        };
+
+        let mut sources = Sources::all_ready();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        sources.shutdown.cancel();
+        for _ in 0..RUNS {
+            assert!(matches!(
+                sources.next_with(everything(), ready_record()).await,
+                LoopEvent::Shutdown
+            ));
+        }
+
+        let mut sources = Sources::all_ready();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let read = sources.next_with(everything(), ready_record()).await;
+        assert!(
+            matches!(read, LoopEvent::Fault(Some(_))),
+            "the fault comes first, got {}",
+            variant(&read)
+        );
+        let read = sources.next_with(everything(), ready_record()).await;
+        assert!(
+            matches!(read, LoopEvent::Housekeeping),
+            "the housekeeping tick comes next, got {}",
+            variant(&read)
+        );
+        let read = sources.next_with(everything(), ready_record()).await;
+        assert!(
+            matches!(read, LoopEvent::CommitDue),
+            "the commit deadline comes next, got {}",
+            variant(&read)
+        );
+        // The deadline is read once per pass; the loop's next pass computes
+        // a new one or none, as here.
+        let rest = || Enabled {
+            commit_due_at: None,
+            ..everything()
+        };
+        let read = sources.next_with(rest(), ready_record()).await;
+        assert!(
+            matches!(read, LoopEvent::RebalanceWoken),
+            "the rebalance wake comes next, got {}",
+            variant(&read)
+        );
+        let read = sources.next_with(rest(), ready_record()).await;
+        assert!(
+            matches!(read, LoopEvent::WaitEnded),
+            "the wait-end wake comes next, got {}",
+            variant(&read)
+        );
+        let no_pending = || Enabled {
+            listen_for_wait_end: false,
+            ..rest()
+        };
+        let read = sources.next_with(no_pending(), ready_record()).await;
+        assert!(
+            matches!(read, LoopEvent::Completion(Some(_))),
+            "the completion comes next, got {}",
+            variant(&read)
+        );
+        let read = sources.next_with(no_pending(), ready_record()).await;
+        let LoopEvent::PermitFreed(permit) = read else {
+            panic!(
+                "the resume arm comes before the record, got {}",
+                variant(&read)
+            );
+        };
+        drop(permit.expect("the semaphore is open"));
+        let read = sources.next_with(Enabled::none(), ready_record()).await;
+        assert!(
+            matches!(read, LoopEvent::Record(7)),
+            "the record comes last, got {}",
+            variant(&read)
+        );
+    }
 
     /// The stop race in the unpaused state: a record is ready and the token
     /// fired in the same instant. The loop reads the stop, every time.
