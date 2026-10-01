@@ -22,6 +22,17 @@ slow-timeout = { period = "90s" }
 filter = 'binary_id(shove::metrics_sqs_sequenced)'
 threads-required = 'num-test-threads'
 
+[[profile.default.overrides]]
+# The two Kafka in-place order tests that change the group's membership while
+# a head record waits in place: one stages a cooperative rebalance, the other
+# a coordinator-forced revoke, and each polls the group through it. They run
+# with every test thread rather than beside the other Kafka brokers a run at
+# default parallelism starts, whose pressure stretches a rebalance past the
+# bounds a laptop holds. Per-test exclusivity rather than a group cap, as for
+# `metrics_sqs_sequenced` above.
+filter = 'test(=cooperative_rebalance_does_not_commit_past_deferred_head) | test(=a_forced_revoke_ends_the_in_place_wait_and_the_new_owner_completes_the_record)'
+threads-required = 'num-test-threads'
+
 [[profile.default.scripts]]
 # The `metrics_rabbitmq_*` binaries share the container rather than starting
 # their own: each carves out a private vhost per run, so they cannot collide

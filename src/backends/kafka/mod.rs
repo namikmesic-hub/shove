@@ -27,6 +27,9 @@ pub use consumer::drop_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::pause_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::permit_wait_probe;
 
 /// Test-only seam (see the `test-support` feature): how often the concurrent
 /// receive loop wakes on its own to drain rebalance events, so a test that

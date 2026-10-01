@@ -458,9 +458,9 @@ struct OffsetTracker {
     topic: String,
     partitions: HashMap<i32, PartitionTracker>,
     /// The current assignment of every partition this member holds, see
-    /// [`AssignmentEpoch`]. An entry begins on the assign event, or on the
-    /// first delivery if the event was not seen first, and ends with its
-    /// token cancelled on the revoke event.
+    /// [`AssignmentEpoch`]. An entry begins on the assign event and ends,
+    /// its token cancelled, on the revoke event. A record of a partition
+    /// without an entry is refused, see `track_received`.
     epochs: HashMap<i32, AssignmentEpoch>,
     /// The number the next assignment gets. Never reused.
     next_epoch: u64,
@@ -1183,6 +1183,24 @@ pub mod put_back_probe {
 
     pub fn pending_order() -> usize {
         PENDING_ORDER.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only counter (see the `test-support` feature) on the records the
+/// receive loop took in hand and entered the permit wait with, whether a
+/// permit was free at that instant or not, so a test can count the records
+/// that passed through and place one in that wait before it moves on.
+/// nextest runs each test in its own process, so the counter starts at zero.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod permit_wait_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A record entered `acquire_permit_while_polling` from the receive arm.
+    pub static ENTERED: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn entered() -> usize {
+        ENTERED.load(Ordering::SeqCst)
     }
 }
 
@@ -4634,9 +4652,13 @@ impl PollingConsumer for KafkaStreamConsumer {
 /// (`rdkafka_assignment.c`, the `RD_KAFKA_TOPPAR_F_LIB_PAUSE` reset).
 /// Whatever paused the partition is over with the old assignment, so it is
 /// resumed here; a resume of a partition that was never paused is a no-op.
-/// Called after every drain the loop makes, at the top of a pass and in the
-/// receive arm, where the assign event and the partition's first record can
-/// come from one poll.
+/// Called at the top of every pass. The receive arm drains the events too,
+/// to seed the tracker in the right order when the assign event and the
+/// partition's first record come from one poll, but leaves the assigned
+/// partitions to the next pass: a record that goes straight to a handler
+/// reaches it microseconds later, and one that waits for a permit reaches it
+/// after that wait, during which any record of the partition would be put
+/// back anyway.
 fn settle_assigned<C: PollingConsumer>(
     tracker: &mut OffsetTracker,
     consumer: &C,
@@ -4786,6 +4808,111 @@ async fn acquire_permit_while_polling<C: PollingConsumer>(
                 );
             }
         }
+    }
+}
+
+/// What woke the concurrent receive loop, see [`next_loop_event`].
+enum LoopEvent<M> {
+    /// The shutdown token fired: drain, commit, return.
+    Shutdown,
+    /// A handler task reported a fault over the fault channel; `None` once
+    /// every sender is gone, which cannot happen while the loop holds one.
+    Fault(Option<ShoveError>),
+    /// The housekeeping interval ticked, so the top-of-loop drain runs even
+    /// when no record or completion arrives: the rebalance callbacks push
+    /// onto a channel that only the loop body reads.
+    Housekeeping,
+    /// The commit gate's window expired with commit work pending, so a gated
+    /// commit lands within about one interval even on a topic gone idle,
+    /// instead of waiting for the housekeeping tick.
+    CommitDue,
+    /// A rebalance event was queued: the top-of-loop drain applies it now,
+    /// so a revoke ends the in-place waits on its partitions at once, not on
+    /// the next housekeeping tick or record.
+    RebalanceWoken,
+    /// An in-place wait ended while a partition is paused behind one: the
+    /// top-of-loop check resumes it.
+    WaitEnded,
+    /// A handler completion arrived. Completions must wake the loop even when
+    /// no record does: with only the record arm, the offsets of the last
+    /// in-flight batch sat uncommitted until the next record or the stop, so
+    /// a crash on an idle topic redelivered a batch already handled.
+    Completion(Option<Completion>),
+    /// The whole assignment is paused and a permit freed, so the assignment
+    /// can be resumed and the permit kept for the next record.
+    PermitFreed(std::result::Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>),
+    /// `recv()` yielded a record, or an error.
+    Record(M),
+}
+
+/// The sources one wait of the concurrent receive loop reads, borrowed for
+/// that wait.
+struct LoopWaits<'a> {
+    shutdown: &'a CancellationToken,
+    fault_rx: &'a mut mpsc::Receiver<ShoveError>,
+    housekeeping: &'a mut tokio::time::Interval,
+    /// The commit gate's deadline while commit work is pending, and `None`
+    /// otherwise, so an idle consumer does not wake every interval. No busy
+    /// spin when the deadline is past: the top-of-loop drain then commits
+    /// and the gate's `mark` pushes the deadline forward.
+    commit_due_at: Option<Instant>,
+    rebalance: &'a RebalanceReceiver,
+    in_place_waits: &'a InPlaceWaits,
+    /// Whether a partition is paused behind an in-place wait, which is the
+    /// only time a wait's end has anything to resume.
+    listen_for_wait_end: bool,
+    completion_rx: &'a mut mpsc::Receiver<Completion>,
+    semaphore: &'a Arc<Semaphore>,
+    /// Whether the whole assignment is paused, which is the only time a
+    /// freed permit has anything to resume.
+    paused: bool,
+}
+
+/// One wait of the concurrent receive loop: the first of its sources to be
+/// ready, read in this order when several are: shutdown, the fault, the
+/// housekeeping and commit wakes, the rebalance and wait-end wakes, the
+/// completions, the resume arm, and `recv()` last.
+///
+/// Biased, because the order decides what a stop hands over. An in-place
+/// wait that shutdown cancels frees its permit in the same instant; with
+/// the arms polled in random order the resume arm could take that permit,
+/// resume the assignment and hand the next record to a handler during the
+/// drain, behind the record the stop left unhandled, and a record `recv()`
+/// already holds could reach a handler the same way. The order is the
+/// plan's, and the function exists so the order is pinned by a unit test
+/// with every source ready at once; a broker cannot stage that instant.
+async fn next_loop_event<M>(waits: LoopWaits<'_>, recv: impl Future<Output = M>) -> LoopEvent<M> {
+    let LoopWaits {
+        shutdown,
+        fault_rx,
+        housekeeping,
+        commit_due_at,
+        rebalance,
+        in_place_waits,
+        listen_for_wait_end,
+        completion_rx,
+        semaphore,
+        paused,
+    } = waits;
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => LoopEvent::Shutdown,
+        fault = fault_rx.recv() => LoopEvent::Fault(fault),
+        _ = housekeeping.tick() => LoopEvent::Housekeeping,
+        _ = sleep_until_or_never(commit_due_at) => LoopEvent::CommitDue,
+        _ = rebalance.woken() => LoopEvent::RebalanceWoken,
+        _ = in_place_waits.changed(), if listen_for_wait_end => LoopEvent::WaitEnded,
+        completion = completion_rx.recv() => LoopEvent::Completion(completion),
+        permit = semaphore.clone().acquire_owned(), if paused => LoopEvent::PermitFreed(permit),
+        record = recv => LoopEvent::Record(record),
+    }
+}
+
+/// Sleeps until `deadline`, or forever without one.
+async fn sleep_until_or_never(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -5243,17 +5370,28 @@ impl KafkaConsumer {
                         );
                     }
 
-                    // Biased, in this order: shutdown, the fault, the
-                    // housekeeping and commit wakes, the completions, the
-                    // resume arm, and `recv()` last. An in-place wait that
-                    // shutdown cancels frees its permit in the same instant;
-                    // with the arms polled in random order the resume arm
-                    // could take that permit, resume the assignment and hand
-                    // the next record to a handler during the drain, behind
-                    // the record the stop left unhandled.
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => {
+                    // The order of the arms is `next_loop_event`'s, and what
+                    // a stop hands over depends on it; see its doc.
+                    let event = next_loop_event(
+                        LoopWaits {
+                            shutdown: &shutdown,
+                            fault_rx: &mut fault_rx,
+                            housekeeping: &mut housekeeping,
+                            commit_due_at: tracker
+                                .has_committable()
+                                .then(|| commit_gate.deadline(now)),
+                            rebalance: &rebalance_rx,
+                            in_place_waits: &in_place_waits,
+                            listen_for_wait_end: !paused_for_pending.is_empty(),
+                            completion_rx: &mut completion_rx,
+                            semaphore: &semaphore,
+                            paused,
+                        },
+                        consumer.recv(),
+                    )
+                    .await;
+                    match event {
+                        LoopEvent::Shutdown => {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             // A spare permit would otherwise deadlock the drain below.
                             drop(spare_permit.take());
@@ -5301,7 +5439,7 @@ impl KafkaConsumer {
                             }
                             return Ok(());
                         }
-                        fault = fault_rx.recv() => {
+                        LoopEvent::Fault(fault) => {
                             // `None` cannot happen while `fault_tx` lives in
                             // this scope; the arm is total anyway.
                             let Some(e) = fault else { continue };
@@ -5315,51 +5453,23 @@ impl KafkaConsumer {
                             // is returned.
                             return Err(e);
                         }
-                        // Falls through to the top-of-loop drain — see the
-                        // comment on `housekeeping` above.
-                        _ = housekeeping.tick() => {}
-                        // Wakes the loop when the commit gate's window expires
-                        // with commit work pending, so a gated commit lands
-                        // within ~ASYNC_COMMIT_INTERVAL even on a topic gone
-                        // idle — without this arm it would wait for the next
-                        // housekeeping tick, regressing the idle-topic
-                        // redelivery bound (see the completion arm below) from
-                        // the gate interval to HOUSEKEEPING_INTERVAL. Disabled
-                        // when nothing is committable, so an idle consumer does
-                        // not wake every interval; no busy-spin when past due,
-                        // because the top-of-loop drain then commits and
-                        // `mark` pushes the deadline forward. Cost note:
-                        // select! evaluates this expression (a `Sleep`
-                        // construct-and-drop plus the `has_committable` scan)
-                        // on every pass, even when the precondition disables
-                        // the arm; the timer only registers when the arm is
-                        // enabled, and the whole thing displaced a per-message
-                        // commit FFI call — the e2e cell's throughput went UP
-                        // ~26k -> ~30.5k msg/s with the gate in place.
-                        _ = tokio::time::sleep_until(commit_gate.deadline(now)),
-                            if tracker.has_committable() => {}
-                        // A rebalance event was queued: fall through to the
-                        // top-of-loop drain, so a revoke ends the in-place
-                        // waits on its partitions now, not on the next
-                        // housekeeping tick or record.
-                        _ = rebalance_rx.woken() => {}
-                        // An in-place wait ended while a partition is paused
-                        // behind one: fall through to the top-of-loop check
-                        // that resumes it.
-                        _ = in_place_waits.changed(), if !paused_for_pending.is_empty() => {}
-                        // Handler completions must wake the loop even when no new
-                        // message arrives: with only the recv() arm, the offsets of
-                        // the last in-flight batch sat uncommitted until the *next*
-                        // message (or shutdown), so a crash or rebalance on an idle
-                        // topic redelivered an already-processed batch. The drain at
-                        // the top of the loop picks up any further completions and
-                        // commits in one pass.
-                        completion = completion_rx.recv() => {
+                        // Each wake falls through to the top-of-loop drain,
+                        // which is where its work is done; see the variants'
+                        // docs. The commit wake's gate kept the e2e cell's
+                        // throughput up (about 26k to 30.5k msg/s) by
+                        // displacing a per-message commit FFI call.
+                        LoopEvent::Housekeeping
+                        | LoopEvent::CommitDue
+                        | LoopEvent::RebalanceWoken
+                        | LoopEvent::WaitEnded => {}
+                        // The drain at the top of the loop picks up any further
+                        // completions and commits in one pass.
+                        LoopEvent::Completion(completion) => {
                             if let Some(completion) = completion {
                                 tracker.mark_complete(completion);
                             }
                         }
-                        permit = semaphore.clone().acquire_owned(), if paused => {
+                        LoopEvent::PermitFreed(permit) => {
                             let permit = permit.map_err(|_| {
                                 ShoveError::Connection("semaphore closed".to_string())
                             })?;
@@ -5370,7 +5480,7 @@ impl KafkaConsumer {
                             spare_permit = Some(permit);
                             tracing::info!(queue, "a prefetch permit freed; assignment resumed");
                         }
-                        msg_result = consumer.recv() => {
+                        LoopEvent::Record(msg_result) => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,
                                 Err(e) => {
@@ -5401,16 +5511,10 @@ impl KafkaConsumer {
                             // message arrives from the same poll. Apply pending
                             // events BEFORE tracking — otherwise the next
                             // iteration's drain would wipe the tracker entry this
-                            // message is about to seed. A partition assigned by
-                            // those events is resumed as at the top of the loop.
+                            // message is about to seed. The partitions those
+                            // events assigned are settled at the top of the next
+                            // pass, see `settle_assigned`.
                             tracker.apply_rebalance_events(&rebalance_rx.events(), Instant::now());
-                            settle_assigned(
-                                &mut tracker,
-                                consumer.as_ref(),
-                                queue,
-                                paused,
-                                &mut paused_for_pending,
-                            )?;
 
                             // A paused assignment delivers nothing it held when
                             // the pause took effect, so a record that arrives
@@ -5708,6 +5812,8 @@ impl KafkaConsumer {
                                 // this record waits for a permit, so the wait
                                 // must keep polling; see the helper.
                                 None if in_place => {
+                                    #[cfg(feature = "test-support")]
+                                    permit_wait_probe::ENTERED.fetch_add(1, Ordering::SeqCst);
                                     let mut rebalance = RebalanceDrain {
                                         events: &rebalance_rx,
                                         tracker: &mut tracker,
@@ -9156,6 +9262,177 @@ mod assignment_epoch_tests {
             "partition 0 was not revoked"
         );
         assert!(!first.revoked.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod loop_select_order_tests {
+    use super::*;
+
+    /// Every source the loop's select reads, each quiet until a test readies
+    /// it.
+    struct Sources {
+        shutdown: CancellationToken,
+        fault_tx: mpsc::Sender<ShoveError>,
+        fault_rx: mpsc::Receiver<ShoveError>,
+        housekeeping: tokio::time::Interval,
+        rebalance_rx: RebalanceReceiver,
+        in_place_waits: InPlaceWaits,
+        completion_tx: mpsc::Sender<Completion>,
+        completion_rx: mpsc::Receiver<Completion>,
+        semaphore: Arc<Semaphore>,
+    }
+
+    impl Sources {
+        async fn quiet() -> Self {
+            let (fault_tx, fault_rx) = mpsc::channel(1);
+            let (completion_tx, completion_rx) = mpsc::channel(4);
+            let (_rebalance_tx, rebalance_rx) = rebalance_channel();
+            let mut housekeeping = tokio::time::interval(Duration::from_secs(3600));
+            // An interval's first tick is immediate; the loop consumes it on
+            // its first pass, as this does.
+            housekeeping.tick().await;
+            Self {
+                shutdown: CancellationToken::new(),
+                fault_tx,
+                fault_rx,
+                housekeeping,
+                rebalance_rx,
+                in_place_waits: InPlaceWaits::default(),
+                completion_tx,
+                completion_rx,
+                // One permit, free: the resume arm is ready whenever it is
+                // enabled.
+                semaphore: Arc::new(Semaphore::new(1)),
+            }
+        }
+
+        /// One wait, with `recv` as the record source.
+        async fn next<M>(&mut self, paused: bool, recv: impl Future<Output = M>) -> LoopEvent<M> {
+            next_loop_event(
+                LoopWaits {
+                    shutdown: &self.shutdown,
+                    fault_rx: &mut self.fault_rx,
+                    housekeeping: &mut self.housekeeping,
+                    commit_due_at: None,
+                    rebalance: &self.rebalance_rx,
+                    in_place_waits: &self.in_place_waits,
+                    listen_for_wait_end: false,
+                    completion_rx: &mut self.completion_rx,
+                    semaphore: &self.semaphore,
+                    paused,
+                },
+                recv,
+            )
+            .await
+        }
+    }
+
+    /// A record ready, so one wait of the select has a record to read.
+    fn ready_record() -> impl Future<Output = i32> {
+        std::future::ready(7)
+    }
+
+    fn completion() -> Completion {
+        Completion {
+            partition: 0,
+            offset: 0,
+            epoch: 1,
+            discard: None,
+        }
+    }
+
+    /// The runs each test makes: a select that polled its arms in random
+    /// order would pass one wait by luck half the time, and all of these
+    /// once in two to the hundredth.
+    const RUNS: usize = 100;
+
+    /// The stop race in the unpaused state: a record is ready and the token
+    /// fired in the same instant. The loop reads the stop, every time.
+    #[tokio::test]
+    async fn shutdown_wins_over_a_ready_record_in_the_unpaused_state() {
+        let mut sources = Sources::quiet().await;
+        sources.shutdown.cancel();
+        for _ in 0..RUNS {
+            assert!(matches!(
+                sources.next(false, ready_record()).await,
+                LoopEvent::Shutdown
+            ));
+        }
+    }
+
+    /// The stop race in the paused state: the permit an in-place wait held
+    /// is free, the token fired, and a record is ready too. The loop reads
+    /// the stop, never the resume arm, every time.
+    #[tokio::test]
+    async fn shutdown_wins_over_a_freed_permit_in_the_paused_state() {
+        let mut sources = Sources::quiet().await;
+        sources.shutdown.cancel();
+        for _ in 0..RUNS {
+            assert!(matches!(
+                sources.next(true, ready_record()).await,
+                LoopEvent::Shutdown
+            ));
+            assert_eq!(
+                sources.semaphore.available_permits(),
+                1,
+                "the permit was not taken"
+            );
+        }
+    }
+
+    /// Without a stop, the resume arm comes before the record: a freed
+    /// permit resumes the paused assignment first, and is kept for the
+    /// record the next pass reads.
+    #[tokio::test]
+    async fn a_freed_permit_resumes_before_a_record_is_read() {
+        let mut sources = Sources::quiet().await;
+        for _ in 0..RUNS {
+            let LoopEvent::PermitFreed(permit) = sources.next(true, ready_record()).await else {
+                panic!("the resume arm is read before the record");
+            };
+            drop(permit.expect("the semaphore is open"));
+        }
+    }
+
+    /// A completion is read before a record, and a fault before both.
+    #[tokio::test]
+    async fn a_fault_then_a_completion_come_before_a_record() {
+        let mut sources = Sources::quiet().await;
+        for _ in 0..RUNS {
+            sources.completion_tx.try_send(completion()).unwrap();
+            assert!(matches!(
+                sources.next(false, ready_record()).await,
+                LoopEvent::Completion(Some(_))
+            ));
+        }
+        for _ in 0..RUNS {
+            sources.completion_tx.try_send(completion()).unwrap();
+            sources
+                .fault_tx
+                .try_send(ShoveError::Topology("fault".into()))
+                .unwrap();
+            assert!(matches!(
+                sources.next(true, ready_record()).await,
+                LoopEvent::Fault(Some(_))
+            ));
+            // Drain the completion the fault was read ahead of.
+            assert!(matches!(
+                sources.next(false, std::future::pending::<i32>()).await,
+                LoopEvent::Completion(Some(_))
+            ));
+        }
+    }
+
+    /// With nothing else ready, the record is read; the disabled arms stay
+    /// out of the way.
+    #[tokio::test]
+    async fn a_lone_record_is_read() {
+        let mut sources = Sources::quiet().await;
+        assert!(matches!(
+            sources.next(false, ready_record()).await,
+            LoopEvent::Record(7)
+        ));
     }
 }
 

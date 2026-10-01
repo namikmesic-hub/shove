@@ -759,6 +759,7 @@ async fn group_member_ids(brokers: &str, group: &str, timeout: Duration) -> Vec<
                 | RDKafkaErrorCode::CoordinatorNotAvailable
                 | RDKafkaErrorCode::CoordinatorLoadInProgress
                 | RDKafkaErrorCode::OperationTimedOut
+                | RDKafkaErrorCode::BrokerTransportFailure
         )
     }
 

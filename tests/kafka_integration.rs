@@ -28,7 +28,7 @@ use shove::topology::{SequenceFailure, TopologyBuilder};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaContainer};
@@ -1067,10 +1067,47 @@ struct Delivery {
     redelivered: bool,
 }
 
+/// A gate a handler waits at until the test opens it, so a test holds a
+/// handler in its running state for exactly as long as the scenario needs,
+/// and never for a fixed time.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct Gate {
+    open: AtomicBool,
+    opened: Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl Gate {
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        self.opened.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            // Register before the check: `notify_waiters` stores no permit,
+            // so an open landing between an unregistered check and the await
+            // would otherwise be lost.
+            let mut opened = std::pin::pin!(self.opened.notified());
+            opened.as_mut().enable();
+            if self.open.load(Ordering::SeqCst) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+/// The gates an [`OrderRecorder`] waits at, by the record's coordinates.
+#[cfg(feature = "test-support")]
+type Gates = Arc<std::sync::Mutex<HashMap<(i32, i64), Arc<Gate>>>>;
+
 /// Records every delivery into a log shared by every member of a group, in
 /// arrival order, and defers the records it is told to hold for as long as
-/// it holds them; everything else is acked. The log is what the in-place
-/// order tests assert on, across members and across a stop.
+/// it holds them; everything else is acked. A record can be gated, so the
+/// handler runs on it until the test opens the gate. The log is what the
+/// in-place order tests assert on, across members and across a stop.
 #[cfg(feature = "test-support")]
 #[derive(Clone)]
 struct OrderRecorder {
@@ -1078,9 +1115,8 @@ struct OrderRecorder {
     log: Arc<std::sync::Mutex<Vec<Delivery>>>,
     /// `(partition, offset)` pairs this member defers while they are listed.
     hold: Arc<std::sync::Mutex<std::collections::HashSet<(i32, i64)>>>,
-    /// How long the handler runs on a record before it returns, so a test
-    /// can keep the handler in its running state for a while.
-    runs_for: Arc<std::sync::Mutex<HashMap<(i32, i64), Duration>>>,
+    /// The gates records wait at before the handler returns.
+    gates: Gates,
     /// How many `Defer` outcomes this member has returned.
     defers: Arc<AtomicU32>,
 }
@@ -1092,7 +1128,7 @@ impl OrderRecorder {
             member,
             log,
             hold: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            runs_for: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             defers: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -1102,11 +1138,10 @@ impl OrderRecorder {
         self
     }
 
-    fn running_for(self, partition: i32, offset: i64, duration: Duration) -> Self {
-        self.runs_for
-            .lock()
-            .unwrap()
-            .insert((partition, offset), duration);
+    /// The handler waits at `gate` on every delivery of `(partition,
+    /// offset)` before it returns.
+    fn gated(self, partition: i32, offset: i64, gate: Arc<Gate>) -> Self {
+        self.gates.lock().unwrap().insert((partition, offset), gate);
         self
     }
 
@@ -1129,14 +1164,14 @@ impl OrderRecorder {
             id,
             redelivered: meta.redelivered,
         });
-        let runs_for = self
-            .runs_for
+        let gate = self
+            .gates
             .lock()
             .unwrap()
             .get(&(partition, offset))
-            .copied();
-        if let Some(duration) = runs_for {
-            tokio::time::sleep(duration).await;
+            .cloned();
+        if let Some(gate) = gate {
+            gate.wait().await;
         }
         let held = self.hold.lock().unwrap().contains(&(partition, offset));
         if held {
@@ -1278,6 +1313,7 @@ async fn group_member_ids(brokers: &str, group: &str, timeout: Duration) -> Vec<
                 | RDKafkaErrorCode::CoordinatorNotAvailable
                 | RDKafkaErrorCode::CoordinatorLoadInProgress
                 | RDKafkaErrorCode::OperationTimedOut
+                | RDKafkaErrorCode::BrokerTransportFailure
         )
     }
 
@@ -4009,7 +4045,7 @@ async fn external_topic_queued_record_keeps_the_member_when_a_running_handler_st
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behind_it() {
-    use shove::kafka::drop_probe;
+    use shove::kafka::{drop_probe, permit_wait_probe};
 
     const TOPIC: &str = "kafka-external-stop-order";
     const GROUP: &str = "kafka-external-stop-order-consumer";
@@ -4024,12 +4060,13 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
     };
 
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-    // Offset 2 runs a second before it defers, so offset 3, published right
+    // Offset 2 waits at a gate before it defers, so offset 3, published right
     // behind it, is in the loop's hand waiting for the permit by the time
     // the in-place wait begins.
+    let gate = Arc::new(Gate::default());
     let handler = OrderRecorder::new("a", log.clone())
         .holding(0, 2)
-        .running_for(0, 2, Duration::from_secs(1));
+        .gated(0, 2, gate.clone());
     let shutdown = CancellationToken::new();
     let running = spawn_single_permit_in_place_member::<ExternalStopOrderTopic, _>(
         tb.client(),
@@ -4046,8 +4083,19 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
         committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(2)
     })
     .await;
+    // Every record the loop takes without a spare permit passes through the
+    // permit wait, offset 2 included, which acquires at once: the second
+    // entry from here is offset 3, held for the permit offset 2 holds.
+    let entered_before = permit_wait_probe::entered();
     publish_raw_to(tb.brokers(), TOPIC, 0, &record(2)).await;
     publish_raw_to(tb.brokers(), TOPIC, 0, &record(3)).await;
+    poll_until(
+        "offset 3 is in the loop's hand, waiting for the permit offset 2 holds",
+        REBALANCE_TIMEOUT,
+        || permit_wait_probe::entered() >= entered_before + 2,
+    )
+    .await;
+    gate.open();
     poll_until(
         "offset 2 is deferred and waits in place",
         REBALANCE_TIMEOUT,
@@ -4360,16 +4408,17 @@ async fn a_revoke_reaches_the_waiting_task_before_the_next_housekeeping_tick() {
 
 /// The order invariant with two permits, on the record the loop holds while
 /// it waits for a permit. Records 0 and 1 of partition 0 are dispatched
-/// together; 0 runs a second and defers, 1 runs two seconds and acks.
-/// Record 2 arrived meanwhile and waits for a permit; when 1's permit frees,
-/// 0 is waiting, so 2 must be checked again, put back and its partition
-/// paused, not handed over. Partition 1 keeps flowing while partition 0 is
-/// paused, and once 0's hold is released its wait ends, the partition
-/// resumes, and 2 arrives once, put back once in all.
+/// together and each waits at its own gate; record 2 arrived meanwhile and
+/// waits for a permit. Record 0's gate opens and it defers, so it waits in
+/// place; then record 1's gate opens and it acks, so its permit frees. Record
+/// 2 must be checked again, put back and its partition paused, not handed
+/// over. Partition 1 keeps flowing while partition 0 is paused, and once
+/// 0's hold is released its wait ends, the partition resumes, and 2 arrives
+/// once, put back once in all.
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_meanwhile() {
-    use shove::kafka::put_back_probe;
+    use shove::kafka::{permit_wait_probe, put_back_probe};
 
     const TOPIC: &str = "kafka-external-two-permits";
     const GROUP: &str = "kafka-external-two-permits-consumer";
@@ -4384,10 +4433,12 @@ async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_m
     };
 
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let head_gate = Arc::new(Gate::default());
+    let second_gate = Arc::new(Gate::default());
     let handler = OrderRecorder::new("a", log.clone())
         .holding(0, 0)
-        .running_for(0, 0, Duration::from_secs(1))
-        .running_for(0, 1, Duration::from_secs(2));
+        .gated(0, 0, head_gate.clone())
+        .gated(0, 1, second_gate.clone());
     let shutdown = CancellationToken::new();
     // Two permits, set explicitly: this is the case the one-permit pause
     // does not cover.
@@ -4408,6 +4459,22 @@ async fn a_record_held_for_a_permit_is_checked_again_against_a_wait_that_began_m
     for offset in 0..3 {
         publish_raw_to(tb.brokers(), TOPIC, 0, &record(0, offset)).await;
     }
+    // Records 0 and 1 pass through the permit wait and acquire at once; the
+    // third entry is record 2, held for a permit.
+    poll_until(
+        "records 0 and 1 are in handlers and record 2 waits for a permit",
+        REBALANCE_TIMEOUT,
+        || deliveries(&log).len() >= 2 && permit_wait_probe::entered() >= 3,
+    )
+    .await;
+    // Record 0 defers and waits in place while record 1 still runs.
+    head_gate.open();
+    poll_until("record 0 waits in place", REBALANCE_TIMEOUT, || {
+        handler.defers() >= 1
+    })
+    .await;
+    // Record 1 acks and frees its permit; record 2 must be checked again.
+    second_gate.open();
     poll_until(
         "record 2, held for a permit, is put back once 0 waits and 1's permit frees",
         REBALANCE_TIMEOUT,

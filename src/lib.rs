@@ -392,6 +392,13 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::pause_probe;
 
+    /// Test-only counter (see the `test-support` feature) on the records the
+    /// receive loop held while it waited for a permit, for tests that place
+    /// a record in that wait before they move on.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::permit_wait_probe;
+
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// housekeeping interval, for tests that bound a revoke's reach by it.
     #[cfg(feature = "test-support")]
