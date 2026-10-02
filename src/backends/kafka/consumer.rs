@@ -393,8 +393,8 @@ impl PartitionTracker {
     /// add a request. At shutdown that rule left a hole. The last
     /// asynchronous commit may still be in flight, or a rebalance may have
     /// dropped it without a callback, and with no new completion the final
-    /// `Sync` commit had nothing to confirm. Re-offering every position
-    /// makes that commit confirm every safe position. A repeated commit
+    /// `Sync` commit carried nothing. Re-offering every position makes that
+    /// commit carry every safe position, for the broker to confirm. A repeated commit
     /// keeps the same logical position, though the coordinator still
     /// appends the request to `__consumer_offsets`, as the rebalance
     /// re-offer in `OffsetTracker::apply_rebalance_events` relies on; and
@@ -4607,9 +4607,10 @@ impl KafkaConsumer {
                             tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
                             // Every partition's current position, whether or
                             // not an earlier asynchronous drain offered it:
-                            // the final `Sync` commit confirms every safe
+                            // the final `Sync` commit offers every safe
                             // position, including one an in-flight
-                            // asynchronous commit may not have landed. See
+                            // asynchronous commit may not have landed, for
+                            // the broker to confirm. See
                             // `PartitionTracker::drain_all`.
                             let (tpl, discards) = match tracker.drain_all() {
                                 Some((tpl, discards)) => (Some(tpl), discards),

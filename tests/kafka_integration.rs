@@ -6323,6 +6323,75 @@ async fn a_raised_commit_interval_raises_the_receive_loops_fence_threshold() {
     broker.close().await;
 }
 
+/// A consumer that received no record has no position to commit, so when no
+/// thread can be spawned for the final commit there is no commit to fail:
+/// the run ends clean, with no `Commit` error, and the close still moves off
+/// the runtime thread. The record-carrying case is
+/// `a_leaked_consumer_keeps_its_group_member_past_the_session_timeout`.
+// `test-support` gates the spawn switch this test reads.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_consumer_with_nothing_to_commit_ends_clean_when_no_thread_can_be_spawned() {
+    use shove::kafka::final_commit_spawn_probe;
+
+    shove::define_topic!(
+        NothingToCommitTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-nothing-to-commit").build()
+    );
+
+    impl MessageHandler<NothingToCommitTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    const GROUP: &str = "kafka-nothing-to-commit-consumer";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<NothingToCommitTopic>()
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let run = tokio::spawn(async move {
+        consumer
+            .run::<NothingToCommitTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Kafka>::new().with_shutdown(sc),
+            )
+            .await
+    });
+    // The member has joined and holds its partitions; nothing was delivered.
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    // From here on no thread can be had, for the final commit or for the close.
+    final_commit_spawn_probe::refuse_threads(true);
+    let started = Instant::now();
+    shutdown.cancel();
+    let result = run.await.unwrap();
+    assert!(
+        result.is_ok(),
+        "with no position to commit, a refused thread is not a commit failure: {result:?}"
+    );
+    // The close blocks for as long as librdkafka takes to leave the group. A
+    // run that returns at once did not run it on the runtime thread.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown must return without closing the consumer here, took {:?}",
+        started.elapsed()
+    );
+}
+
 /// The last resort of the final-commit thread, N1: when no thread can be
 /// spawned for the commit or for the close, the handle is leaked rather than
 /// closed on the runtime thread. This pins, against a real broker, the cost

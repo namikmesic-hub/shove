@@ -446,7 +446,7 @@ On shutdown the consumer first waits for its in-flight handlers to finish.
 That wait is bounded by the handler timeout and by any in-place delays.
 It then drains the republish queue and commits its final position **synchronously**.
 That commit carries every partition's current position, whether or not an earlier asynchronous commit already offered it.
-It therefore confirms every safe position, including one an asynchronous commit still in flight may not have landed.
+It therefore offers every safe position, including one an asynchronous commit still in flight may not have landed; only the broker's answer confirms them.
 The commit runs on a dedicated thread that also owns the consumer's close.
 The thread is spawned before it is handed the consumer, so a failed spawn never closes the consumer on the runtime thread.
 If no thread can be spawned, nothing commits and the close moves to a second, close-only thread.
@@ -457,19 +457,24 @@ The consumer waits for that commit for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` 
 The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
 The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
 
-A final commit that does not land ends the member with `ShoveError::Commit` instead of a clean exit.
+A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
 The error names the topic, the position the commit carried per partition, and a `CommitFailure`.
-`Rejected` carries the broker's answer, `Deadline` means nothing answered within the time it carries, normally the 20 s deadline, and `NoThread` means no thread could be spawned for the commit.
-`Rejected` and `NoThread` say this commit did not land; `Deadline` says its result is unknown, because the detached thread may still land it.
-Redelivery then starts from the last position the broker accepted for each partition, which an earlier asynchronous commit may have advanced: only the records from that position on come back.
-The error carries positions and the broker's error text only, never a record's payload, key or headers.
+`Rejected` carries the broker's answer.
+`Deadline` means nothing answered within the time it carries, normally the 20 s deadline.
+`NoThread` means no thread could be spawned for the commit.
+`Rejected` and `NoThread` say this commit did not land.
+`Deadline` says its result is unknown, because the detached thread may still land it.
+Redelivery then starts from the last position the broker accepted for each partition, which an earlier asynchronous commit may have advanced.
+The error carries positions and the error text only, never a record's payload, key or headers.
 A consumer group counts the error once under `SupervisorOutcome::errors`, so `exit_code()` is 1 where it was 0 in 0.15.0.
-Nothing else about the run changes: it still ends on its stop signal, and a drain that times out while the commit is waiting still aborts the member and reports `timed_out`.
-A member the autoscaler retires on scale-down makes the same final commit, and the rebalance that retirement starts can make the coordinator reject it with a rebalance in progress or a stale generation.
-For now that rejection counts under `errors` like any other; the new owner redelivers from the last accepted position, as at-least-once delivery intends.
+Nothing else about the run changes: it still ends on its stop signal.
+A drain that times out while the commit is still waiting aborts the member instead and reports `timed_out`, so `exit_code()` is 3 and no error is counted.
+A member the autoscaler retires on scale-down makes the same final commit.
+The rebalance that retirement starts can make the coordinator reject it with a rebalance in progress or a stale generation.
+For now that rejection counts under `errors` like any other.
 A member with nothing to commit has no commit to fail and still ends clean.
 An acknowledged offset on a partition a rebalance revoked before the stop is not part of the final commit and raises no error.
-Its tracker went with the partition, and the new owner redelivers the record, which is at-least-once delivery as before.
+Its tracker went with the partition, and the new owner picks the record up.
 
 What that means for replay:
 

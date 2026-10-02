@@ -104,7 +104,9 @@ On clean shutdown, shove first waits for the in-flight handlers to finish.
 That wait is bounded by the handler timeout and by any in-place delays on an external topic.
 It then commits the final position synchronously from a dedicated thread and waits at most 20 s for that commit.
 That 20 s bound covers the concurrent consumer's final commit only.
-A final commit that is rejected, has no answer within the bound, or has no thread to run on (`CommitFailure::NoThread`) ends the member with `ShoveError::Commit`, so the run's exit code is 1; see [Offset commit semantics](/backends/kafka#offset-commit-semantics).
+A final commit that is rejected, has no answer within the bound, or has no thread to run on (`CommitFailure::NoThread`) ends the member with `ShoveError::Commit`.
+A group counts that under `errors`, so the run's exit code is 1; see [Offset commit semantics](/backends/kafka#offset-commit-semantics).
+A drain that times out while that commit is still waiting aborts the member instead, and the run reports `timed_out` with exit code 3.
 A synchronous commit already in flight when shutdown fires, the one that retires a discarded record, blocks for as long as librdkafka retries it.
 A FIFO consumer commits a discarded message synchronously and a batch consumer commits every flush synchronously, and those commits block the same way.
 On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts.

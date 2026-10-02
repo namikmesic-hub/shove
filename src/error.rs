@@ -53,7 +53,7 @@ pub enum ShoveError {
     #[error("batch publish: {0}")]
     PartialBatch(Box<BatchFailure>),
 
-    /// The final offset commit of a stopping consumer did not land.
+    /// The final offset commit of a stopping consumer was not confirmed.
     ///
     /// The Kafka receive loop returns this from its shutdown arm when the
     /// synchronous commit it issues after the handler drain is rejected,
@@ -79,15 +79,18 @@ pub enum ShoveError {
     /// stale generation; that rejection counts under `errors` like any
     /// other, and the new owner redelivers from the last accepted position.
     ///
-    /// Why the result is surfaced at all: Apache Kafka's Java consumer also
-    /// commits synchronously inside `close()`, and only logs a failure, while
-    /// librdkafka's `rd_kafka_consumer_close` returns the error code. shove
-    /// follows librdkafka and returns it, because a process that gates its
-    /// restart on the exit code cannot read a log line.
+    /// Why the result is surfaced at all: Apache Kafka's Java consumer
+    /// raises the result of an explicit `commitSync()` as an exception, and
+    /// its `close()` commits only under auto-commit, which shove turns off;
+    /// librdkafka's `rd_kafka_commit` returns the error code of a
+    /// synchronous commit, while `rd_kafka_consumer_close` reports only the
+    /// close itself. shove makes an explicit synchronous commit and returns
+    /// its result, because a process that gates its restart on the exit
+    /// code cannot read a log line.
     ///
     /// `#[non_exhaustive]`: match with `..`, so a field can be added later.
     #[error(
-        "final offset commit on '{topic}' did not land for {}: {kind}",
+        "final offset commit on '{topic}' for {} was not confirmed: {kind}",
         format_offsets(offsets)
     )]
     #[non_exhaustive]
@@ -104,8 +107,8 @@ pub enum ShoveError {
     },
 }
 
-/// Why the final offset commit of a stopping consumer did not land; the
-/// `kind` of [`ShoveError::Commit`].
+/// Why the final offset commit of a stopping consumer was not confirmed;
+/// the `kind` of [`ShoveError::Commit`].
 ///
 /// `#[non_exhaustive]`: match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -226,7 +229,7 @@ mod tests {
     fn display_commit_error_names_the_topic_the_offsets_and_the_kind() {
         assert_eq!(
             commit_error().to_string(),
-            "final offset commit on 'orders' did not land for [0@8, 3@12]: \
+            "final offset commit on 'orders' for [0@8, 3@12] was not confirmed: \
              rejected: Broker: Group authorization failed"
         );
         let deadline = ShoveError::Commit {
@@ -236,8 +239,8 @@ mod tests {
         };
         assert_eq!(
             deadline.to_string(),
-            "final offset commit on 'orders' did not land for [0@8]: no answer after waiting \
-             20s; the result is unknown"
+            "final offset commit on 'orders' for [0@8] was not confirmed: no answer after \
+             waiting 20s; the result is unknown"
         );
         assert_eq!(
             CommitFailure::NoThread.to_string(),
