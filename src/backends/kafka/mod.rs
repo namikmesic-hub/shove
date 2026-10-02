@@ -4,7 +4,6 @@ mod client;
 mod constants;
 mod consumer;
 mod consumer_group;
-pub(crate) use consumer_group::MemberFaults;
 #[cfg(feature = "kafka-msk-iam")]
 mod msk_iam;
 mod offset_reset;

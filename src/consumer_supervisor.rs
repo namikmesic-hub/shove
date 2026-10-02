@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -40,69 +39,6 @@ impl SupervisorOutcome {
     /// True when no errors, panics, or drain timeouts were recorded.
     pub fn is_clean(&self) -> bool {
         self.exit_code() == 0
-    }
-}
-
-/// The outcome of a run, plus the fatal errors that ended it.
-///
-/// Returned by
-/// [`ConsumerGroup::run_until_timeout_with_report`](crate::ConsumerGroup::run_until_timeout_with_report)
-/// and
-/// [`BroadcastSubscriber::run_until_timeout_with_report`](crate::BroadcastSubscriber::run_until_timeout_with_report).
-/// `outcome` is the tally `run_until_timeout` returns, unchanged: a fatal
-/// member counts one under [`SupervisorOutcome::errors`], so
-/// [`exit_code`](SupervisorOutcome::exit_code) is at least `1` whenever
-/// `fatal` is non-empty. `fatal` carries the errors themselves, typed, for
-/// a process that decides from the error rather than from the code.
-///
-/// A fatal error ([`ShoveError::is_fatal`]) ends the run that owns the
-/// member or the subscription: the run cancels its siblings, drains them and
-/// returns without waiting for its external stop signal. Every other error
-/// ends the member alone and is only counted.
-///
-/// `#[non_exhaustive]`: build one through the run methods, never by literal.
-#[must_use]
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct RunReport {
-    pub outcome: SupervisorOutcome,
-    /// Every fatal error a member or a subscription ended with, in arrival
-    /// order. Empty when the run ended on its stop signal alone.
-    ///
-    /// The errors carry positions and the broker's error text only, never
-    /// a record's payload, key or headers, so a process can log or return
-    /// them as they are.
-    pub fatal: Vec<ShoveError>,
-}
-
-/// The next fatal error a backend's spawner reported, or pending forever
-/// when the run has no fatal channel or every sender is gone: this arm of a
-/// run's select must never win on a closed channel, because the run would
-/// then end with nothing to report.
-///
-/// Shared by the Kafka registry run and the generic autoscaling run in
-/// `consumer_group.rs`, which select on it beside their stop signal.
-pub(crate) async fn next_fatal(rx: &mut Option<mpsc::UnboundedReceiver<ShoveError>>) -> ShoveError {
-    match rx {
-        Some(rx) => match rx.recv().await {
-            Some(e) => e,
-            None => std::future::pending().await,
-        },
-        None => std::future::pending().await,
-    }
-}
-
-/// Every fatal error still queued after the drain, appended to `into` in
-/// arrival order. A second member can end with its own fatal error while
-/// the run drains on the first, and the report carries both.
-pub(crate) fn drain_fatal(
-    rx: &mut Option<mpsc::UnboundedReceiver<ShoveError>>,
-    into: &mut Vec<ShoveError>,
-) {
-    if let Some(rx) = rx {
-        while let Ok(e) = rx.try_recv() {
-            into.push(e);
-        }
     }
 }
 
@@ -491,48 +427,6 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The fatal channel keeps arrival order: a run takes the first error
-    /// through `next_fatal` and the rest through `drain_fatal`, in order.
-    #[tokio::test]
-    async fn fatal_errors_come_out_in_arrival_order() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut rx = Some(rx);
-        for name in ["first", "second", "third"] {
-            tx.send(ShoveError::Topology(name.into())).unwrap();
-        }
-        let first = next_fatal(&mut rx).await;
-        assert_eq!(first.to_string(), "topology error: first");
-        let mut rest = Vec::new();
-        drain_fatal(&mut rx, &mut rest);
-        let rest: Vec<String> = rest.iter().map(ToString::to_string).collect();
-        assert_eq!(rest, ["topology error: second", "topology error: third"]);
-    }
-
-    /// `next_fatal` never resolves without a channel, or on a channel whose
-    /// senders are gone: a run must not end with nothing to report.
-    #[tokio::test]
-    async fn next_fatal_stays_pending_without_a_channel_or_a_sender() {
-        use std::future::poll_fn;
-        use std::task::Poll;
-
-        let mut none = None;
-        let fut = next_fatal(&mut none);
-        let mut fut = std::pin::pin!(fut);
-        assert!(poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_pending())).await);
-
-        let (tx, rx) = mpsc::unbounded_channel::<ShoveError>();
-        drop(tx);
-        let mut closed = Some(rx);
-        {
-            let fut = next_fatal(&mut closed);
-            let mut fut = std::pin::pin!(fut);
-            assert!(poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_pending())).await);
-        }
-        let mut rest = Vec::new();
-        drain_fatal(&mut closed, &mut rest);
-        assert!(rest.is_empty());
-    }
 
     #[test]
     fn clean_outcome_has_exit_code_zero() {

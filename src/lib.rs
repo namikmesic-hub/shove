@@ -233,7 +233,7 @@ pub use consumer::{
     DEFAULT_KAFKA_MAX_BATCH_SIZE, DEFAULT_MAX_BATCH_AGE, DEFAULT_MAX_BATCH_SIZE,
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, RetryStrategy,
 };
-pub use consumer_supervisor::{ConsumerSupervisor, RunReport, SupervisorOutcome};
+pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::{CommitFailure, ShoveError};
 pub use handler::{BatchMessageHandler, MessageHandler, MessageHandlerExt};
 pub use metadata::{

@@ -60,9 +60,8 @@ pub enum ShoveError {
     /// misses the shutdown deadline, or has no thread to run on. The member
     /// ends with this error instead of a clean exit: a group run counts it
     /// under [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors),
-    /// ends on it without an external stop, and returns it in
-    /// [`RunReport::fatal`](crate::RunReport::fatal). It is fatal
-    /// ([`is_fatal`](Self::is_fatal)) and not retryable, so a consumer that
+    /// so [`exit_code`](crate::SupervisorOutcome::exit_code) is `1`, and the
+    /// run otherwise ends as before. It is not retryable, so a consumer that
     /// reconnects on transient errors returns it instead.
     ///
     /// The next member of the group resumes each partition from the last
@@ -73,6 +72,12 @@ pub enum ShoveError {
     /// member never tried to commit: an acknowledged offset on a partition a
     /// rebalance revoked is dropped with the partition and redelivered by
     /// its new owner, silently, as before.
+    ///
+    /// A member the autoscaler retires on scale-down makes the same final
+    /// commit, and a coordinator in the middle of the rebalance that
+    /// retirement triggers can reject it with a rebalance in progress or a
+    /// stale generation; that rejection counts under `errors` like any
+    /// other, and the new owner redelivers from the last accepted position.
     ///
     /// Why the result is surfaced at all: Apache Kafka's Java consumer also
     /// commits synchronously inside `close()`, and only logs a failure, while
@@ -114,10 +119,9 @@ pub enum CommitFailure {
     #[error("rejected: {0}")]
     Rejected(String),
     /// The commit had no answer within the time it carries: the shutdown
-    /// deadline, the shorter time the loop waited when the owning run's
-    /// drain timed out first and ended the wait, or the moment the commit
-    /// thread ended without reporting. The result is unknown: the detached
-    /// commit thread may still land it after the consumer has returned.
+    /// deadline, or the time waited when the commit thread ended without
+    /// reporting. The result is unknown: the detached commit thread may
+    /// still land it after the consumer has returned.
     #[error("no answer after waiting {0:?}; the result is unknown")]
     Deadline(Duration),
     /// No thread could be spawned to run the commit, so this commit was
@@ -149,17 +153,6 @@ impl ShoveError {
             ShoveError::PartialBatch(f) => f.source().is_retryable(),
             _ => false,
         }
-    }
-
-    /// Returns `true` for an error that ends the run owning the consumer it
-    /// came from: a consumer group's or a broadcast subscriber's
-    /// `run_until_timeout` cancels its siblings, drains and returns when a
-    /// member ends with one, and autoscaling does not replace that member.
-    /// Every other error ends the member alone, as before.
-    ///
-    /// True for [`Commit`](Self::Commit). A fatal error is never retryable.
-    pub fn is_fatal(&self) -> bool {
-        matches!(self, ShoveError::Commit { .. })
     }
 }
 
@@ -249,28 +242,11 @@ mod tests {
         );
     }
 
-    /// A failed final commit ends the owning run and is never retried: a
-    /// reconnect would rejoin the group with the position still uncommitted
-    /// and read as a clean member.
+    /// A failed final commit is never retried: a reconnect would rejoin the
+    /// group with the position still uncommitted and read as a clean member.
     #[test]
-    fn commit_error_is_fatal_and_not_retryable() {
-        let err = commit_error();
-        assert!(err.is_fatal());
-        assert!(!err.is_retryable());
-    }
-
-    /// Only `Commit` is fatal: a connection error keeps reconnecting and a
-    /// topology error keeps ending the member alone.
-    #[test]
-    fn every_other_error_is_not_fatal() {
-        for err in [
-            ShoveError::Connection("channel closed".into()),
-            ShoveError::Topology("missing exchange".into()),
-            ShoveError::Validation("too large".into()),
-            ShoveError::Unknown("boom".into()),
-        ] {
-            assert!(!err.is_fatal(), "{err}");
-        }
+    fn commit_error_is_not_retryable() {
+        assert!(!commit_error().is_retryable());
     }
 
     /// `PartialBatch` has no retryability of its own — it inherits the

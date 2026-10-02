@@ -714,7 +714,7 @@ mod tests {
             config,
             spawner,
             group_token,
-            faults: Default::default(),
+            error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             panic_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             retiring: Vec::new(),
             respawn: RespawnSupervisor::default(),
@@ -737,10 +737,7 @@ mod tests {
         let mut groups = HashMap::new();
         groups.insert("test-group".to_string(), group);
 
-        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(
-            groups,
-            CancellationToken::new(),
-        )))
+        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(groups)))
     }
 
     #[tokio::test]
@@ -1010,7 +1007,7 @@ mod tests {
             config,
             spawner,
             group_token,
-            faults: Default::default(),
+            error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             panic_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             retiring: Vec::new(),
             respawn: RespawnSupervisor::default(),
@@ -1018,10 +1015,7 @@ mod tests {
 
         let mut groups = HashMap::new();
         groups.insert("test-group".to_string(), group);
-        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(
-            groups,
-            CancellationToken::new(),
-        )))
+        Arc::new(Mutex::new(KafkaConsumerGroupRegistry::from_groups(groups)))
     }
 
     #[tokio::test]

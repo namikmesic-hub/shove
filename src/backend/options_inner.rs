@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::{KafkaAutoOffsetReset, MemberFaults};
+use crate::backends::kafka::KafkaAutoOffsetReset;
 use crate::broadcast::BroadcastStart;
 use crate::consumer::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, RetryStrategy,
@@ -73,13 +73,6 @@ pub(crate) struct ConsumerOptionsInner {
     /// Propagated from `KafkaConsumerGroupConfig::with_max_poll_interval_for_test`.
     #[cfg(all(feature = "kafka", feature = "test-support"))]
     pub kafka_max_poll_interval: Option<Duration>,
-
-    /// Where a Kafka group member records its exit. The receive loop uses
-    /// it to report a final commit whose result the owning run's drain
-    /// abort would otherwise lose, see `PendingFinalCommit`; `None` on the
-    /// direct and supervisor paths, which have no group counters.
-    #[cfg(feature = "kafka")]
-    pub kafka_member_faults: Option<MemberFaults>,
 
     /// Where a broadcast subscription starts reading. `None` keeps the tail.
     /// Propagated from `ConsumerOptions::with_broadcast_start`; read by
@@ -148,8 +141,6 @@ impl ConsumerOptionsInner {
             kafka_commit_interval: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
-            #[cfg(feature = "kafka")]
-            kafka_member_faults: None,
             broadcast_start: None,
             retry_strategy: None,
             #[cfg(feature = "kafka-schema-registry")]

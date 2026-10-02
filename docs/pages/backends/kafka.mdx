@@ -459,15 +459,14 @@ The thread finishes on its own and never holds the runtime or the process, so a 
 
 A final commit that does not land ends the member with `ShoveError::Commit` instead of a clean exit.
 The error names the topic, the position the commit carried per partition, and a `CommitFailure`.
-`Rejected` carries the broker's answer, `Deadline` means nothing answered within the time the loop waited, and `NoThread` means no thread could be spawned for the commit.
+`Rejected` carries the broker's answer, `Deadline` means nothing answered within the time it carries, normally the 20 s deadline, and `NoThread` means no thread could be spawned for the commit.
 `Rejected` and `NoThread` say this commit did not land; `Deadline` says its result is unknown, because the detached thread may still land it.
 Redelivery then starts from the last position the broker accepted for each partition, which an earlier asynchronous commit may have advanced: only the records from that position on come back.
-`Deadline` carries the 20 s when the loop's own deadline passed, or the shorter time it waited when the owning run's drain timed out first; that drain then aborts the member and the report still carries the unresolved commit.
 The error carries positions and the broker's error text only, never a record's payload, key or headers.
-The error is fatal: a consumer group run ends on it without waiting for its stop signal, drains the other members, and counts it once under `SupervisorOutcome::errors`.
-`run_until_timeout_with_report` returns it typed in `RunReport::fatal`, and `exit_code()` is 1 where it was 0 before 0.16.
-With autoscaling on, the member is not replaced.
-A member the autoscaler retires on scale-down makes the same final commit, so its failure ends the run the same way.
+A consumer group counts the error once under `SupervisorOutcome::errors`, so `exit_code()` is 1 where it was 0 in 0.15.0.
+Nothing else about the run changes: it still ends on its stop signal, and a drain that times out while the commit is waiting still aborts the member and reports `timed_out`.
+A member the autoscaler retires on scale-down makes the same final commit, and the rebalance that retirement starts can make the coordinator reject it with a rebalance in progress or a stale generation.
+For now that rejection counts under `errors` like any other; the new owner redelivers from the last accepted position, as at-least-once delivery intends.
 A member with nothing to commit has no commit to fail and still ends clean.
 An acknowledged offset on a partition a rebalance revoked before the stop is not part of the final commit and raises no error.
 Its tracker went with the partition, and the new owner redelivers the record, which is at-least-once delivery as before.

@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -21,7 +20,7 @@ use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::RetryStrategy;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_group::reject_fifo_concurrency;
-use crate::consumer_supervisor::ShutdownTally;
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -55,89 +54,6 @@ fn harvest_if_finished(
         panic_count.fetch_add(1, Ordering::Relaxed);
     }
     true
-}
-
-/// Where a member's exit is recorded: the error count the shutdown tally
-/// reads, the fatal flag `ensure_min` reads, and the sink the registry's run
-/// selects on. Cloned into the spawner, so every member of a group reports
-/// through the counters that group drains.
-#[derive(Clone, Default)]
-pub(crate) struct MemberFaults {
-    errors: Arc<AtomicUsize>,
-    fatal: Arc<AtomicBool>,
-    /// Attached once, by the registry that owns the group. A group run
-    /// outside a registry has no run to end, so a fatal error there only
-    /// sets the flag and is logged.
-    sink: Arc<OnceLock<mpsc::UnboundedSender<ShoveError>>>,
-}
-
-impl MemberFaults {
-    /// Record the error a member ended with. Every error counts one, as
-    /// before. A fatal one (`ShoveError::is_fatal`) also raises the flag
-    /// that stops `ensure_min` from replacing the member, and reaches the
-    /// run that owns the registry through the sink, which ends that run.
-    ///
-    /// The count is raised before the send, so a run woken by the error
-    /// finds it already counted when it drains.
-    pub(crate) fn record(&self, error: ShoveError) {
-        self.errors.fetch_add(1, Ordering::Relaxed);
-        if !error.is_fatal() {
-            return;
-        }
-        self.fatal.store(true, Ordering::Release);
-        match self.sink.get() {
-            // A closed receiver means the run has already ended; nothing is
-            // left to stop.
-            Some(sink) => {
-                let _ = sink.send(error);
-            }
-            None => tracing::warn!(
-                error = %error,
-                "a member ended with a fatal error and no run owns the group; \
-                 the member is not replaced"
-            ),
-        }
-    }
-
-    /// Attach the registry's fatal channel. A second attach is a no-op.
-    pub(crate) fn attach_sink(&self, sink: mpsc::UnboundedSender<ShoveError>) {
-        let _ = self.sink.set(sink);
-    }
-
-    /// Whether a member of this group ended with a fatal error.
-    pub(crate) fn is_fatal(&self) -> bool {
-        self.fatal.load(Ordering::Acquire)
-    }
-
-    /// The errors recorded since the last take, for the shutdown tally.
-    fn take_errors(&self) -> usize {
-        self.errors.swap(0, Ordering::Relaxed)
-    }
-}
-
-/// Settle the shard tasks of one FIFO member into its group's counters, as
-/// the standard spawner settles a member: an `Err` from a shard is recorded
-/// through `faults`, fatal or not, a panic counts under `panic_count`, and
-/// a cancelled shard counts nothing.
-async fn settle_fifo_shards(
-    handles: Vec<JoinHandle<Result<()>>>,
-    faults: &MemberFaults,
-    panic_count: &AtomicUsize,
-) {
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::error!("sequenced shard exited with error: {e}");
-                faults.record(e);
-            }
-            Err(e) if e.is_cancelled() => {}
-            Err(e) => {
-                panic_count.fetch_add(1, Ordering::Relaxed);
-                tracing::error!("sequenced shard panicked: {e}");
-            }
-        }
-    }
 }
 
 /// `auto.offset.reset` policy applied when a consumer group joins a topic
@@ -626,9 +542,7 @@ pub struct KafkaConsumerGroup {
     pub(crate) spawner: Spawner,
     pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
     pub(crate) group_token: CancellationToken,
-    /// Where every member of this group records its exit; see
-    /// [`MemberFaults`].
-    pub(crate) faults: MemberFaults,
+    pub(crate) error_count: Arc<AtomicUsize>,
     /// Panic count incremented by the FIFO spawner wrapper when a shard task
     /// exits with a `JoinError` that is not a cancellation. Drained by
     /// [`KafkaConsumerGroup::shutdown_with_tally`].
@@ -668,8 +582,8 @@ impl KafkaConsumerGroup {
                  call .with_concurrent_processing(true) to honor the configured value"
             );
         }
-        let faults = MemberFaults::default();
-        let faults_for_spawner = faults.clone();
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = KafkaConsumer::new(client.clone());
@@ -681,16 +595,14 @@ impl KafkaConsumerGroup {
                     ..options
                 }
             };
-            let faults = faults_for_spawner.clone();
+            let ec = ec_for_spawner.clone();
             let ctx = ctx.clone();
 
             tokio::spawn(async move {
                 let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
+                    ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");
-                    // Counted, and if fatal, reported to the run that owns
-                    // the group, which ends on it.
-                    faults.record(e);
                 }
             })
         });
@@ -708,7 +620,7 @@ impl KafkaConsumerGroup {
             config,
             spawner,
             group_token,
-            faults,
+            error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
             retiring: Vec::new(),
             respawn: RespawnSupervisor::default(),
@@ -731,9 +643,9 @@ impl KafkaConsumerGroup {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
-        let faults = MemberFaults::default();
+        let error_count = Arc::new(AtomicUsize::new(0));
         let panic_count = Arc::new(AtomicUsize::new(0));
-        let faults_for_spawner = faults.clone();
+        let ec_for_spawner = error_count.clone();
         let pc_for_spawner = panic_count.clone();
 
         // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
@@ -743,7 +655,7 @@ impl KafkaConsumerGroup {
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = KafkaConsumer::new(client.clone());
-            let faults = faults_for_spawner.clone();
+            let ec = ec_for_spawner.clone();
             let pc = pc_for_spawner.clone();
             let ctx = ctx.clone();
             tokio::spawn(async move {
@@ -751,12 +663,25 @@ impl KafkaConsumerGroup {
                 let handles = match consumer.spawn_fifo_shards::<T, H>(handler, ctx, options) {
                     Ok(h) => h,
                     Err(e) => {
+                        ec.fetch_add(1, Ordering::Relaxed);
                         tracing::error!("FIFO registration failed: {e}");
-                        faults.record(e);
                         return;
                     }
                 };
-                settle_fifo_shards(handles, &faults, &pc).await;
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            ec.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard exited with error: {e}");
+                        }
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => {
+                            pc.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard panicked: {e}");
+                        }
+                    }
+                }
             })
         });
 
@@ -773,7 +698,7 @@ impl KafkaConsumerGroup {
             config,
             spawner,
             group_token,
-            faults,
+            error_count,
             panic_count,
             retiring: Vec::new(),
             respawn: RespawnSupervisor::default(),
@@ -811,19 +736,8 @@ impl KafkaConsumerGroup {
             .retain_mut(|handle| !harvest_if_finished(handle, panic_count, queue));
     }
 
-    /// Spawn one additional consumer. Returns false at max capacity, and
-    /// false after a member ended with a fatal error: that error ends the run
-    /// that owns this group, so a member added in the window before the run
-    /// cancels the group would only meet the same shutdown, exactly as
-    /// `ensure_min` refuses to replace one.
+    /// Spawn one additional consumer. Returns false at max capacity.
     pub fn scale_up(&mut self) -> bool {
-        if self.faults.is_fatal() {
-            debug!(
-                group = %self.queue,
-                "scale_up rejected: a member ended with a fatal error"
-            );
-            return false;
-        }
         self.prune_finished();
         if self.consumers.len() >= self.config.max_consumers as usize {
             debug!(group = %self.queue, max = self.config.max_consumers, "scale_up rejected: at max capacity");
@@ -886,18 +800,6 @@ impl KafkaConsumerGroup {
         // still tick between cancellation and the final drain, and a member
         // spawned there would be born cancelled.
         if self.group_token.is_cancelled() {
-            return 0;
-        }
-        // Never replace a member that ended with a fatal error: the error
-        // ends the run that owns this group, and a member spawned in the
-        // window before that run cancels the group would only meet the same
-        // shutdown. The flag outlives the member, so the block holds across
-        // every tick until the drain.
-        if self.faults.is_fatal() {
-            debug!(
-                group = %self.queue,
-                "a member ended with a fatal error; the group is not topped up"
-            );
             return 0;
         }
         self.prune_finished();
@@ -966,14 +868,10 @@ impl KafkaConsumerGroup {
     ///
     /// Error and panic counts are snapshotted at the start and again after all
     /// awaits complete. Both the active-consumer and retiring drain loops sit
-    /// between the two snapshots, preserving cancel-safety across both. Each
-    /// handle is awaited in place and removed from its list only once it has
-    /// settled, so a drain future dropped at the drain deadline leaves the
-    /// member it was awaiting in the list, still running, for
-    /// [`Self::abort_remaining_into`] to abort and await. That member's exit
-    /// is then counted by the abort path's snapshot; a final commit the abort
-    /// ends is reported by the receive loop's `PendingFinalCommit` guard as
-    /// the task is dropped, before the awaited abort returns.
+    /// between the two snapshots, preserving cancel-safety across both. The
+    /// consumer list is drained via `pop()` so dropped futures leave unawaited
+    /// handles in place for a subsequent escalation via
+    /// [`Self::abort_remaining_into`].
     pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             group = %self.queue,
@@ -984,13 +882,12 @@ impl KafkaConsumerGroup {
         );
         self.group_token.cancel();
 
-        tally.errors += self.faults.take_errors();
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
-        while let Some((_token, _processing, handle)) = self.consumers.last_mut() {
-            let settled = handle.await;
-            self.consumers.pop();
-            match settled {
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
+            match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
@@ -1000,10 +897,9 @@ impl KafkaConsumerGroup {
             }
         }
 
-        while let Some(handle) = self.retiring.last_mut() {
-            let settled = handle.await;
-            self.retiring.pop();
-            match settled {
+        while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
+            match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
@@ -1013,7 +909,7 @@ impl KafkaConsumerGroup {
             }
         }
 
-        tally.errors += self.faults.take_errors();
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
 
@@ -1051,7 +947,7 @@ impl KafkaConsumerGroup {
                 }
             }
         }
-        tally.errors += self.faults.take_errors();
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
 
@@ -1062,9 +958,6 @@ impl KafkaConsumerGroup {
         options.max_retries = self.config.max_retries;
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
-        // The receive loop reports a final commit the drain's abort would
-        // otherwise lose through the same counters the spawner records into.
-        options.kafka_member_faults = Some(self.faults.clone());
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.handler_timeout_outcome = self.config.handler_timeout_outcome.clone();
         if let Some(limit) = self.config.max_pending_per_key {
@@ -1103,17 +996,6 @@ impl KafkaConsumerGroup {
 pub struct KafkaConsumerGroupRegistry {
     pub(crate) groups: HashMap<String, KafkaConsumerGroup>,
     client: Option<KafkaClient>,
-    /// The client's shutdown token, the parent of every group token this
-    /// registry creates. The run's stop signal cancels it, and so stops every
-    /// registry on the same client, as before; a fatal member error cancels
-    /// only this registry's groups, see [`cancel_groups`](Self::cancel_groups).
-    shutdown_token: CancellationToken,
-    /// The channel every group's members report a fatal error on. The run
-    /// that owns this registry takes `fatal_rx` once and selects on it
-    /// beside its stop signal; `fatal_tx` lives as long as the registry so
-    /// that receiver never reads as closed while a member can still report.
-    fatal_tx: mpsc::UnboundedSender<ShoveError>,
-    fatal_rx: Option<mpsc::UnboundedReceiver<ShoveError>>,
     pub(super) default_handler_timeout: Option<Duration>,
     /// Replication factor applied to topics created by declaration (main + DLQ)
     /// declared via `register` / `register_fifo`. `None` keeps the topology
@@ -1127,38 +1009,20 @@ pub struct KafkaConsumerGroupRegistry {
 
 impl KafkaConsumerGroupRegistry {
     pub fn new(client: KafkaClient) -> Self {
-        let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
-        let shutdown_token = client.shutdown_token();
         Self {
             groups: HashMap::new(),
             client: Some(client),
-            shutdown_token,
-            fatal_tx,
-            fatal_rx: Some(fatal_rx),
             default_handler_timeout: None,
             default_replication_factor: None,
         }
     }
 
-    /// Create a registry from a pre-populated map of groups (for testing),
-    /// with `shutdown_token` standing in for the client's shutdown token.
-    /// Each group's members report into this registry's fatal channel, as
-    /// `register` arranges for a group it builds.
+    /// Create a registry from a pre-populated map of groups (for testing).
     #[cfg(test)]
-    pub(crate) fn from_groups(
-        groups: HashMap<String, KafkaConsumerGroup>,
-        shutdown_token: CancellationToken,
-    ) -> Self {
-        let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
-        for group in groups.values() {
-            group.faults.attach_sink(fatal_tx.clone());
-        }
+    pub(crate) fn from_groups(groups: HashMap<String, KafkaConsumerGroup>) -> Self {
         Self {
             groups,
             client: None,
-            shutdown_token,
-            fatal_tx,
-            fatal_rx: Some(fatal_rx),
             default_handler_timeout: None,
             default_replication_factor: None,
         }
@@ -1197,26 +1061,10 @@ impl KafkaConsumerGroupRegistry {
     /// Used by `RegistryImpl::cancellation_token` and `run_until_timeout`
     /// to coordinate graceful shutdown with the broker's lifecycle.
     pub(crate) fn client_shutdown_token(&self) -> CancellationToken {
-        self.shutdown_token.clone()
-    }
-
-    /// Cancel every group this registry owns, and nothing else.
-    ///
-    /// The fatal path's stop. The client's shutdown token is shared by every
-    /// registry built from that client, so cancelling it for one member's
-    /// fatal error would stop sibling registries that have nothing to do
-    /// with it. Each group token is a child of that token, so a client
-    /// shutdown still reaches every group as before.
-    pub(crate) fn cancel_groups(&self) {
-        for group in self.groups.values() {
-            group.group_token.cancel();
-        }
-    }
-
-    /// The receiver of the fatal errors this registry's members end with,
-    /// for the run that owns the registry. Taken once; `None` afterwards.
-    pub(crate) fn take_fatal_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<ShoveError>> {
-        self.fatal_rx.take()
+        self.client
+            .as_ref()
+            .map(|c| c.shutdown_token())
+            .unwrap_or_default()
     }
 
     pub async fn register<T, H>(
@@ -1279,7 +1127,6 @@ impl KafkaConsumerGroupRegistry {
             handler_factory,
             ctx,
         );
-        group.faults.attach_sink(self.fatal_tx.clone());
         self.groups.insert(name, group);
         Ok(())
     }
@@ -1352,7 +1199,6 @@ impl KafkaConsumerGroupRegistry {
             handler_factory,
             ctx,
         );
-        group.faults.attach_sink(self.fatal_tx.clone());
         self.groups.insert(name, group);
         Ok(())
     }
@@ -1414,7 +1260,6 @@ impl KafkaConsumerGroupRegistry {
 mod tests {
     use super::*;
     use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
-    use crate::error::CommitFailure;
     use crate::supervision::{
         RESPAWN_BACKOFF_MAX, RESPAWN_CIRCUIT_COOLDOWN, RESPAWN_CIRCUIT_LIMIT,
     };
@@ -1439,7 +1284,7 @@ mod tests {
             config,
             spawner,
             group_token: CancellationToken::new(),
-            faults: MemberFaults::default(),
+            error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
             retiring: Vec::new(),
             respawn: RespawnSupervisor::default(),
@@ -1747,7 +1592,7 @@ mod tests {
         group.start();
         assert_eq!(group.active_consumers(), 2);
 
-        group.faults.errors.store(7, Ordering::Relaxed);
+        group.error_count.store(7, Ordering::Relaxed);
         group.panic_count.store(2, Ordering::Relaxed);
 
         let mut tally = ShutdownTally::default();
@@ -1764,7 +1609,7 @@ mod tests {
         let mut group = hanging_test_group(KafkaConsumerGroupConfig::new(2..=2));
         group.start();
 
-        group.faults.errors.store(5, Ordering::Relaxed);
+        group.error_count.store(5, Ordering::Relaxed);
         group.panic_count.store(1, Ordering::Relaxed);
 
         let mut tally = ShutdownTally::default();
@@ -1847,8 +1692,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "default_handler_timeout must be positive")]
     fn with_default_handler_timeout_zero_panics() {
-        let registry =
-            KafkaConsumerGroupRegistry::from_groups(HashMap::new(), CancellationToken::new());
+        let registry = KafkaConsumerGroupRegistry::from_groups(HashMap::new());
         let _ = registry.with_default_handler_timeout(Duration::ZERO);
     }
 
@@ -2160,590 +2004,6 @@ mod tests {
         group.shutdown().await;
     }
 
-    // -- fatal member errors --
-
-    /// The one fatal error a Kafka member can end with on this version: the
-    /// final offset commit of a stopping member did not land.
-    fn commit_error() -> ShoveError {
-        ShoveError::Commit {
-            topic: "test-queue".into(),
-            offsets: vec![(0, 1)],
-            kind: CommitFailure::Rejected("Broker: Group authorization failed".into()),
-        }
-    }
-
-    fn ordinary_error() -> ShoveError {
-        ShoveError::Topology("boom".into())
-    }
-
-    /// Spawner whose members end at once with the error `make` builds,
-    /// recorded through `faults` the way the real spawner records an exit.
-    fn dies_with_spawner(faults: MemberFaults, make: fn() -> ShoveError) -> Spawner {
-        Arc::new(move |_options: ConsumerOptions| {
-            let faults = faults.clone();
-            tokio::spawn(async move { faults.record(make()) })
-        })
-    }
-
-    /// A group whose members all end with the error `make` builds, recorded
-    /// into the group's own counters.
-    fn dying_group(
-        config: KafkaConsumerGroupConfig,
-        make: fn() -> ShoveError,
-    ) -> KafkaConsumerGroup {
-        let faults = MemberFaults::default();
-        let mut group = test_group_with_spawner(config, dies_with_spawner(faults.clone(), make));
-        group.faults = faults;
-        group
-    }
-
-    /// Polls, with a bound, until every member task of `group` has ended.
-    async fn wait_until_no_member_is_alive(group: &KafkaConsumerGroup) {
-        for _ in 0..200 {
-            if group.active_consumers() == 0 {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("members still alive after the wait budget");
-    }
-
-    /// The respawn block: a member that ended with `Commit` is not replaced.
-    /// `ensure_min_respawns_dead_consumers` is the control, where the same
-    /// shortfall with no fatal error is respawned in full.
-    #[tokio::test(start_paused = true)]
-    async fn ensure_min_does_not_replace_a_member_that_ended_with_a_fatal_error() {
-        let mut group = dying_group(KafkaConsumerGroupConfig::new(2..=4), commit_error);
-        group.start();
-        wait_until_no_member_is_alive(&group).await;
-        assert!(
-            group.faults.is_fatal(),
-            "the fatal flag is raised by the exit"
-        );
-
-        assert_eq!(
-            group.ensure_min(),
-            0,
-            "a member that ended with a fatal error is not replaced"
-        );
-        assert_eq!(group.active_consumers(), 0);
-
-        let tally = group.shutdown_with_tally().await;
-        assert_eq!(tally.errors, 2, "each fatal member still counts one error");
-        assert_eq!(tally.panics, 0);
-    }
-
-    /// The control on the same spawner: an ordinary error ends the member
-    /// alone, raises no flag, and the shortfall is respawned as before.
-    #[tokio::test(start_paused = true)]
-    async fn ensure_min_still_replaces_a_member_that_ended_with_an_ordinary_error() {
-        let mut group = dying_group(KafkaConsumerGroupConfig::new(2..=4), ordinary_error);
-        group.start();
-        wait_until_no_member_is_alive(&group).await;
-        assert!(!group.faults.is_fatal());
-
-        assert_eq!(
-            group.ensure_min(),
-            2,
-            "an ordinary error is respawned in full"
-        );
-        group.shutdown().await;
-    }
-
-    /// The registry's run ends on the fatal error with no external stop:
-    /// the signal never resolves, and the report carries the error beside
-    /// an outcome that counts it.
-    #[tokio::test]
-    async fn the_registry_run_ends_on_a_fatal_member_error_without_a_stop() {
-        use crate::backend::RegistryImpl;
-
-        let mut groups = HashMap::new();
-        groups.insert(
-            "test-queue".to_string(),
-            dying_group(KafkaConsumerGroupConfig::new(1..=1), commit_error),
-        );
-        let registry = KafkaConsumerGroupRegistry::from_groups(groups, CancellationToken::new());
-
-        let report = tokio::time::timeout(
-            Duration::from_secs(5),
-            RegistryImpl::run_until_timeout_with_report(
-                registry,
-                std::future::pending(),
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("the run ends on the fatal error, not on a signal that never comes");
-
-        assert_eq!(report.fatal.len(), 1, "{:?}", report.fatal);
-        assert!(
-            matches!(report.fatal[0], ShoveError::Commit { .. }),
-            "{:?}",
-            report.fatal
-        );
-        assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
-        assert_eq!(report.outcome.panics, 0, "{:?}", report.outcome);
-        assert!(!report.outcome.timed_out, "{:?}", report.outcome);
-        assert!(!report.outcome.is_clean());
-        assert_eq!(report.outcome.exit_code(), 1);
-    }
-
-    /// The control: an ordinary member error does not end the run. The
-    /// registry keeps waiting for its signal and reports the count at
-    /// shutdown, as before.
-    #[tokio::test]
-    async fn the_registry_run_waits_out_an_ordinary_member_error() {
-        use crate::backend::RegistryImpl;
-        use std::future::poll_fn;
-
-        let group = dying_group(KafkaConsumerGroupConfig::new(1..=1), ordinary_error);
-        let faults = group.faults.clone();
-        let mut groups = HashMap::new();
-        groups.insert("test-queue".to_string(), group);
-        let registry = KafkaConsumerGroupRegistry::from_groups(groups, CancellationToken::new());
-
-        let stop = CancellationToken::new();
-        let run = RegistryImpl::run_until_timeout_with_report(
-            registry,
-            stop.clone().cancelled_owned(),
-            Duration::from_secs(1),
-        );
-        let mut run = std::pin::pin!(run);
-
-        // Drive the run until the member has ended, then check it is still
-        // pending: the member's error is counted, not acted on.
-        for _ in 0..200 {
-            if faults.errors.load(Ordering::Relaxed) == 1 {
-                break;
-            }
-            let polled = poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx))).await;
-            assert!(
-                polled.is_pending(),
-                "the run ended before its signal: {polled:?}"
-            );
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(faults.errors.load(Ordering::Relaxed), 1, "the member ended");
-        let polled = poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx))).await;
-        assert!(
-            polled.is_pending(),
-            "an ordinary error must not end the run: {polled:?}"
-        );
-
-        stop.cancel();
-        let report = run.await;
-        assert!(report.fatal.is_empty(), "{:?}", report.fatal);
-        assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
-        assert!(!report.outcome.timed_out);
-    }
-
-    /// A fatal error ends the run that owns the member and nothing else. Two
-    /// registries built from one client share that client's shutdown token,
-    /// the parent of every group token; the fatal path must leave it alone,
-    /// or one member's fatal error would stop every sibling registry on the
-    /// client.
-    #[tokio::test]
-    async fn a_fatal_run_does_not_cancel_a_sibling_registry_on_the_same_client() {
-        use crate::backend::RegistryImpl;
-
-        let client_token = CancellationToken::new();
-        let mut failing = dying_group(KafkaConsumerGroupConfig::new(1..=1), commit_error);
-        failing.group_token = client_token.child_token();
-        let mut sibling = test_group(KafkaConsumerGroupConfig::new(1..=1));
-        sibling.group_token = client_token.child_token();
-        let sibling_token = sibling.group_token.clone();
-        // Only observed, never run: its group token is what the other
-        // registry's fatal error must not reach.
-        let _sibling_registry = KafkaConsumerGroupRegistry::from_groups(
-            HashMap::from([("sibling".to_string(), sibling)]),
-            client_token.clone(),
-        );
-        let registry = KafkaConsumerGroupRegistry::from_groups(
-            HashMap::from([("test-queue".to_string(), failing)]),
-            client_token.clone(),
-        );
-
-        let report = tokio::time::timeout(
-            Duration::from_secs(5),
-            RegistryImpl::run_until_timeout_with_report(
-                registry,
-                std::future::pending(),
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("the run ends on the fatal error");
-
-        assert_eq!(report.fatal.len(), 1, "{:?}", report.fatal);
-        assert!(
-            !client_token.is_cancelled(),
-            "a fatal member error must not cancel the client's shutdown token"
-        );
-        assert!(
-            !sibling_token.is_cancelled(),
-            "a sibling registry's group must keep running"
-        );
-    }
-
-    /// The control: the stop signal keeps its scope. It cancels the client's
-    /// shutdown token, as it did before, so every registry on the client
-    /// stops together.
-    #[tokio::test]
-    async fn the_stop_signal_still_cancels_the_client_token() {
-        use crate::backend::RegistryImpl;
-
-        let client_token = CancellationToken::new();
-        let mut group = test_group(KafkaConsumerGroupConfig::new(1..=1));
-        group.group_token = client_token.child_token();
-        let registry = KafkaConsumerGroupRegistry::from_groups(
-            HashMap::from([("test-queue".to_string(), group)]),
-            client_token.clone(),
-        );
-
-        let stop = CancellationToken::new();
-        let run = RegistryImpl::run_until_timeout_with_report(
-            registry,
-            stop.clone().cancelled_owned(),
-            Duration::from_secs(1),
-        );
-        stop.cancel();
-        let report = tokio::time::timeout(Duration::from_secs(5), run)
-            .await
-            .expect("the run ends on its signal");
-        assert!(report.fatal.is_empty());
-        assert!(report.outcome.is_clean(), "{:?}", report.outcome);
-        assert!(
-            client_token.is_cancelled(),
-            "the stop signal cancels the client's shutdown token, as before"
-        );
-    }
-
-    /// The other respawn path: lag-driven `scale_up` refuses a member after a
-    /// fatal member error, as `ensure_min` refuses to replace one.
-    #[tokio::test(start_paused = true)]
-    async fn scale_up_refuses_a_member_after_a_fatal_member_error() {
-        let mut group = dying_group(KafkaConsumerGroupConfig::new(1..=4), commit_error);
-        group.start();
-        wait_until_no_member_is_alive(&group).await;
-        assert!(group.faults.is_fatal());
-
-        assert!(
-            !group.scale_up(),
-            "no member is added after a fatal member error"
-        );
-        assert_eq!(group.active_consumers(), 0);
-        group.shutdown().await;
-    }
-
-    /// The control: an ordinary error leaves `scale_up` as it was.
-    #[tokio::test(start_paused = true)]
-    async fn scale_up_still_adds_a_member_after_an_ordinary_error() {
-        let mut group = dying_group(KafkaConsumerGroupConfig::new(1..=4), ordinary_error);
-        group.start();
-        wait_until_no_member_is_alive(&group).await;
-        assert!(!group.faults.is_fatal());
-
-        assert!(
-            group.scale_up(),
-            "an ordinary error does not block scale_up"
-        );
-        group.shutdown().await;
-    }
-
-    fn commit_error_on(partition: i32) -> ShoveError {
-        ShoveError::Commit {
-            topic: "test-queue".into(),
-            offsets: vec![(partition, 1)],
-            kind: CommitFailure::Rejected("Broker: Group authorization failed".into()),
-        }
-    }
-
-    /// The autoscaling run ends on a member's fatal error too, without its
-    /// stop signal: the autoscaler is stopped first, the group is drained,
-    /// the error is reported, and the client's shared token is left alone.
-    /// The autoscaler is a stand-in task that waits for its stop token, as
-    /// the real one does between ticks.
-    #[tokio::test]
-    async fn the_autoscaling_run_ends_on_a_fatal_member_error_without_a_stop() {
-        use crate::consumer_group::run_with_autoscaler;
-
-        let client_token = CancellationToken::new();
-        let mut group = dying_group(KafkaConsumerGroupConfig::new(1..=1), commit_error);
-        group.group_token = client_token.child_token();
-        let registry = KafkaConsumerGroupRegistry::from_groups(
-            HashMap::from([("test-queue".to_string(), group)]),
-            client_token.clone(),
-        );
-        let autoscaler_stopped = Arc::new(AtomicBool::new(false));
-        let stopped = autoscaler_stopped.clone();
-
-        let report = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_with_autoscaler(
-                registry,
-                move |_registry, stop| {
-                    tokio::spawn(async move {
-                        stop.cancelled().await;
-                        stopped.store(true, Ordering::SeqCst);
-                    })
-                },
-                std::future::pending(),
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("the autoscaling run ends on the fatal error, not on a signal that never comes");
-
-        assert_eq!(report.fatal.len(), 1, "{:?}", report.fatal);
-        assert!(
-            matches!(report.fatal[0], ShoveError::Commit { .. }),
-            "{:?}",
-            report.fatal
-        );
-        assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
-        assert_eq!(report.outcome.panics, 0, "{:?}", report.outcome);
-        assert!(!report.outcome.timed_out, "{:?}", report.outcome);
-        assert!(
-            autoscaler_stopped.load(Ordering::SeqCst),
-            "the autoscaler is stopped before the drain"
-        );
-        assert!(
-            !client_token.is_cancelled(),
-            "the fatal path leaves the client's token alone on the autoscaling run too"
-        );
-    }
-
-    /// Two members end with fatal errors: the first ends the run, the second
-    /// is recorded while the run drains, and the report keeps both in
-    /// arrival order.
-    #[tokio::test]
-    async fn the_report_keeps_a_second_fatal_error_recorded_during_the_drain_in_order() {
-        use crate::backend::RegistryImpl;
-
-        let faults = MemberFaults::default();
-        let faults_for_spawner = faults.clone();
-        let next_member = Arc::new(AtomicUsize::new(0));
-        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
-            let faults = faults_for_spawner.clone();
-            let member = next_member.fetch_add(1, Ordering::SeqCst) as i32;
-            tokio::spawn(async move {
-                if member == 0 {
-                    // Ends the run.
-                    faults.record(commit_error_on(0));
-                } else {
-                    // Records only once the run cancels the group, so during
-                    // its drain.
-                    options.shutdown.cancelled().await;
-                    faults.record(commit_error_on(member));
-                }
-            })
-        });
-        let mut group = test_group_with_spawner(KafkaConsumerGroupConfig::new(2..=2), spawner);
-        group.faults = faults;
-        let registry = KafkaConsumerGroupRegistry::from_groups(
-            HashMap::from([("test-queue".to_string(), group)]),
-            CancellationToken::new(),
-        );
-
-        let report = tokio::time::timeout(
-            Duration::from_secs(5),
-            RegistryImpl::run_until_timeout_with_report(
-                registry,
-                std::future::pending(),
-                Duration::from_secs(2),
-            ),
-        )
-        .await
-        .expect("the run ends on the first fatal error");
-
-        let partitions: Vec<Vec<(i32, i64)>> = report
-            .fatal
-            .iter()
-            .map(|e| match e {
-                ShoveError::Commit { offsets, .. } => offsets.clone(),
-                other => panic!("not a commit error: {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            partitions,
-            vec![vec![(0, 1)], vec![(1, 1)]],
-            "both errors, in arrival order: {:?}",
-            report.fatal
-        );
-        assert_eq!(report.outcome.errors, 2, "{:?}", report.outcome);
-        assert!(!report.outcome.timed_out, "{:?}", report.outcome);
-    }
-
-    /// The FIFO member's shards settle into the same counters as a standard
-    /// member: an `Err` counts one error, a panic counts one panic, and a
-    /// cancelled shard counts nothing.
-    #[tokio::test]
-    async fn fifo_shard_results_reach_the_groups_counters() {
-        let faults = MemberFaults::default();
-        let panics = AtomicUsize::new(0);
-        let cancelled: JoinHandle<Result<()>> =
-            tokio::spawn(async { std::future::pending().await });
-        cancelled.abort();
-        let panicking: JoinHandle<Result<()>> = tokio::spawn(async { panic!("shard panic") });
-        let handles = vec![
-            tokio::spawn(async { Ok(()) }),
-            tokio::spawn(async { Err(ordinary_error()) }),
-            panicking,
-            cancelled,
-        ];
-
-        settle_fifo_shards(handles, &faults, &panics).await;
-
-        assert_eq!(faults.take_errors(), 1, "one shard error");
-        assert_eq!(panics.load(Ordering::Relaxed), 1, "one shard panic");
-        assert!(!faults.is_fatal());
-    }
-
-    /// A FIFO shard that ends with a fatal error raises the group's flag and
-    /// reaches the registry's channel like a standard member's exit.
-    #[tokio::test]
-    async fn a_fatal_fifo_shard_error_raises_the_flag_and_reaches_the_sink() {
-        let faults = MemberFaults::default();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        faults.attach_sink(tx);
-        let shard: JoinHandle<Result<()>> = tokio::spawn(async { Err(commit_error()) });
-
-        settle_fifo_shards(vec![shard], &faults, &AtomicUsize::new(0)).await;
-
-        assert!(faults.is_fatal());
-        assert!(matches!(rx.try_recv(), Ok(ShoveError::Commit { .. })));
-        assert_eq!(faults.take_errors(), 1);
-    }
-
-    /// The FIFO spawner's registration-failure arm, driven through
-    /// `new_fifo`: a FIFO member whose options the shard spawner refuses ends
-    /// before any shard exists, and that exit reaches the shutdown tally as
-    /// one ordinary error. The refusal here is a commit interval, which a
-    /// FIFO consumer never reads; `spawn_fifo_shards` refuses it before it
-    /// contacts a broker, so the client is an offline one and nothing
-    /// connects. The registry's `register_fifo` refuses the interval earlier;
-    /// `new_fifo` does not, which is what lets this test reach the arm.
-    #[tokio::test]
-    async fn a_refused_fifo_registration_reaches_the_shutdown_tally() {
-        use serde::{Deserialize, Serialize};
-
-        use crate::define_sequenced_topic;
-        use crate::metadata::MessageMetadata;
-        use crate::outcome::Outcome;
-        use crate::topology::{SequenceFailure, TopologyBuilder};
-
-        #[derive(Debug, Clone, Serialize, Deserialize)]
-        struct Entry {
-            key: String,
-        }
-
-        define_sequenced_topic!(
-            RefusedFifo,
-            Entry,
-            |msg| msg.key.clone(),
-            TopologyBuilder::new("fifo-refused-registration")
-                .sequenced(SequenceFailure::FailAll)
-                .hold_queue(Duration::from_millis(50))
-                .dlq()
-                .build()
-        );
-
-        struct AckAll;
-        impl MessageHandler<RefusedFifo> for AckAll {
-            type Context = ();
-            async fn handle(&self, _: Entry, _: MessageMetadata, _: &()) -> Outcome {
-                Outcome::Ack
-            }
-        }
-
-        // Port 1 is never listening; the refusal returns before any I/O.
-        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
-            .await
-            .expect("client construction is lazy");
-        let mut group = KafkaConsumerGroup::new_fifo::<RefusedFifo, AckAll>(
-            "fifo-refused-registration",
-            client,
-            KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::from_secs(1)),
-            CancellationToken::new(),
-            || AckAll,
-            (),
-        );
-        group.start();
-        wait_until_no_member_is_alive(&group).await;
-
-        let tally = group.shutdown_with_tally().await;
-        assert_eq!(
-            tally.errors, 1,
-            "the refused registration is one member error in the tally"
-        );
-        assert_eq!(tally.panics, 0);
-        assert!(!group.faults.is_fatal(), "a refusal is an ordinary error");
-    }
-
-    /// The two error snapshots of `drain_into`: an error a member records
-    /// after the first snapshot, while the drain awaits that member, is
-    /// counted by the second.
-    #[tokio::test]
-    async fn an_error_recorded_during_the_drain_is_counted_by_the_second_snapshot() {
-        let faults = MemberFaults::default();
-        let faults_for_spawner = faults.clone();
-        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
-            let faults = faults_for_spawner.clone();
-            tokio::spawn(async move {
-                // Runs only once the drain has cancelled the group and taken
-                // its first snapshot, while it awaits this task.
-                options.shutdown.cancelled().await;
-                faults.record(ordinary_error());
-            })
-        });
-        let mut group = test_group_with_spawner(KafkaConsumerGroupConfig::new(1..=1), spawner);
-        group.faults = faults.clone();
-        group.start();
-        assert_eq!(
-            faults.errors.load(Ordering::Relaxed),
-            0,
-            "nothing before the drain"
-        );
-
-        let mut tally = ShutdownTally::default();
-        group.drain_into(&mut tally).await;
-        assert_eq!(tally.errors, 1, "the second snapshot counts it");
-    }
-
-    /// The abort path's snapshot: a member that hangs through the drain and
-    /// records its error only when the abort drops it is still counted, and
-    /// a fatal one still raises the flag.
-    #[tokio::test]
-    async fn an_error_recorded_on_abort_is_counted_by_the_abort_path() {
-        struct RecordOnDrop(MemberFaults);
-        impl Drop for RecordOnDrop {
-            fn drop(&mut self) {
-                self.0.record(commit_error());
-            }
-        }
-        let faults = MemberFaults::default();
-        let faults_for_spawner = faults.clone();
-        let spawner: Spawner = Arc::new(move |_options: ConsumerOptions| {
-            let guard = RecordOnDrop(faults_for_spawner.clone());
-            tokio::spawn(async move {
-                let _guard = guard;
-                std::future::pending::<()>().await;
-            })
-        });
-        let mut group = test_group_with_spawner(KafkaConsumerGroupConfig::new(1..=1), spawner);
-        group.faults = faults.clone();
-        group.start();
-
-        let mut tally = ShutdownTally::default();
-        let drained =
-            tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
-        assert!(drained.is_err(), "the member hangs through the drain");
-        group.abort_remaining_into(&mut tally).await;
-
-        assert_eq!(tally.errors, 1, "the abort path's snapshot counts it");
-        assert!(faults.is_fatal());
-    }
-
     // -- schema-registry group config (Task 8) --
 
     #[cfg(feature = "kafka-schema-registry")]
@@ -2878,7 +2138,7 @@ mod tests {
         }
 
         fn registry() -> KafkaConsumerGroupRegistry {
-            KafkaConsumerGroupRegistry::from_groups(HashMap::new(), CancellationToken::new())
+            KafkaConsumerGroupRegistry::from_groups(HashMap::new())
         }
 
         /// An explicitly-set `concurrent_processing(true)` must fail at

@@ -11,7 +11,7 @@ use crate::autoscaler::AutoscalerConfig;
 use crate::backend::RegistryImpl;
 use crate::backend::capability::HasCoordinatedGroups;
 use crate::broadcast::reject_broadcast;
-use crate::consumer_supervisor::{RunReport, SupervisorOutcome, drain_fatal, next_fatal};
+use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 #[cfg(feature = "kafka")]
@@ -249,110 +249,32 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         self
     }
 
-    /// Run every registered group until `signal` resolves, the group's
-    /// cancellation token fires, or a member ends with a fatal error, then
-    /// drain in-flight work for up to `drain_timeout` and return the tally.
-    ///
-    /// The same run as
-    /// [`run_until_timeout_with_report`](Self::run_until_timeout_with_report),
-    /// which also returns the fatal errors themselves; this returns its
-    /// `outcome`.
     pub async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        self.run_until_timeout_with_report(signal, drain_timeout)
-            .await
-            .outcome
-    }
-
-    /// [`run_until_timeout`](Self::run_until_timeout), plus the fatal
-    /// errors that ended the run.
-    ///
-    /// A member that ends with an error for which
-    /// [`ShoveError::is_fatal`] is true ends the
-    /// run: every group is cancelled and drained as on the stop signal, the
-    /// error counts one under [`SupervisorOutcome::errors`], and it is
-    /// returned in [`RunReport::fatal`] in arrival order. With autoscaling
-    /// on, the member is not replaced. Every other error ends the member
-    /// alone and is only counted, as before. On Kafka the one fatal error is
-    /// [`ShoveError::Commit`], a final offset
-    /// commit that did not land when a member stopped.
-    pub async fn run_until_timeout_with_report<S>(
-        self,
-        signal: S,
-        drain_timeout: Duration,
-    ) -> RunReport
-    where
-        S: Future<Output = ()> + Send + 'static,
-    {
         let Some(config) = self.autoscaler else {
-            return self
-                .inner
-                .run_until_timeout_with_report(signal, drain_timeout)
-                .await;
+            return self.inner.run_until_timeout(signal, drain_timeout).await;
         };
-        let client = self.client;
-        run_with_autoscaler(
-            self.inner,
-            move |registry, auto_token| B::spawn_autoscaler(&client, registry, config, auto_token),
-            signal,
-            drain_timeout,
-        )
-        .await
-    }
-}
 
-/// The autoscaling run behind [`ConsumerGroup::run_until_timeout_with_report`]:
-/// start `inner`, share it with the autoscaler task `spawn` starts, wait for
-/// `signal`, the registry's token or a member's fatal error, then stop the
-/// autoscaler and drain. Free of the backend so the fatal path can be driven
-/// with a stand-in autoscaler.
-pub(crate) async fn run_with_autoscaler<R, S>(
-    mut inner: R,
-    spawn: impl FnOnce(Arc<Mutex<R>>, CancellationToken) -> tokio::task::JoinHandle<()>,
-    signal: S,
-    drain_timeout: Duration,
-) -> RunReport
-where
-    R: RegistryImpl + 'static,
-    S: Future<Output = ()> + Send + 'static,
-{
-    {
+        let mut inner = self.inner;
         // Token we race the external signal against; cancelling it cascades to
         // consumers exactly as the non-autoscaling path's broker token does.
         let consumer_token = inner.cancellation_token();
-        // Taken before the registry is shared with the autoscaler, so the
-        // select below owns the one receiver of the members' fatal errors.
-        let mut fatal_rx = inner.take_fatal_receiver();
-        let mut fatal = Vec::new();
-        // Whether the stop below came from a member's fatal error, whose
-        // scope is this run's groups and not the token they share with every
-        // other registry on the client.
-        let mut ended_by_fatal = false;
         inner.start_all();
 
         let registry = Arc::new(Mutex::new(inner));
         // Dedicated token so we can stop the autoscaler *before* draining
         // consumers (ordering required by the shutdown contract).
         let auto_token = CancellationToken::new();
-        let handle = spawn(registry.clone(), auto_token.clone());
+        let handle =
+            B::spawn_autoscaler(&self.client, registry.clone(), config, auto_token.clone());
 
-        // Wait for the external signal, an externally-triggered cancel, or a
-        // member that ended with a fatal error.
+        // Wait for the external signal or an externally-triggered cancel.
         let mut signal_task = tokio::spawn(signal);
         tokio::select! {
             _ = consumer_token.cancelled() => { signal_task.abort(); }
             res = &mut signal_task => { let _ = res; }
-            e = next_fatal(&mut fatal_rx) => {
-                tracing::error!(
-                    error = %e,
-                    "a consumer group member ended with a fatal error; stopping the run"
-                );
-                fatal.push(e);
-                ended_by_fatal = true;
-                signal_task.abort();
-            }
         }
 
         // Stop the autoscaler first; bounded-join so a stuck metrics poll can't
@@ -378,7 +300,7 @@ where
         }
 
         // Autoscaler task (and its registry Arc clone) is now gone: sole owner.
-        let mut inner = Arc::try_unwrap(registry)
+        let inner = Arc::try_unwrap(registry)
             .unwrap_or_else(|_| unreachable!("autoscaler joined; registry Arc must be sole-owned"))
             .into_inner();
 
@@ -388,19 +310,12 @@ where
         // concurrently before any sequential per-group drain begins.
         // Without this, drain_all_into cancels groups one at a time as it
         // iterates, so groups 2..N keep consuming until the sequential drain
-        // reaches them. A fatal member error stops this run's groups and
-        // nothing else: the token above is the client's, shared with every
-        // other registry on it.
-        if ended_by_fatal {
-            inner.cancel_groups();
-        } else {
-            consumer_token.cancel();
-        }
+        // reaches them.
+        consumer_token.cancel();
 
         let mut outcome = inner.drain_until_timeout(drain_timeout).await;
         outcome.panics += autoscaler_panics;
-        drain_fatal(&mut fatal_rx, &mut fatal);
-        RunReport { outcome, fatal }
+        outcome
     }
 }
 

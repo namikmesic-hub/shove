@@ -12,7 +12,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
@@ -23,10 +23,8 @@ use crate::backend::{
     capability::{HasBatchConsumption, HasBroadcast, HasCoordinatedGroups},
     sealed,
 };
-use crate::consumer_supervisor::{
-    RunReport, ShutdownTally, SupervisorOutcome, drain_fatal, next_fatal,
-};
-use crate::error::{Result, ShoveError};
+use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
+use crate::error::Result;
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::Kafka;
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
@@ -352,64 +350,22 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
         }
     }
 
-    async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
-    where
-        S: Future<Output = ()> + Send + 'static,
-    {
-        RegistryImpl::run_until_timeout_with_report(self, signal, drain_timeout)
-            .await
-            .outcome
-    }
-
-    fn take_fatal_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<ShoveError>> {
-        KafkaConsumerGroupRegistry::take_fatal_receiver(self)
-    }
-
-    fn cancel_groups(&mut self) {
-        KafkaConsumerGroupRegistry::cancel_groups(self);
-    }
-
-    /// Runs until the stop signal, the client's shutdown token, or the first
-    /// fatal error a member ends with (`ShoveError::is_fatal`, on Kafka a
-    /// final offset commit that did not land). A fatal error cancels every
-    /// group of this registry, the scope of the run, and only those: the
-    /// client's shutdown token is shared with every other registry on the
-    /// client, so it is left to the stop signal. The drain then collects the
-    /// error and any sibling's into `RunReport::fatal`.
-    async fn run_until_timeout_with_report<S>(
-        mut self,
-        signal: S,
-        drain_timeout: Duration,
-    ) -> RunReport
+    async fn run_until_timeout<S>(mut self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
         self.start_all();
 
         let broker_token = self.client_shutdown_token();
-        // Taken once, here: the spawner of every group reports into it.
-        let mut fatal_rx = KafkaConsumerGroupRegistry::take_fatal_receiver(&mut self);
-        let mut fatal = Vec::new();
-        let mut signal_handle = tokio::spawn(signal);
+        let signal_handle = tokio::spawn(signal);
         tokio::select! {
             _ = broker_token.cancelled() => {}
-            res = &mut signal_handle => {
+            res = signal_handle => {
                 let _ = res;
                 broker_token.cancel();
             }
-            e = next_fatal(&mut fatal_rx) => {
-                tracing::error!(
-                    error = %e,
-                    "a consumer group member ended with a fatal error; stopping every group of this registry"
-                );
-                fatal.push(e);
-                signal_handle.abort();
-                KafkaConsumerGroupRegistry::cancel_groups(&self);
-            }
         }
 
-        let outcome = self.drain_until_timeout(drain_timeout).await;
-        drain_fatal(&mut fatal_rx, &mut fatal);
-        RunReport { outcome, fatal }
+        self.drain_until_timeout(drain_timeout).await
     }
 }

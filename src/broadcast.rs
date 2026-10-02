@@ -4,13 +4,13 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::BroadcastImpl;
 use crate::backend::capability::HasBroadcast;
 use crate::consumer::ConsumerOptions;
-use crate::consumer_supervisor::{RunReport, SupervisorOutcome, tally_join_result};
+use crate::consumer_supervisor::{SupervisorOutcome, tally_join_result};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
@@ -306,143 +306,54 @@ impl<B: HasBroadcast, Ctx: Clone + Send + Sync + 'static> BroadcastSubscriber<B,
     /// timeout the surviving tasks are aborted and
     /// [`SupervisorOutcome::timed_out`] is set — backends release their
     /// subscription from a drop guard, so the abort path reaps too.
-    ///
-    /// A subscription that ends with a fatal error
-    /// ([`ShoveError::is_fatal`]) ends the run the way `signal` does. The
-    /// same run as
-    /// [`run_until_timeout_with_report`](Self::run_until_timeout_with_report),
-    /// which also returns those errors; this returns its `outcome`.
-    pub async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
-    where
-        S: Future<Output = ()> + Send + 'static,
-    {
-        self.run_until_timeout_with_report(signal, drain_timeout)
-            .await
-            .outcome
-    }
-
-    /// [`run_until_timeout`](Self::run_until_timeout), plus the fatal
-    /// errors that ended the run.
-    ///
-    /// A subscription that ends with an error for which
-    /// [`ShoveError::is_fatal`] is true ends the run: every other
-    /// subscription is cancelled and drained as on the stop signal, the
-    /// error counts one under [`SupervisorOutcome::errors`], and it is
-    /// returned in [`RunReport::fatal`] in arrival order. Every other error
-    /// ends the subscription alone and is only counted, as before; a broker
-    /// outage in particular is a reconnect, not a stop. No broadcast loop
-    /// commits offsets, so on this version no subscription ends with
-    /// [`ShoveError::Commit`]; the path exists for the fatal errors a later
-    /// version adds.
-    pub async fn run_until_timeout_with_report<S>(
+    pub async fn run_until_timeout<S>(
         mut self,
         signal: S,
         drain_timeout: Duration,
-    ) -> RunReport
+    ) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        run_tasks_until_timeout_with_report(&mut self.tasks, &self.shutdown, signal, drain_timeout)
-            .await
-    }
-}
-
-/// The run behind [`BroadcastSubscriber::run_until_timeout_with_report`],
-/// over the subscription tasks and their shutdown token alone, so the fatal
-/// path can be driven with plain tasks and no backend.
-async fn run_tasks_until_timeout_with_report<S>(
-    tasks: &mut JoinSet<Result<()>>,
-    shutdown: &CancellationToken,
-    signal: S,
-    drain_timeout: Duration,
-) -> RunReport
-where
-    S: Future<Output = ()>,
-{
-    let mut errors = 0usize;
-    let mut panics = 0usize;
-    let mut fatal = Vec::new();
-
-    // Until the stop: the signal, the token, or a subscription that ends
-    // on its own. An ordinary end is tallied here instead of at the
-    // drain, and a fatal one is the stop itself.
-    let mut signal = std::pin::pin!(signal);
-    loop {
         tokio::select! {
-            _ = &mut signal => {
-                shutdown.cancel();
-                break;
-            }
-            _ = shutdown.cancelled() => break,
-            res = tasks.join_next(), if !tasks.is_empty() => {
-                let Some(res) = res else { continue };
-                if tally_or_collect(res, &mut errors, &mut panics, &mut fatal) {
-                    tracing::error!(
-                        "a broadcast subscription ended with a fatal error; stopping the run"
-                    );
-                    shutdown.cancel();
-                    break;
+            _ = signal => { self.shutdown.cancel(); }
+            _ = self.shutdown.cancelled() => {}
+        }
+
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+
+        let drain = {
+            let tasks = &mut self.tasks;
+            let errors = &mut errors;
+            let panics = &mut panics;
+            async move {
+                while let Some(res) = tasks.join_next().await {
+                    tally_join_result(res, errors, panics);
                 }
             }
-        }
-    }
+        };
 
-    let drain = {
-        let tasks = &mut *tasks;
-        let errors = &mut errors;
-        let panics = &mut panics;
-        let fatal = &mut fatal;
-        async move {
-            while let Some(res) = tasks.join_next().await {
-                tally_or_collect(res, errors, panics, fatal);
-            }
-        }
-    };
-
-    let outcome = match tokio::time::timeout(drain_timeout, drain).await {
-        Ok(()) => SupervisorOutcome {
-            errors,
-            panics,
-            timed_out: false,
-        },
-        Err(_) => {
-            tracing::warn!(
-                timeout_ms = drain_timeout.as_millis() as u64,
-                "broadcast subscriber drain timed out; aborting surviving subscriptions"
-            );
-            tasks.abort_all();
-            while let Some(res) = tasks.join_next().await {
-                tally_or_collect(res, &mut errors, &mut panics, &mut fatal);
-            }
-            SupervisorOutcome {
+        match tokio::time::timeout(drain_timeout, drain).await {
+            Ok(()) => SupervisorOutcome {
                 errors,
                 panics,
-                timed_out: true,
+                timed_out: false,
+            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "broadcast subscriber drain timed out; aborting surviving subscriptions"
+                );
+                self.tasks.abort_all();
+                while let Some(res) = self.tasks.join_next().await {
+                    tally_join_result(res, &mut errors, &mut panics);
+                }
+                SupervisorOutcome {
+                    errors,
+                    panics,
+                    timed_out: true,
+                }
             }
-        }
-    };
-    RunReport { outcome, fatal }
-}
-
-/// [`tally_join_result`], except that a fatal error is also kept for the
-/// report: it counts one error, like any other, and is pushed onto `fatal`.
-/// Returns whether the subscription ended with a fatal error.
-fn tally_or_collect(
-    res: std::result::Result<Result<()>, JoinError>,
-    errors: &mut usize,
-    panics: &mut usize,
-    fatal: &mut Vec<ShoveError>,
-) -> bool {
-    match res {
-        Ok(Err(e)) if e.is_fatal() => {
-            tracing::error!(error = %e, "broadcast subscription ended with a fatal error");
-            *errors += 1;
-            fatal.push(e);
-            true
-        }
-        other => {
-            tally_join_result(other, errors, panics);
-            false
         }
     }
 }
@@ -450,206 +361,6 @@ fn tally_or_collect(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::future::poll_fn;
-    use std::task::Poll;
-
-    use crate::error::CommitFailure;
-
-    fn commit_error_on(partition: i32) -> ShoveError {
-        ShoveError::Commit {
-            topic: "q".into(),
-            offsets: vec![(partition, 1)],
-            kind: CommitFailure::Rejected("Broker: Group authorization failed".into()),
-        }
-    }
-
-    /// `tally_or_collect` keeps a fatal error for the report and counts it
-    /// once, like any error.
-    #[test]
-    fn tally_or_collect_keeps_a_fatal_error_and_counts_it() {
-        let (mut errors, mut panics, mut fatal) = (0, 0, Vec::new());
-        let fatal_seen = tally_or_collect(
-            Ok(Err(commit_error_on(0))),
-            &mut errors,
-            &mut panics,
-            &mut fatal,
-        );
-        assert!(fatal_seen);
-        assert_eq!((errors, panics), (1, 0));
-        assert!(matches!(fatal.as_slice(), [ShoveError::Commit { .. }]));
-    }
-
-    /// An ordinary error is counted and not kept, and a clean end is neither.
-    #[test]
-    fn tally_or_collect_counts_an_ordinary_error_without_keeping_it() {
-        let (mut errors, mut panics, mut fatal) = (0, 0, Vec::new());
-        let ordinary = Ok(Err(ShoveError::Topology("boom".into())));
-        assert!(!tally_or_collect(
-            ordinary,
-            &mut errors,
-            &mut panics,
-            &mut fatal
-        ));
-        assert!(!tally_or_collect(
-            Ok(Ok(())),
-            &mut errors,
-            &mut panics,
-            &mut fatal
-        ));
-        assert_eq!((errors, panics), (1, 0));
-        assert!(fatal.is_empty());
-    }
-
-    /// A subscription that ends with a fatal error ends the run without its
-    /// signal: the sibling that waits on the token is cancelled and drained,
-    /// the error counts one, and the report carries it.
-    #[tokio::test]
-    async fn a_fatal_subscription_error_ends_the_run_and_is_reported() {
-        let shutdown = CancellationToken::new();
-        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-        let sibling = shutdown.clone();
-        tasks.spawn(async move {
-            sibling.cancelled().await;
-            Ok(())
-        });
-        tasks.spawn(async { Err(commit_error_on(0)) });
-
-        let report = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_tasks_until_timeout_with_report(
-                &mut tasks,
-                &shutdown,
-                std::future::pending(),
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("the run ends on the fatal error, not on a signal that never comes");
-
-        assert!(
-            matches!(report.fatal.as_slice(), [ShoveError::Commit { .. }]),
-            "{:?}",
-            report.fatal
-        );
-        assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
-        assert_eq!(report.outcome.panics, 0, "{:?}", report.outcome);
-        assert!(!report.outcome.timed_out, "{:?}", report.outcome);
-        assert!(shutdown.is_cancelled(), "the siblings are stopped");
-        assert!(tasks.is_empty(), "every subscription is drained");
-    }
-
-    /// An ordinary error is counted and the run keeps waiting for its signal;
-    /// a panic counts as a panic and does not end the run either.
-    #[tokio::test]
-    async fn ordinary_errors_and_panics_do_not_end_the_run() {
-        let shutdown = CancellationToken::new();
-        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-        tasks.spawn(async { Err(ShoveError::Topology("boom".into())) });
-        tasks.spawn(async { panic!("subscription panic") });
-        let sibling = shutdown.clone();
-        tasks.spawn(async move {
-            sibling.cancelled().await;
-            Ok(())
-        });
-        let signal = CancellationToken::new();
-        let run = run_tasks_until_timeout_with_report(
-            &mut tasks,
-            &shutdown,
-            signal.clone().cancelled_owned(),
-            Duration::from_secs(1),
-        );
-        let mut run = std::pin::pin!(run);
-
-        // Drive the run until the two failing tasks have been tallied, and
-        // check it stays pending at every step: neither end is a stop.
-        for _ in 0..200 {
-            let polled = poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx))).await;
-            assert!(
-                polled.is_pending(),
-                "the run ended before its signal: {polled:?}"
-            );
-            tokio::task::yield_now().await;
-        }
-        assert!(!shutdown.is_cancelled());
-
-        signal.cancel();
-        let report = run.await;
-        assert!(report.fatal.is_empty(), "{:?}", report.fatal);
-        assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
-        assert_eq!(report.outcome.panics, 1, "{:?}", report.outcome);
-        assert!(!report.outcome.timed_out, "{:?}", report.outcome);
-    }
-
-    /// A second fatal error, from a subscription that ends while the run
-    /// drains on the first, is reported after it.
-    #[tokio::test]
-    async fn a_fatal_error_during_the_drain_is_reported_after_the_first() {
-        let shutdown = CancellationToken::new();
-        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-        tasks.spawn(async { Err(commit_error_on(0)) });
-        let sibling = shutdown.clone();
-        tasks.spawn(async move {
-            sibling.cancelled().await;
-            Err(commit_error_on(1))
-        });
-
-        let report = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_tasks_until_timeout_with_report(
-                &mut tasks,
-                &shutdown,
-                std::future::pending(),
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("the run ends on the first fatal error");
-
-        let partitions: Vec<Vec<(i32, i64)>> = report
-            .fatal
-            .iter()
-            .map(|e| match e {
-                ShoveError::Commit { offsets, .. } => offsets.clone(),
-                other => panic!("not a commit error: {other:?}"),
-            })
-            .collect();
-        assert_eq!(partitions, vec![vec![(0, 1)], vec![(1, 1)]]);
-        assert_eq!(report.outcome.errors, 2, "{:?}", report.outcome);
-    }
-
-    /// A drain that times out aborts the survivors and still keeps the fatal
-    /// error that ended the run.
-    #[tokio::test]
-    async fn a_drain_timeout_keeps_the_fatal_error_that_ended_the_run() {
-        let shutdown = CancellationToken::new();
-        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-        tasks.spawn(async { Err(commit_error_on(0)) });
-        // Ignores the token: only the abort ends it.
-        tasks.spawn(async { std::future::pending().await });
-
-        let report = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_tasks_until_timeout_with_report(
-                &mut tasks,
-                &shutdown,
-                std::future::pending(),
-                Duration::from_millis(50),
-            ),
-        )
-        .await
-        .expect("the drain times out and the run returns");
-
-        assert!(report.outcome.timed_out, "{:?}", report.outcome);
-        assert!(
-            matches!(report.fatal.as_slice(), [ShoveError::Commit { .. }]),
-            "{:?}",
-            report.fatal
-        );
-        assert_eq!(report.outcome.errors, 1, "{:?}", report.outcome);
-        assert_eq!(report.outcome.panics, 0, "an aborted task is not a panic");
-        assert!(tasks.is_empty());
-    }
 
     /// The neutral check names the topic, the value and the unit, so the
     /// error reads the same on every backend.
