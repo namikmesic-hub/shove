@@ -77,7 +77,8 @@ The priority ordering for `exit_code()` is: `timed_out` (3) > `panics` (2) > `er
 | `timed_out == true` | 3 | Drain deadline elapsed; in-flight messages were abandoned |
 
 Exit code `1` is a consumer task error, not a handler-returned `Outcome::Reject`. An `Outcome::Reject` that routes a message to the DLQ is normal operation — it does not increment `errors`. Only unrecoverable infrastructure errors (failed broker connection during drain, serialization bugs that `shove` surfaces as `Err`) increment the error count.
-On Kafka, a member whose final offset commit was not confirmed when it stopped ends with `ShoveError::Commit` and counts here too; see [Kafka → Offset commit semantics](/backends/kafka#offset-commit-semantics).
+On Kafka, a member whose final offset commit was not confirmed when it stopped ends with `ShoveError::Commit`.
+That error counts here too, see [Kafka → Offset commit semantics](/backends/kafka#offset-commit-semantics).
 If the drain deadline passes while that commit is still waiting, the member is aborted instead and the outcome is `timed_out`, exit code 3.
 
 ## Picking a drain timeout

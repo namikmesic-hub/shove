@@ -468,7 +468,8 @@ Redelivery then starts from the last position the broker accepted for each parti
 The error carries positions and the error text only, never a record's payload, key or headers.
 A consumer group counts the error once under `SupervisorOutcome::errors`, so `exit_code()` is 1 where it was 0 in 0.15.0.
 Nothing else about the run changes: it still ends on its stop signal.
-A drain that times out while the commit is still waiting aborts the member instead and reports `timed_out`, so `exit_code()` is 3 and no error is counted.
+A drain that times out while the commit is still waiting aborts the member instead.
+The run then reports `timed_out`, so `exit_code()` is 3 and no error is counted.
 A member the autoscaler retires on scale-down makes the same final commit.
 The rebalance that retirement starts can make the coordinator reject it with a rebalance in progress or a stale generation.
 For now that rejection counts under `errors` like any other.
