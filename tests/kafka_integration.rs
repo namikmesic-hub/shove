@@ -4115,7 +4115,10 @@ async fn a_cooperative_revoke_with_two_permits_ends_the_in_place_wait_on_the_mov
 /// The test runs past the 20 s delay: A's kept partition commits only after
 /// the kept head's wait ended, and in both cases the old behaviour, a stale
 /// redelivery of the moved head or a stale dispatch of the record in hand,
-/// would have reached A's handler before that commit.
+/// would have reached A's handler before that commit. Which partition moves
+/// is the assignor's choice, so this test handles both shapes and forces
+/// neither; the check that leaves the record in hand to its next owner has
+/// its deterministic case in the consumer's unit tests of `after_wait`.
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_cooperative_revoke_with_one_permit_reaches_the_in_place_wait_through_the_callback() {

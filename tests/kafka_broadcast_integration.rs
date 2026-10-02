@@ -1494,13 +1494,16 @@ async fn defer_redelivers_in_place_before_later_records() {
 /// A stop during a deferred wait hands nothing over behind it. Two records
 /// sit on one partition. The first call defers, so that record waits in
 /// place holding the subscription's single slot; the second record was read
-/// meanwhile and waits in the loop's hand for that slot. The stop cancels
-/// the wait, which frees the slot in the same instant; the loop must read
-/// the stop first and drop the second record, so the handler saw exactly one
-/// call. At `7d392b6` the slot wait was a bare `acquire_owned().await`, so
-/// the second record reached the handler after the stop.
+/// meanwhile and waits in the loop's hand for that slot, which the probe on
+/// that wait shows before the stop lands. The stop cancels the wait, which
+/// frees the slot in the same instant; the loop must read the stop first and
+/// drop the second record, so the handler saw exactly one call. At `7d392b6`
+/// the slot wait was a bare `acquire_owned().await`, so the second record
+/// reached the handler after the stop.
 #[tokio::test]
 async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
+    use shove::kafka::permit_wait_probe;
+
     const TOPIC: &str = "kafka-broadcast-stop";
     let tb = TestBroker::start().await;
     let publisher_broker = tb.broker().await;
@@ -1533,9 +1536,15 @@ async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(handler.calls().await, vec!["1".to_string()]);
-    // "1" now waits out its one-second deferral holding the slot, and "2"
-    // sits in the loop's hand behind it, or is read before the stop lands
-    // and the stop is read ahead of it either way.
+    // "1" now waits out its one-second deferral holding the slot; "2" is in
+    // the loop's hand behind it once the loop has entered the slot wait.
+    while permit_wait_probe::broadcast_entered() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "record 2 never reached the slot wait behind the deferred record"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     sub.cancellation_token().cancel();
     let outcome = sub
         .run_until_timeout(std::future::pending(), Duration::from_secs(10))
