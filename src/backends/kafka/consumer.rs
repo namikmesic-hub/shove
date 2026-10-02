@@ -1181,20 +1181,26 @@ pub mod put_back_probe {
     }
 }
 
-/// Test-only counters (see the `test-support` feature) on the entries into
-/// the two waits for a permit: `acquire_permit_while_polling` on the receive
-/// loop, and the slot wait of the broadcast loop. Each counts the records the
-/// loop has held while it waited, the ones handed a free permit at once
-/// included. A test that must have a record in that wait before it goes on,
-/// as the two stop tests do, reads it instead of sleeping. nextest runs each
-/// test in its own process, so both start at zero.
+/// Test-only probe (see the `test-support` feature) on the two waits for a
+/// permit: `acquire_permit_while_polling` on the receive loop, and the slot
+/// wait of the broadcast loop. Two counters count the records each loop has
+/// held while it waited, the ones handed a free permit at once included, so
+/// a test that must have a record in that wait before it goes on, as the
+/// stop tests do, reads them instead of sleeping. One hook runs once, in the
+/// instant either loop has a permit in hand and before it reads the stop and
+/// the record's assignment again (see `after_wait`): the one way a test can
+/// land a stop inside that window on cue, which no order of broker events
+/// reaches on its own. nextest runs each test in its own process, so the
+/// counters start at zero and the hook starts empty.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod permit_wait_probe {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub static ENTERED: AtomicUsize = AtomicUsize::new(0);
     pub static BROADCAST_ENTERED: AtomicUsize = AtomicUsize::new(0);
+    static ON_ACQUIRED: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
     /// Records the receive loop held for a permit so far.
     pub fn entered() -> usize {
@@ -1204,6 +1210,25 @@ pub mod permit_wait_probe {
     /// Records the broadcast loop held for its slot so far.
     pub fn broadcast_entered() -> usize {
         BROADCAST_ENTERED.load(Ordering::SeqCst)
+    }
+
+    /// Install `hook` to run once, the next time a loop has a permit in
+    /// hand for a record and has not yet read the stop again.
+    pub fn on_acquired(hook: impl FnOnce() + Send + 'static) {
+        *ON_ACQUIRED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Runs the installed hook, if any, and uninstalls it.
+    pub(super) fn acquired() {
+        let hook = ON_ACQUIRED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -5342,6 +5367,8 @@ impl KafkaConsumer {
                                     ShoveError::Connection("semaphore closed".to_string())
                                 })?,
                             };
+                            #[cfg(feature = "test-support")]
+                            permit_wait_probe::acquired();
                             // Read again with the permit in hand, see
                             // `after_wait`. A record left here is tracked and
                             // never completed, so the position stays below it:
@@ -7314,6 +7341,8 @@ impl KafkaConsumer {
                         permit = semaphore.clone().acquire_owned() => permit
                             .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?,
                     };
+                    #[cfg(feature = "test-support")]
+                    permit_wait_probe::acquired();
                     // Read again with the slot in hand, see `after_wait`.
                     if after_wait(&shutdown, None) == AfterWait::Stop {
                         drop(permit);
@@ -9557,10 +9586,14 @@ mod in_place_wait_accounting_tests {
     }
 
     /// A revoke during the registry retry wait of a redelivery ends it as
-    /// `Revoked`: that wait selects on the record's assignment token too.
-    /// The mock has answered the lookup and its one retry once it has been
-    /// asked twice, so the task is in the retry wait, or about to enter it
-    /// from a lookup the token ends the same way. The waiter is uncounted.
+    /// `Revoked` at once: that wait selects on the record's assignment token
+    /// too. The mock has answered the lookup and its one retry once it has
+    /// been asked twice, so the task is in the retry wait, or about to enter
+    /// it from a lookup the token ends the same way. The exit is bounded by
+    /// half the retry delay: a wait that selected on the sleep alone would
+    /// end only when the delay ran out and the next check read the token,
+    /// about a second later, while the revoke arm ends it within
+    /// milliseconds. The waiter is uncounted.
     #[tokio::test]
     async fn a_revoke_during_the_registry_retry_wait_ends_the_redelivery() {
         let (registry, hits) = unavailable_registry().await;
@@ -9631,10 +9664,16 @@ mod in_place_wait_accounting_tests {
         }
         assert_eq!(waiters.load(Ordering::SeqCst), 1);
 
+        let cancelled_at = Instant::now();
         revoked.cancel();
         assert!(
             task.await.expect("redelivery task panicked"),
             "a revoke during the registry retry wait ends the redelivery as Revoked"
+        );
+        let took = cancelled_at.elapsed();
+        assert!(
+            took < REGISTRY_RETRY_DELAY / 2,
+            "the revoke ends the retry wait at once, not when the delay runs out; took {took:?}"
         );
         assert_eq!(waiters.load(Ordering::SeqCst), 0);
         assert!(!shutdown.is_cancelled());

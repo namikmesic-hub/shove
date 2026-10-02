@@ -1211,6 +1211,122 @@ fn order_record(partition: i32, offset: i64) -> Vec<u8> {
     .unwrap()
 }
 
+/// The member ids the broker lists for `group` right now. A coordinator that
+/// is moving or loading answers the probe with an error that means "ask
+/// again"; those are retried within `timeout`, as `wait_for_stable_group`
+/// retries them, and the last one is reported if the deadline passes. Any
+/// other error is a broken probe and fails at once.
+#[cfg(feature = "test-support")]
+async fn group_member_ids(brokers: &str, group: &str, timeout: Duration) -> Vec<String> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+    use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+
+    fn is_transient(code: RDKafkaErrorCode) -> bool {
+        matches!(
+            code,
+            RDKafkaErrorCode::NotCoordinator
+                | RDKafkaErrorCode::CoordinatorNotAvailable
+                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                | RDKafkaErrorCode::OperationTimedOut
+                | RDKafkaErrorCode::BrokerTransportFailure
+        )
+    }
+
+    let probe: BaseConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create group probe");
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last_error = match probe.fetch_group_list(Some(group), Duration::from_secs(10)) {
+            Ok(list) => {
+                return list
+                    .groups()
+                    .iter()
+                    .find(|g| g.name() == group)
+                    .map(|g| g.members().iter().map(|m| m.id().to_string()).collect())
+                    .unwrap_or_default();
+            }
+            Err(KafkaError::GroupListFetch(code)) if is_transient(code) => {
+                KafkaError::GroupListFetch(code)
+            }
+            Err(e) => panic!("failed to fetch group list: {e}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "the coordinator did not list group {group} within {timeout:?}; \
+             last coordinator error: {last_error}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Send the coordinator a LeaveGroup request on `member_id`'s behalf, as an
+/// operator's tooling could. The coordinator drops the member and rebalances
+/// its partitions away while the member itself still believes it holds them,
+/// until its next heartbeat tells it otherwise: a revoke the member did not
+/// ask for, of every partition it holds.
+///
+/// LeaveGroup version 1, hand-framed: a request header (api key 13, version
+/// 1, a correlation id, a client id), then the group id and the member id as
+/// length-prefixed strings. The response is the correlation id, a throttle
+/// time and the error code.
+#[cfg(feature = "test-support")]
+async fn leave_group_on_behalf_of(brokers: &str, group: &str, member_id: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        let len = i16::try_from(s.len()).expect("a short string");
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    const LEAVE_GROUP_API_KEY: i16 = 13;
+    const CORRELATION_ID: i32 = 7;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&LEAVE_GROUP_API_KEY.to_be_bytes());
+    body.extend_from_slice(&1i16.to_be_bytes());
+    body.extend_from_slice(&CORRELATION_ID.to_be_bytes());
+    put_string(&mut body, "shove-test-leave-group");
+    put_string(&mut body, group);
+    put_string(&mut body, member_id);
+    let mut frame = i32::try_from(body.len())
+        .expect("a short frame")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&body);
+
+    let mut stream = tokio::net::TcpStream::connect(brokers)
+        .await
+        .expect("failed to connect to the coordinator");
+    stream
+        .write_all(&frame)
+        .await
+        .expect("failed to send LeaveGroup");
+    let mut size = [0u8; 4];
+    stream
+        .read_exact(&mut size)
+        .await
+        .expect("failed to read the LeaveGroup response size");
+    let size = usize::try_from(i32::from_be_bytes(size)).expect("a positive size");
+    let mut response = vec![0u8; size];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("failed to read the LeaveGroup response");
+    let correlation = i32::from_be_bytes(response[0..4].try_into().unwrap());
+    assert_eq!(
+        correlation, CORRELATION_ID,
+        "the response answers our request"
+    );
+    let error_code = i16::from_be_bytes(response[8..10].try_into().unwrap());
+    assert_eq!(
+        error_code, 0,
+        "the coordinator refused the LeaveGroup with error code {error_code}"
+    );
+}
+
 /// Records the id of every message it is handed.
 #[derive(Clone)]
 struct IdRecorder {
@@ -3929,6 +4045,101 @@ async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behi
     running.await.unwrap().unwrap();
 }
 
+/// A stop that lands in the instant the permit is acquired, after the permit
+/// wait's own poll of the token. The receive loop reads the stop again with
+/// the permit in hand and leaves the record. No order of broker events lands
+/// a stop in that window on cue, so the probe's hook cancels the token the
+/// moment the loop has the permit. Offset 2 runs at a gate holding the sole
+/// permit; offset 3 was fetched behind it and waits in the loop's hand; the
+/// gate opens, offset 2 acks and frees the permit, the loop takes it and the
+/// hook fires. The handler never sees offset 3, the position is 3, and a
+/// restart delivers `[3]`. Without the check with the permit in hand, offset
+/// 3 reaches a handler during the drain.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_stop_in_the_instant_the_permit_is_acquired_leaves_the_record_in_hand_unread() {
+    use shove::kafka::permit_wait_probe;
+
+    const TOPIC: &str = "kafka-external-stop-order";
+    const GROUP: &str = "kafka-external-stop-order-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let gate = Arc::new(Gate::default());
+    let handler = OrderRecorder::new("a", log.clone()).gated(0, 2, gate.clone());
+    let shutdown = CancellationToken::new();
+    let running = spawn_in_place_member::<ExternalStopOrderTopic, _>(
+        tb.client(),
+        handler.clone(),
+        shutdown.clone(),
+        1,
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 0)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 1)).await;
+    poll_until("offsets 0 and 1 are committed", REBALANCE_TIMEOUT, || {
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(2)
+    })
+    .await;
+    let entered_before = permit_wait_probe::entered();
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 2)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 3)).await;
+    poll_until(
+        "offset 3 is in the loop's hand, waiting for the permit offset 2 holds",
+        REBALANCE_TIMEOUT,
+        || permit_wait_probe::entered() >= entered_before + 2,
+    )
+    .await;
+
+    // The stop lands the moment the loop has the permit offset 2 frees.
+    let stop = shutdown.clone();
+    permit_wait_probe::on_acquired(move || stop.cancel());
+    gate.open();
+    tokio::time::timeout(REBALANCE_TIMEOUT, running)
+        .await
+        .expect("the consumer did not end: the stop never landed")
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
+
+    let seen: Vec<i64> = deliveries(&log).iter().map(|d| d.offset).collect();
+    assert_eq!(
+        seen,
+        vec![0, 1, 2],
+        "the handler never saw offset 3, in the loop's hand when the stop landed"
+    );
+    assert_eq!(
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0),
+        Some(3),
+        "offset 2 was acked and committed; offset 3 stays uncommitted"
+    );
+
+    let restarted_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shutdown = CancellationToken::new();
+    let running = spawn_in_place_member::<ExternalStopOrderTopic, _>(
+        tb.client(),
+        OrderRecorder::new("restart", restarted_log.clone()),
+        shutdown.clone(),
+        1,
+    );
+    poll_until("the restart handled offset 3", REBALANCE_TIMEOUT, || {
+        !deliveries(&restarted_log).is_empty()
+    })
+    .await;
+    let seen: Vec<i64> = deliveries(&restarted_log)
+        .iter()
+        .map(|d| d.offset)
+        .collect();
+    assert_eq!(
+        seen,
+        vec![3],
+        "the restart delivers the record left in hand"
+    );
+    shutdown.cancel();
+    running.await.unwrap().unwrap();
+}
+
 /// Two partitions with their head record each, for the two rebalance
 /// tests. The heads alone are on the topic when A joins, so the record
 /// behind the first head A dispatches is the other partition's head and not
@@ -4215,6 +4426,97 @@ async fn a_cooperative_revoke_with_one_permit_reaches_the_in_place_wait_through_
     running_a.await.unwrap().unwrap();
     shutdown_b.cancel();
     running_b.await.unwrap().unwrap();
+}
+
+/// A revoke the member did not ask for, of its only partition, while the
+/// head waits in place holding the sole permit and the next record waits in
+/// the loop's hand. A LeaveGroup request sent on the member's behalf makes
+/// the coordinator take the partition away, and the member's next heartbeat
+/// revokes it. The wait must end at the revoke, and the record in hand must
+/// be left behind once the freed permit is in hand: the member rejoins, is
+/// handed the head again from the committed offset as a fresh delivery, and
+/// only then the next record. Both records are on one partition, so the
+/// record in hand is revoked whatever a cooperative assignor would choose,
+/// which pins that check. A wait the revoke did not end would hold the
+/// permit for 30 s and then hand the head back as a redelivery; a record in
+/// hand that was dispatched would reach the handler ahead of the fresh head.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_forced_revoke_ends_the_wait_and_leaves_the_record_in_hand_to_the_fresh_assignment() {
+    use shove::kafka::permit_wait_probe;
+
+    const TOPIC: &str = "kafka-external-stop-order";
+    const GROUP: &str = "kafka-external-stop-order-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 0)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 1)).await;
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The head runs at a gate until offset 1 is in the loop's hand, then
+    // defers into a 30 s wait only the revoke can end.
+    let gate = Arc::new(Gate::default());
+    let a = OrderRecorder::new("a", log.clone())
+        .holding(0, 0)
+        .gated(0, 0, gate.clone());
+    let shutdown = CancellationToken::new();
+    let running = spawn_in_place_member::<ExternalStopOrderTopic, _>(
+        tb.client(),
+        a.clone(),
+        shutdown.clone(),
+        1,
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+    poll_until(
+        "the head runs at the gate and offset 1 waits in the loop's hand for the permit",
+        REBALANCE_TIMEOUT,
+        || permit_wait_probe::entered() >= 2,
+    )
+    .await;
+    gate.open();
+    poll_until(
+        "the head is deferred and waits in place",
+        REBALANCE_TIMEOUT,
+        || a.defers() >= 1,
+    )
+    .await;
+    let members = group_member_ids(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+    assert_eq!(members.len(), 1, "one member: {members:?}");
+
+    // The fresh assignment acks the head: the hold is off from here, and
+    // the old wait can end only at the revoke.
+    a.release();
+    leave_group_on_behalf_of(tb.brokers(), GROUP, &members[0]).await;
+
+    poll_until(
+        "the member rejoined, was handed the head again and then the record that waited in hand",
+        REBALANCE_TIMEOUT,
+        || deliveries(&log).iter().any(|d| d.offset == 1),
+    )
+    .await;
+    let log = deliveries(&log);
+    let offsets: Vec<i64> = log.iter().map(|d| d.offset).collect();
+    assert_eq!(
+        offsets,
+        vec![0, 0, 1],
+        "the head once under each assignment, then the record that waited in hand: {log:#?}"
+    );
+    assert!(
+        log.iter().all(|d| !d.redelivered),
+        "the old wait handed the head back to no handler: {log:#?}"
+    );
+    poll_until(
+        "both records are committed under the fresh assignment",
+        REBALANCE_TIMEOUT,
+        || committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(2),
+    )
+    .await;
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
 }
 
 /// A missing external topic is a startup error, not a silent auto-create:
