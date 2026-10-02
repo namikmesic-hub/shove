@@ -70,6 +70,10 @@ pub enum RetryStrategy {
     /// waits inside the handler's task, holding its prefetch slot, with the
     /// count kept in memory; NATS naks with the delay and reads the count from
     /// the delivery info. Implied by an external topology.
+    ///
+    /// On Kafka a stop during the wait completes nothing and hands no record
+    /// fetched behind the waiting one to a handler; both are redelivered on
+    /// restart, in order.
     InPlace,
 }
 
