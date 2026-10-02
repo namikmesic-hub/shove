@@ -88,23 +88,33 @@ pub enum ShoveError {
     /// its result, because a process that gates its restart on the exit
     /// code cannot read a log line.
     ///
-    /// `#[non_exhaustive]`: match with `..`, so a field can be added later.
-    #[error(
-        "final offset commit on '{topic}' for {} was not confirmed: {kind}",
-        format_offsets(offsets)
-    )]
-    #[non_exhaustive]
-    Commit {
-        /// The topic the member consumed.
-        topic: String,
-        /// The offsets the consumer tried to commit, per partition: one
-        /// `(partition, offset)` pair per partition the member held, the
-        /// offset exclusive as Kafka commits it. Never empty: a member with
-        /// nothing to commit has no commit to fail.
-        offsets: Vec<(i32, i64)>,
-        /// Rejected by the coordinator, or unknown after the deadline.
-        kind: CommitFailure,
-    },
+    /// Boxed to keep `ShoveError` small, like [`PartialBatch`](Self::PartialBatch).
+    #[error(transparent)]
+    Commit(Box<FailedCommit>),
+}
+
+/// A final offset commit that was not confirmed: what the commit carried
+/// and why it was not confirmed. The payload of [`ShoveError::Commit`].
+///
+/// `#[non_exhaustive]`: read the fields, and match with `..`, so a field
+/// can be added later.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "final offset commit on '{topic}' for {} was not confirmed: {kind}",
+    format_offsets(offsets)
+)]
+#[non_exhaustive]
+pub struct FailedCommit {
+    /// The topic the member consumed.
+    pub topic: String,
+    /// The offsets the consumer tried to commit, per partition: one
+    /// `(partition, offset)` pair per partition the member held, the
+    /// offset exclusive as Kafka commits it. Never empty: a member with
+    /// nothing to commit has no commit to fail.
+    pub offsets: Vec<(i32, i64)>,
+    /// How the commit failed: the error it returned, no answer within the
+    /// deadline, or no thread to run it on.
+    pub kind: CommitFailure,
 }
 
 /// Why the final offset commit of a stopping consumer was not confirmed;
@@ -114,14 +124,15 @@ pub enum ShoveError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommitFailure {
-    /// The coordinator answered the commit with an error, carried as text.
-    /// This commit did not land; the broker keeps the last position it
-    /// accepted.
+    /// The commit returned an error, carried as text: the coordinator's
+    /// answer, or a librdkafka local error, such as a timeout of its own or
+    /// an unknown partition. This commit did not land; the broker keeps the
+    /// last position it accepted.
     ///
-    /// The text is librdkafka's rendering of the broker's answer: the error
-    /// code and its description, and nothing else. It never carries a
-    /// record's payload, key or headers, nor a personal or account
-    /// identifier taken from one, so it is safe to log and to return as is.
+    /// The text is librdkafka's rendering of that error: the error code and
+    /// its description, and nothing else. It never carries a record's
+    /// payload, key or headers, nor a personal or account identifier taken
+    /// from one, so it is safe to log and to return as is.
     #[error("rejected: {0}")]
     Rejected(String),
     /// The commit had no answer within the time it carries: the shutdown
@@ -136,7 +147,7 @@ pub enum CommitFailure {
     NoThread,
 }
 
-/// `[p0@o0, p1@o1]`, the `offsets` of [`ShoveError::Commit`] in its message.
+/// `[p0@o0, p1@o1]`, the `offsets` of [`FailedCommit`] in its message.
 fn format_offsets(offsets: &[(i32, i64)]) -> String {
     let pairs: Vec<String> = offsets
         .iter()
@@ -218,11 +229,22 @@ mod tests {
     }
 
     fn commit_error() -> ShoveError {
-        ShoveError::Commit {
+        ShoveError::Commit(Box::new(FailedCommit {
             topic: "orders".into(),
             offsets: vec![(0, 8), (3, 12)],
             kind: CommitFailure::Rejected("Broker: Group authorization failed".into()),
-        }
+        }))
+    }
+
+    /// The payload is boxed so that the error every fallible call returns
+    /// by value stays the size it was before the variant existed.
+    #[test]
+    fn the_commit_payload_is_boxed_so_the_error_stays_small() {
+        assert!(
+            std::mem::size_of::<ShoveError>() <= 40,
+            "ShoveError is {} bytes; box a large payload",
+            std::mem::size_of::<ShoveError>()
+        );
     }
 
     #[test]
@@ -232,11 +254,11 @@ mod tests {
             "final offset commit on 'orders' for [0@8, 3@12] was not confirmed: \
              rejected: Broker: Group authorization failed"
         );
-        let deadline = ShoveError::Commit {
+        let deadline = ShoveError::Commit(Box::new(FailedCommit {
             topic: "orders".into(),
             offsets: vec![(0, 8)],
             kind: CommitFailure::Deadline(Duration::from_secs(20)),
-        };
+        }));
         assert_eq!(
             deadline.to_string(),
             "final offset commit on 'orders' for [0@8] was not confirmed: no answer after \

@@ -16,8 +16,9 @@
 //! infra would, and the record is produced with a raw rdkafka producer so it
 //! carries a key beside its payload.
 //!
-//! `test-support` gates the deadline seam this file reads; both Kafka
-//! coverage rows enable it, so the suite runs in each.
+//! `test-support` gates the deadline seam this file reads. The Kafka
+//! coverage row enables it and runs this suite; the schema-registry row
+//! compiles the binary too, but its test filter does not select it.
 
 #![cfg(all(feature = "kafka", feature = "test-support"))]
 
@@ -302,18 +303,16 @@ async fn stop_a_group_after_one_record(
 /// The commit error `run` returned, checked to name the topic and the
 /// acknowledged record's exclusive position on the only partition.
 fn the_commit_error(result: &Result<(), ShoveError>) -> &CommitFailure {
-    let Err(ShoveError::Commit {
-        topic,
-        offsets,
-        kind,
-        ..
-    }) = result
-    else {
+    let Err(ShoveError::Commit(failed)) = result else {
         panic!("run ends with ShoveError::Commit: {result:?}");
     };
-    assert_eq!(topic, TOPIC);
-    assert_eq!(offsets, &[(0, 1)], "the acknowledged record's position");
-    kind
+    assert_eq!(failed.topic, TOPIC);
+    assert_eq!(
+        failed.offsets,
+        [(0, 1)],
+        "the acknowledged record's position"
+    );
+    &failed.kind
 }
 
 /// A rejected OffsetCommit at shutdown ends the consumer with `Commit` of

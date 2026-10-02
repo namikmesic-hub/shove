@@ -35,7 +35,7 @@ use crate::broadcast::BroadcastStart;
 use crate::consumer::RetryStrategy;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
-use crate::error::{CommitFailure, Result};
+use crate::error::{CommitFailure, FailedCommit, Result};
 use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
@@ -602,21 +602,32 @@ impl OffsetTracker {
         let mut discards = Vec::new();
         for (&partition, tracker) in &mut self.partitions {
             let (commit_offset, covered) = tracker.drain_all();
-            discards.extend(covered);
-            if let Err(e) = tpl
+            match tpl
                 .get_or_insert_with(TopicPartitionList::new)
                 .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
             {
-                // A partition left out here is a position the final commit
-                // never carries, which is what that commit's result exists
-                // to surface; say so instead of dropping it in silence.
-                tracing::error!(
-                    queue = %self.topic,
-                    partition,
-                    offset = commit_offset,
-                    error = %e,
-                    "could not add the partition to the final commit; its position is not committed"
-                );
+                Ok(()) => discards.extend(covered),
+                Err(e) => {
+                    // A partition left out here is a position the final
+                    // commit never carries, which is what that commit's
+                    // result exists to surface; say so instead of dropping
+                    // it in silence. The entry stays in the list with an
+                    // invalid offset, which librdkafka leaves out of the
+                    // request. A commit that does not carry the position
+                    // cannot confirm what it would have retired, so those
+                    // discards are settled as survived here instead of
+                    // riding the commit.
+                    tracing::error!(
+                        queue = %self.topic,
+                        partition,
+                        offset = commit_offset,
+                        error = %e,
+                        "could not add the partition to the final commit; its position is not committed"
+                    );
+                    for discard in covered {
+                        discard.survived();
+                    }
+                }
             }
         }
         tpl.map(|tpl| (tpl, discards))
@@ -4667,11 +4678,11 @@ impl KafkaConsumer {
                                          from the last position the broker accepted, and the consumer \
                                          ends with ShoveError::Commit"
                                     );
-                                    return Err(ShoveError::Commit {
+                                    return Err(ShoveError::Commit(Box::new(FailedCommit {
                                         topic: queue.to_string(),
                                         offsets,
                                         kind,
-                                    });
+                                    })));
                                 }
                             }
                         }
@@ -7757,6 +7768,38 @@ mod offset_tracker_tests {
         );
         assert_eq!(committed_offset(&tpl, 1), Some(3));
         assert!(discards.is_empty());
+    }
+
+    /// The one arm of `drain_all` a position the tracker computes cannot
+    /// reach: `add_partition_offset` refuses an offset below zero, so a
+    /// tracker seeded below zero drives it. The partition's position is not
+    /// carried, and the discards that position would have retired are
+    /// settled as survived instead of riding a commit that could confirm
+    /// them without having carried them. The other partition rides as usual.
+    #[test]
+    fn a_partition_the_commit_cannot_carry_keeps_its_discards_out_of_the_commit() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, -2);
+        tracker.track_received(0, -1);
+        tracker.mark_complete(terminal(-2));
+        tracker.track_received(1, 4);
+        tracker.mark_complete(Completion::plain(1, 4));
+
+        let (tpl, discards) = tracker.drain_all().expect("two partitions");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            None,
+            "a position below zero is not carried"
+        );
+        assert_eq!(
+            committed_offset(&tpl, 1),
+            Some(5),
+            "the other partition rides"
+        );
+        assert!(
+            discards.is_empty(),
+            "the discard of the partition left out was settled, not handed to the commit"
+        );
     }
 
     /// A member that never held a partition has nothing to commit, so the

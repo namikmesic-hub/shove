@@ -4787,11 +4787,15 @@ async fn child_consumes_then_shuts_down_on_stdin() -> Result<(), String> {
     // gives up at the deadline and ends with the typed error instead of a
     // clean exit. Printed for the parent, which cannot see the value itself.
     match &result {
-        Err(ShoveError::Commit {
-            kind: CommitFailure::Deadline(deadline),
-            offsets,
-            ..
-        }) => println!("run returned Commit Deadline({deadline:?}) for {offsets:?}"),
+        Err(ShoveError::Commit(failed)) => match &failed.kind {
+            CommitFailure::Deadline(deadline) => {
+                println!(
+                    "run returned Commit Deadline({deadline:?}) for {:?}",
+                    failed.offsets
+                )
+            }
+            other => println!("run returned Commit {other:?} for {:?}", failed.offsets),
+        },
         other => println!("run returned {other:?}"),
     }
     std::io::stdout().flush().unwrap();
@@ -6466,18 +6470,17 @@ async fn a_leaked_consumer_keeps_its_group_member_past_the_session_timeout() {
     // Nothing committed, and the member says so instead of ending clean: the
     // acknowledged record's exclusive position is in the error, with the
     // `NoThread` kind.
-    let Err(ShoveError::Commit {
-        kind: CommitFailure::NoThread,
-        offsets,
-        topic,
-        ..
-    }) = &result
-    else {
+    let Err(ShoveError::Commit(failed)) = &result else {
         panic!(
             "run must end with ShoveError::Commit of the NoThread kind when no thread can be \
              spawned for the final commit: {result:?}"
         );
     };
+    assert!(
+        matches!(failed.kind, CommitFailure::NoThread),
+        "the NoThread kind: {failed:?}"
+    );
+    let (topic, offsets) = (&failed.topic, &failed.offsets);
     assert_eq!(topic, "kafka-leaked-close");
     assert_eq!(
         offsets.len(),

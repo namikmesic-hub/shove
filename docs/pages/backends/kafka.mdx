@@ -459,7 +459,7 @@ The thread finishes on its own and never holds the runtime or the process, so a 
 
 A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
 The error names the topic, the position the commit carried per partition, and a `CommitFailure`.
-`Rejected` carries the broker's answer.
+`Rejected` carries the error the commit returned: the broker's answer, or a librdkafka local error.
 `Deadline` means nothing answered within the time it carries, normally the 20 s deadline.
 `NoThread` means no thread could be spawned for the commit.
 `Rejected` and `NoThread` say this commit did not land.
