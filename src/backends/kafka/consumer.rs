@@ -1922,7 +1922,10 @@ where
         let message = {
             let _waiting = InPlaceWait::begin(waiters);
             tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
+                // The stop and the revoke are read before the sleep: a
+                // sleep that won a tie cost one more pass before the next
+                // check read the token.
+                biased;
                 _ = shutdown.cancelled() => {
                     tracing::debug!(
                         queue = topic,
@@ -1940,6 +1943,7 @@ where
                     );
                     return InPlaceEnd::Revoked;
                 }
+                _ = tokio::time::sleep(delay) => {}
             }
             if increment {
                 attempts = attempts.saturating_add(1);
@@ -1985,9 +1989,10 @@ where
                             metrics::FailReason::SchemaUnavailable,
                         );
                         tokio::select! {
-                            _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
+                            biased;
                             _ = shutdown.cancelled() => return InPlaceEnd::Cancelled,
                             _ = revoked.cancelled() => return InPlaceEnd::Revoked,
+                            _ = tokio::time::sleep(REGISTRY_RETRY_DELAY) => {}
                         }
                     }
                     #[cfg(feature = "kafka-schema-registry")]
@@ -7255,7 +7260,9 @@ impl KafkaConsumer {
                                 BroadcastAction::Redeliver => {}
                             }
                             tokio::select! {
-                                _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
+                                // The stop is read before the sleep, so a
+                                // tie never costs a redelivery.
+                                biased;
                                 // A deferral outliving shutdown would hold the
                                 // drain open for the length of the delay to
                                 // redeliver a message the loop is about to stop
@@ -7268,6 +7275,7 @@ impl KafkaConsumer {
                                     );
                                     break;
                                 }
+                                _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
                             }
                             // Loops only through the registry wait arm, which
                             // the `kafka-schema-registry` feature adds.

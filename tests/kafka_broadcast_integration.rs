@@ -260,11 +260,42 @@ impl MessageHandler<DeferTopic> for DeferOnce {
     }
 }
 
-/// Records the key of every call. The first call defers and every later one
-/// acks.
+/// A gate a handler waits at until the test opens it, so a test holds a
+/// handler in its running state for exactly as long as the scenario needs,
+/// and never for a fixed time.
+#[derive(Default)]
+struct Gate {
+    open: std::sync::atomic::AtomicBool,
+    opened: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn open(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.opened.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            // Register before the check: `notify_waiters` stores no permit,
+            // so an open landing between an unregistered check and the await
+            // would otherwise be lost.
+            let mut opened = std::pin::pin!(self.opened.notified());
+            opened.as_mut().enable();
+            if self.open.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+/// Records the key of every call. The first call waits at the gate and then
+/// defers; every later one acks.
 #[derive(Clone, Default)]
 struct DeferFirst {
     calls: Arc<Mutex<Vec<String>>>,
+    gate: Arc<Gate>,
 }
 
 impl DeferFirst {
@@ -276,9 +307,13 @@ impl DeferFirst {
 impl MessageHandler<StopTopic> for DeferFirst {
     type Context = ();
     async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
-        let mut calls = self.calls.lock().await;
-        calls.push(msg.key);
-        if calls.len() == 1 {
+        let first = {
+            let mut calls = self.calls.lock().await;
+            calls.push(msg.key);
+            calls.len() == 1
+        };
+        if first {
+            self.gate.wait().await;
             Outcome::Defer
         } else {
             Outcome::Ack
@@ -1492,12 +1527,13 @@ async fn defer_redelivers_in_place_before_later_records() {
 }
 
 /// A stop during a deferred wait hands nothing over behind it. Two records
-/// sit on one partition. The first call defers, so that record waits in
-/// place holding the subscription's single slot; the second record was read
-/// meanwhile and waits in the loop's hand for that slot, which the probe on
-/// that wait shows before the stop lands. The stop cancels the wait, which
-/// frees the slot in the same instant; the loop must read the stop first and
-/// drop the second record, so the handler saw exactly one call. At `7d392b6`
+/// sit on one partition. The first call holds the subscription's single
+/// slot at a gate while the second record is read and enters the slot wait
+/// behind it, which the probe on that wait shows. The stop lands then, and
+/// the gate opens: the first call defers into a wait the stop ends at once,
+/// which frees the slot in the same instant. The loop must read the stop
+/// first and drop the second record, so the handler saw exactly one call.
+/// The gate keeps the stop off the one-second delay's clock. At `7d392b6`
 /// the slot wait was a bare `acquire_owned().await`, so the second record
 /// reached the handler after the stop.
 #[tokio::test]
@@ -1536,16 +1572,17 @@ async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(handler.calls().await, vec!["1".to_string()]);
-    // "1" now waits out its one-second deferral holding the slot; "2" is in
-    // the loop's hand behind it once the loop has entered the slot wait.
+    // "1" runs at the gate holding the slot; "2" is in the loop's hand
+    // behind it once the loop has entered the slot wait.
     while permit_wait_probe::broadcast_entered() == 0 {
         assert!(
             Instant::now() < deadline,
-            "record 2 never reached the slot wait behind the deferred record"
+            "record 2 never reached the slot wait behind the first record"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     sub.cancellation_token().cancel();
+    handler.gate.open();
     let outcome = sub
         .run_until_timeout(std::future::pending(), Duration::from_secs(10))
         .await;
