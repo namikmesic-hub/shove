@@ -73,7 +73,9 @@ pub enum RetryStrategy {
     ///
     /// On Kafka a stop during the wait completes nothing and hands no record
     /// fetched behind the waiting one to a handler; both are redelivered on
-    /// restart, in order.
+    /// restart, in order. A revoke of the partition ends the wait with
+    /// nothing completed, and the partition's next owner is handed the record
+    /// from the committed offset.
     InPlace,
 }
 
