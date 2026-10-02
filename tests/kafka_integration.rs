@@ -14,6 +14,8 @@ use shove::SequencedTopic as _;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
+#[cfg(feature = "test-support")]
+use shove::error::Result as ShoveResult;
 use shove::handler::MessageHandler;
 use shove::kafka::{
     KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig,
@@ -22,16 +24,20 @@ use shove::kafka::{
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
-use shove::topic::Topic as _;
+use shove::topic::Topic;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 use shove::{CommitFailure, ShoveError};
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaContainer};
 use tokio::sync::{Mutex, Notify};
+#[cfg(feature = "test-support")]
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -281,6 +287,19 @@ shove::define_topic!(
         .build()
 );
 
+// The in-place order on a stop: a wait long enough that the stop always
+// lands inside it.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    ExternalStopOrderTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-external-stop-order")
+        .external()
+        .hold_queue(Duration::from_secs(30))
+        .allow_message_loss()
+        .build()
+);
+
 /// A message type that derives only `Deserialize`: no `Clone`, no
 /// `Serialize`. An in-place redelivery must work from the retained bytes,
 /// never from a copy of the value.
@@ -449,6 +468,11 @@ impl TestBroker {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The bound for a wait that spans a group join. The broker paces it in
+/// seconds, and a Docker host running several brokers at once stretches it.
+#[cfg(feature = "test-support")]
+const REBALANCE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// `(partition, offset, timestamp_ms)` for one delivery.
 type Coordinates = (Option<i32>, Option<i64>, Option<i64>);
@@ -952,6 +976,194 @@ macro_rules! always_for {
 }
 
 always_for!(ExternalRetryTopic, ExternalShutdownTopic);
+
+/// One delivery as an [`OrderRecorder`] saw it: which member handled it, the
+/// record's coordinates, and whether it was an in-place redelivery.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Delivery {
+    member: &'static str,
+    partition: i32,
+    offset: i64,
+    redelivered: bool,
+}
+
+/// A gate a handler waits at until the test opens it, so a test holds a
+/// handler in its running state for exactly as long as the scenario needs,
+/// and never for a fixed time.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct Gate {
+    open: AtomicBool,
+    opened: Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl Gate {
+    fn open(&self) {
+        self.open.store(true, Ordering::SeqCst);
+        self.opened.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            // Register before the check: `notify_waiters` stores no permit,
+            // so an open landing between an unregistered check and the await
+            // would otherwise be lost.
+            let mut opened = std::pin::pin!(self.opened.notified());
+            opened.as_mut().enable();
+            if self.open.load(Ordering::SeqCst) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+/// The gates an [`OrderRecorder`] waits at, by the record's coordinates.
+#[cfg(feature = "test-support")]
+type Gates = Arc<std::sync::Mutex<HashMap<(i32, i64), Arc<Gate>>>>;
+
+/// Records every delivery into a log shared by every member of a group, in
+/// arrival order. The records it is told to hold are deferred for as long as
+/// it holds them; everything else is acked. A record can be gated, so the
+/// handler runs on it until the test opens the gate. The log is what the
+/// in-place order tests assert on, across members and across a stop.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct OrderRecorder {
+    member: &'static str,
+    log: Arc<std::sync::Mutex<Vec<Delivery>>>,
+    /// `(partition, offset)` pairs this member defers while they are listed.
+    hold: Arc<std::sync::Mutex<std::collections::HashSet<(i32, i64)>>>,
+    /// The gates records wait at before the handler returns.
+    gates: Gates,
+    /// How many `Defer` outcomes this member has returned.
+    defers: Arc<AtomicU32>,
+}
+
+#[cfg(feature = "test-support")]
+impl OrderRecorder {
+    fn new(member: &'static str, log: Arc<std::sync::Mutex<Vec<Delivery>>>) -> Self {
+        Self {
+            member,
+            log,
+            hold: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            defers: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn holding(self, partition: i32, offset: i64) -> Self {
+        self.hold.lock().unwrap().insert((partition, offset));
+        self
+    }
+
+    /// The handler waits at `gate` on every delivery of `(partition,
+    /// offset)` before it returns.
+    fn gated(self, partition: i32, offset: i64, gate: Arc<Gate>) -> Self {
+        self.gates.lock().unwrap().insert((partition, offset), gate);
+        self
+    }
+
+    fn defers(&self) -> u32 {
+        self.defers.load(Ordering::SeqCst)
+    }
+
+    async fn record(&self, meta: &MessageMetadata) -> Outcome {
+        let partition = meta.partition.expect("Kafka reports the partition");
+        let offset = meta.offset.expect("Kafka reports the offset");
+        self.log.lock().unwrap().push(Delivery {
+            member: self.member,
+            partition,
+            offset,
+            redelivered: meta.redelivered,
+        });
+        let gate = self
+            .gates
+            .lock()
+            .unwrap()
+            .get(&(partition, offset))
+            .cloned();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
+        let held = self.hold.lock().unwrap().contains(&(partition, offset));
+        if held {
+            self.defers.fetch_add(1, Ordering::SeqCst);
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+macro_rules! order_recorder_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for OrderRecorder {
+            type Context = ();
+            async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
+                self.record(&meta).await
+            }
+        }
+    )+};
+}
+
+#[cfg(feature = "test-support")]
+order_recorder_for!(ExternalStopOrderTopic);
+
+/// A snapshot of an [`OrderRecorder`] log.
+#[cfg(feature = "test-support")]
+fn deliveries(log: &std::sync::Mutex<Vec<Delivery>>) -> Vec<Delivery> {
+    log.lock().unwrap().clone()
+}
+
+/// Poll `condition` every 50 ms until it holds, and panic with `what` once
+/// `timeout` has passed without it.
+#[cfg(feature = "test-support")]
+async fn poll_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {timeout:?} waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Run one member of the group under the in-place retry strategy with
+/// `prefetch` permits, both set explicitly: the group defaults must not be
+/// what a test relies on.
+#[cfg(feature = "test-support")]
+fn spawn_in_place_member<T, H>(
+    client: KafkaClient,
+    handler: H,
+    shutdown: CancellationToken,
+    prefetch: u16,
+) -> JoinHandle<ShoveResult<()>>
+where
+    T: Topic,
+    H: MessageHandler<T, Context = ()>,
+{
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_shutdown(shutdown)
+        .with_retry_strategy(RetryStrategy::InPlace)
+        .with_prefetch_count(prefetch);
+    let consumer = KafkaConsumer::new(client);
+    tokio::spawn(async move { consumer.run::<T, H>(handler, (), options).await })
+}
+
+/// A JSON `SimpleMessage` whose id names the record's coordinates.
+#[cfg(feature = "test-support")]
+fn order_record(partition: i32, offset: i64) -> Vec<u8> {
+    serde_json::to_vec(&SimpleMessage {
+        id: format!("p{partition}-{offset}"),
+        content: String::new(),
+    })
+    .unwrap()
+}
 
 /// Records the id of every message it is handed.
 #[derive(Clone)]
@@ -3551,6 +3763,124 @@ async fn external_topic_queued_record_keeps_the_member_when_a_running_handler_st
     token.cancel();
     assert!(running.await.unwrap().is_clean());
     broker.close().await;
+}
+
+/// The in-place order on a stop, with one permit. Offset 2 is deferred and
+/// waits in place holding the permit; offset 3 was fetched behind it and
+/// waits in the receive loop's hand for that permit; the member is stopped.
+/// The cancelled wait frees the permit in the same instant the stop fires.
+/// The loop must read the stop first and drop offset 3: the handler never
+/// sees it, the position stays at offset 2, and a restart delivers `[2, 3]`.
+///
+/// Deterministic through the `biased` selects. The stop sets the token's
+/// state before it wakes anyone, and the waiting task frees its permit only
+/// after it has seen that state. So whichever of the task and the loop runs
+/// first, the loop's next poll of its permit wait finds the token cancelled
+/// and reads it before the permit; and a stop that lands between those two
+/// polls is caught by the check the loop makes once the permit is in hand.
+/// An unbiased pick could take the permit first and hand offset 3 to a
+/// handler during the drain, the behaviour at `7d392b6`.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_stop_during_an_in_place_wait_never_hands_over_the_record_fetched_behind_it() {
+    use shove::kafka::permit_wait_probe;
+
+    const TOPIC: &str = "kafka-external-stop-order";
+    const GROUP: &str = "kafka-external-stop-order-consumer";
+    let tb = TestBroker::start().await;
+    provision_topic(tb.brokers(), TOPIC, 1).await;
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Offset 2 waits at a gate before it defers, so offset 3, published
+    // right behind it, is in the loop's hand waiting for the permit by the
+    // time the in-place wait begins.
+    let gate = Arc::new(Gate::default());
+    let handler = OrderRecorder::new("a", log.clone())
+        .holding(0, 2)
+        .gated(0, 2, gate.clone());
+    let shutdown = CancellationToken::new();
+    let running = spawn_in_place_member::<ExternalStopOrderTopic, _>(
+        tb.client(),
+        handler.clone(),
+        shutdown.clone(),
+        1,
+    );
+    wait_for_stable_group(tb.brokers(), GROUP, REBALANCE_TIMEOUT).await;
+
+    // Offsets 0 and 1 are acked and committed first, so offset 2 is
+    // dispatched the instant it arrives and offset 3 lands behind it.
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 0)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 1)).await;
+    poll_until("offsets 0 and 1 are committed", REBALANCE_TIMEOUT, || {
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0) == Some(2)
+    })
+    .await;
+    // Every record the loop takes without a spare permit passes through the
+    // permit wait, offset 2 included, which is handed the free permit at
+    // once: the second entry from here is offset 3, held for the permit
+    // offset 2 holds.
+    let entered_before = permit_wait_probe::entered();
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 2)).await;
+    publish_raw_to(tb.brokers(), TOPIC, 0, &order_record(0, 3)).await;
+    poll_until(
+        "offset 3 is in the loop's hand, waiting for the permit offset 2 holds",
+        REBALANCE_TIMEOUT,
+        || permit_wait_probe::entered() >= entered_before + 2,
+    )
+    .await;
+    gate.open();
+    poll_until(
+        "offset 2 is deferred and waits in place",
+        REBALANCE_TIMEOUT,
+        || handler.defers() >= 1,
+    )
+    .await;
+
+    shutdown.cancel();
+    running
+        .await
+        .expect("consumer task panicked")
+        .expect("the consumer ends cleanly on shutdown");
+
+    let seen: Vec<i64> = deliveries(&log).iter().map(|d| d.offset).collect();
+    assert_eq!(
+        seen,
+        vec![0, 1, 2],
+        "the handler never saw offset 3 while offset 2 waited"
+    );
+    assert_eq!(
+        committed_offset(tb.brokers(), GROUP, TOPIC, 0),
+        Some(2),
+        "the position stays at the waiting record"
+    );
+
+    // A fresh member of the same group is handed the waiting record first
+    // and the record fetched behind it second.
+    let restarted_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shutdown = CancellationToken::new();
+    let running = spawn_in_place_member::<ExternalStopOrderTopic, _>(
+        tb.client(),
+        OrderRecorder::new("restart", restarted_log.clone()),
+        shutdown.clone(),
+        1,
+    );
+    poll_until(
+        "the restart handled offsets 2 and 3",
+        REBALANCE_TIMEOUT,
+        || deliveries(&restarted_log).len() >= 2,
+    )
+    .await;
+    let seen: Vec<i64> = deliveries(&restarted_log)
+        .iter()
+        .map(|d| d.offset)
+        .collect();
+    assert_eq!(
+        seen,
+        vec![2, 3],
+        "the restart delivers the waiting record, then the one behind it"
+    );
+    shutdown.cancel();
+    running.await.unwrap().unwrap();
 }
 
 /// A missing external topic is a startup error, not a silent auto-create:

@@ -1069,6 +1069,25 @@ pub mod put_back_probe {
     }
 }
 
+/// Test-only counter (see the `test-support` feature) on the entries into
+/// `acquire_permit_while_polling`: how many records the receive loop has held
+/// while it waited for a prefetch permit, the ones handed a free permit at
+/// once included. A test that must have a record in that wait before it goes
+/// on, as the in-place stop test does, reads it instead of sleeping. nextest
+/// runs each test in its own process, so it starts at zero.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod permit_wait_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static ENTERED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Records held for a permit so far.
+    pub fn entered() -> usize {
+        ENTERED.load(Ordering::SeqCst)
+    }
+}
+
 /// Runs a decode until it answers or `shutdown` fires, whichever comes
 /// first. `None` means shutdown fired.
 ///
@@ -4122,10 +4141,12 @@ async fn handler_fault(rx: Option<&mut mpsc::Receiver<ShoveError>>) -> ShoveErro
 /// yields meanwhile comes from a partition that is not paused; it is put back
 /// (see [`put_back`]) and the assignment is paused, so it arrives again, in
 /// order, once a permit frees and the loop resumes. `Ok(None)` means shutdown
-/// fired first. A fault a handler task reports over `fault_rx` meanwhile ends
-/// the wait with that error, for the reason `RegistryStall::wait` gives: the
-/// loop's fault arm is not polled while this wait runs, and a permit may
-/// never free if the holder is the task that faulted.
+/// fired first: it is read before the permit, and the caller reads it once
+/// more with the permit in hand, see the receive arm. A fault a handler task
+/// reports over `fault_rx` meanwhile ends the wait with that error, for the
+/// reason `RegistryStall::wait` gives: the loop's fault arm is not polled
+/// while this wait runs, and a permit may never free if the holder is the
+/// task that faulted.
 async fn acquire_permit_while_polling(
     semaphore: &Arc<tokio::sync::Semaphore>,
     consumer: &KafkaStreamConsumer,
@@ -4134,15 +4155,20 @@ async fn acquire_permit_while_polling(
     queue: &str,
     paused: &mut bool,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    #[cfg(feature = "test-support")]
+    permit_wait_probe::ENTERED.fetch_add(1, Ordering::SeqCst);
     let fault = handler_fault(fault_rx);
     tokio::pin!(fault);
     loop {
         tokio::select! {
             biased;
-            // The fault is read before the permit: a task that reports one
-            // ends and frees its permit in the same instant, and taking that
-            // permit first would hand the record in hand to a handler on a
-            // consumer that is about to return.
+            // Shutdown and the fault are read before the permit. An in-place
+            // wait that either one ends frees its permit in the same
+            // instant, and taking that permit first would hand the record in
+            // hand to a handler on a consumer that is about to return:
+            // handled ahead of the record that was waiting, and handled
+            // again after the restart.
+            _ = shutdown.cancelled() => return Ok(None),
             e = &mut fault => return Err(e),
             permit = semaphore.clone().acquire_owned() => {
                 let permit = permit.map_err(|_| {
@@ -4150,7 +4176,6 @@ async fn acquire_permit_while_polling(
                 })?;
                 return Ok(Some(permit));
             }
-            _ = shutdown.cancelled() => return Ok(None),
             received = consumer.recv() => {
                 let msg = received.map_err(|e| {
                     tracing::error!(error = %e, queue, "consumer recv error");
@@ -4600,6 +4625,14 @@ impl KafkaConsumer {
                     }
 
                     tokio::select! {
+                        // Read in this order, the stop first. A permit the
+                        // stop itself freed, from a cancelled in-place wait,
+                        // readies the resume arm below in the same instant,
+                        // and an unbiased pick could take it, and on the
+                        // next pass the record behind the waiting one, before
+                        // the stop is seen. A record `recv()` has ready is
+                        // read last for the same reason.
+                        biased;
                         _ = shutdown.cancelled() => {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             // A spare permit would otherwise deadlock the drain below.
@@ -5048,6 +5081,25 @@ impl KafkaConsumer {
                                     ShoveError::Connection("semaphore closed".to_string())
                                 })?,
                             };
+                            // Read again with the permit in hand. The permit
+                            // wait reads the stop before the permit, but a
+                            // stop from another thread can land between those
+                            // two polls, and the permit it then frees is the
+                            // one just taken: this record would reach a
+                            // handler during the drain, ahead of the record
+                            // that was waiting. It is tracked and never
+                            // completed, so the position stays below it and a
+                            // restart delivers it behind that record.
+                            if shutdown.is_cancelled() {
+                                drop(permit);
+                                tracing::debug!(
+                                    queue,
+                                    partition,
+                                    offset,
+                                    "shutdown fired while this record waited for a permit; left uncommitted for the restart"
+                                );
+                                continue;
+                            }
 
                             let task_client = client.clone();
                             let task_processing = processing.clone();
@@ -6943,11 +6995,37 @@ impl KafkaConsumer {
 
                     let metadata = build_message_metadata(&headers, false, coordinates);
 
-                    let permit = semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?;
+                    // The stop is read before the slot, and once more with
+                    // the slot in hand. A deferred redelivery the stop cancels
+                    // frees the slot in the same instant, and taking that slot
+                    // would hand this record to a handler during the drain,
+                    // ahead of the record that was waiting. The record is
+                    // dropped instead, and the loop's own shutdown arm drains
+                    // on the next pass.
+                    let permit = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => {
+                            tracing::debug!(
+                                queue,
+                                partition = coordinates.partition,
+                                offset = coordinates.offset,
+                                "shutdown fired while this record waited for a slot; dropped"
+                            );
+                            continue;
+                        }
+                        permit = semaphore.clone().acquire_owned() => permit
+                            .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?,
+                    };
+                    if shutdown.is_cancelled() {
+                        drop(permit);
+                        tracing::debug!(
+                            queue,
+                            partition = coordinates.partition,
+                            offset = coordinates.offset,
+                            "shutdown fired while this record waited for a slot; dropped"
+                        );
+                        continue;
+                    }
 
                     let task_processing = processing.clone();
                     let task_topic = topic.clone();

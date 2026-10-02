@@ -167,6 +167,8 @@ A partition the group assigns to the member during a pause is paused too.
 A record it delivers first is handed back to the broker and arrives again, in order, once a slot frees.
 The pause lasts until a slot frees: the slot that ends the wait serves the record already in hand, so with one slot the assignment stays paused through that record's handler as well.
 A shutdown during a wait completes nothing: the record stays uncommitted and is redelivered on restart.
+A record the consumer had fetched but not yet handed to a handler when shutdown fired is dropped unhandled too.
+It is redelivered on restart, behind the record that was waiting.
 A waiting handler holds its slot for the whole delay, the contract a broadcast subscription has always had.
 Size `prefetch_count` for the number of records you accept to have waiting at once.
 
@@ -443,7 +445,8 @@ A trailing control record is different: with nothing delivered after it, the com
 An idle transactional topic therefore reads a lag of 1 until the next record arrives, and nothing is redelivered.
 
 On shutdown the consumer first waits for its in-flight handlers to finish.
-That wait is bounded by the handler timeout and by any in-place delays.
+That wait is bounded by the handler timeout.
+An in-place delay does not extend it: shutdown cuts the delay short, and the record stays uncommitted.
 It then drains the republish queue and commits its final position **synchronously**.
 That commit carries every partition's current position, whether or not an earlier asynchronous commit already offered it.
 It therefore offers every safe position, including one an asynchronous commit still in flight may not have landed.
@@ -487,6 +490,7 @@ What that means for replay:
 - After a rebalance, a moved partition replays from its last accepted commit.
 - After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
   A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
+  A record the consumer had fetched but not yet handed to a handler is not handled during the drain, and is redelivered too.
   When the final commit is rejected or hits its deadline, redelivery starts from the last position the broker accepted, and the member reports that with `ShoveError::Commit`.
   An asynchronous commit librdkafka was still retrying can also land after the final one.
   A coordinator hiccup overlapping the shutdown can therefore replay a few records.

@@ -69,6 +69,16 @@ define_topic!(
         .build()
 );
 
+// A stop during a deferred wait; see
+// `a_stop_during_a_deferred_wait_hands_nothing_over_behind_it`.
+define_topic!(
+    StopTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-stop")
+        .broadcast()
+        .build()
+);
+
 define_topic!(
     RetryTopic,
     Invalidate,
@@ -243,6 +253,32 @@ impl MessageHandler<DeferTopic> for DeferOnce {
         let seen_before = calls.iter().filter(|k| **k == msg.key).count();
         calls.push(msg.key);
         if seen_before == 0 {
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// Records the key of every call. The first call defers and every later one
+/// acks.
+#[derive(Clone, Default)]
+struct DeferFirst {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl DeferFirst {
+    async fn calls(&self) -> Vec<String> {
+        self.calls.lock().await.clone()
+    }
+}
+
+impl MessageHandler<StopTopic> for DeferFirst {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+        let mut calls = self.calls.lock().await;
+        calls.push(msg.key);
+        if calls.len() == 1 {
             Outcome::Defer
         } else {
             Outcome::Ack
@@ -1451,6 +1487,66 @@ async fn defer_redelivers_in_place_before_later_records() {
     let _ = sub
         .run_until_timeout(std::future::pending(), Duration::from_secs(10))
         .await;
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// A stop during a deferred wait hands nothing over behind it. Two records
+/// sit on one partition. The first call defers, so that record waits in
+/// place holding the subscription's single slot; the second record was read
+/// meanwhile and waits in the loop's hand for that slot. The stop cancels
+/// the wait, which frees the slot in the same instant; the loop must read
+/// the stop first and drop the second record, so the handler saw exactly one
+/// call. At `7d392b6` the slot wait was a bare `acquire_owned().await`, so
+/// the second record reached the handler after the stop.
+#[tokio::test]
+async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
+    const TOPIC: &str = "kafka-broadcast-stop";
+    let tb = TestBroker::start().await;
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<StopTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+    // Both records are on the topic before the subscription assigns, on one
+    // partition so they are read in this order; a `Head` start reads them
+    // without a settle window.
+    for key in ["1", "2"] {
+        tb.publish_to_partition(TOPIC, 0, &Invalidate { key: key.into() })
+            .await;
+    }
+
+    let broker = tb.broker().await;
+    let handler = DeferFirst::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<StopTopic, _>(
+        handler.clone(),
+        ConsumerOptions::new()
+            .with_broadcast_start(BroadcastStart::Head)
+            .with_prefetch_count(1),
+    )
+    .expect("failed to subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while handler.calls().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(handler.calls().await, vec!["1".to_string()]);
+    // "1" now waits out its one-second deferral holding the slot, and "2"
+    // sits in the loop's hand behind it, or is read before the stop lands
+    // and the stop is read ahead of it either way.
+    sub.cancellation_token().cancel();
+    let outcome = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    assert_eq!(
+        handler.calls().await,
+        vec!["1".to_string()],
+        "the stop handed neither the deferred record nor the one behind it to the handler"
+    );
     broker.close().await;
     publisher_broker.close().await;
 }
