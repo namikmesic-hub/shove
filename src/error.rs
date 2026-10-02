@@ -84,10 +84,13 @@ pub enum ShoveError {
     /// librdkafka's `rd_kafka_consumer_close` returns the error code. shove
     /// follows librdkafka and returns it, because a process that gates its
     /// restart on the exit code cannot read a log line.
+    ///
+    /// `#[non_exhaustive]`: match with `..`, so a field can be added later.
     #[error(
         "final offset commit on '{topic}' did not land for {}: {kind}",
         format_offsets(offsets)
     )]
+    #[non_exhaustive]
     Commit {
         /// The topic the member consumed.
         topic: String,

@@ -603,9 +603,21 @@ impl OffsetTracker {
         for (&partition, tracker) in &mut self.partitions {
             let (commit_offset, covered) = tracker.drain_all();
             discards.extend(covered);
-            tpl.get_or_insert_with(TopicPartitionList::new)
+            if let Err(e) = tpl
+                .get_or_insert_with(TopicPartitionList::new)
                 .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
-                .ok();
+            {
+                // A partition left out here is a position the final commit
+                // never carries, which is what that commit's result exists
+                // to surface; say so instead of dropping it in silence.
+                tracing::error!(
+                    queue = %self.topic,
+                    partition,
+                    offset = commit_offset,
+                    error = %e,
+                    "could not add the partition to the final commit; its position is not committed"
+                );
+            }
         }
         tpl.map(|tpl| (tpl, discards))
     }

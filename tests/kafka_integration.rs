@@ -6401,6 +6401,7 @@ async fn a_leaked_consumer_keeps_its_group_member_past_the_session_timeout() {
         kind: CommitFailure::NoThread,
         offsets,
         topic,
+        ..
     }) = &result
     else {
         panic!(
