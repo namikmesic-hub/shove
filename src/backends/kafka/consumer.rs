@@ -1181,22 +1181,29 @@ pub mod put_back_probe {
     }
 }
 
-/// Test-only counter (see the `test-support` feature) on the entries into
-/// `acquire_permit_while_polling`: how many records the receive loop has held
-/// while it waited for a prefetch permit, the ones handed a free permit at
-/// once included. A test that must have a record in that wait before it goes
-/// on, as the in-place stop test does, reads it instead of sleeping. nextest
-/// runs each test in its own process, so it starts at zero.
+/// Test-only counters (see the `test-support` feature) on the entries into
+/// the two waits for a permit: `acquire_permit_while_polling` on the receive
+/// loop, and the slot wait of the broadcast loop. Each counts the records the
+/// loop has held while it waited, the ones handed a free permit at once
+/// included. A test that must have a record in that wait before it goes on,
+/// as the two stop tests do, reads it instead of sleeping. nextest runs each
+/// test in its own process, so both start at zero.
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod permit_wait_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub static ENTERED: AtomicUsize = AtomicUsize::new(0);
+    pub static BROADCAST_ENTERED: AtomicUsize = AtomicUsize::new(0);
 
-    /// Records held for a permit so far.
+    /// Records the receive loop held for a permit so far.
     pub fn entered() -> usize {
         ENTERED.load(Ordering::SeqCst)
+    }
+
+    /// Records the broadcast loop held for its slot so far.
+    pub fn broadcast_entered() -> usize {
+        BROADCAST_ENTERED.load(Ordering::SeqCst)
     }
 }
 
@@ -1918,7 +1925,20 @@ impl<'a> InPlaceWait<'a> {
 
 impl Drop for InPlaceWait<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        // Underflow-checking: every count has exactly one uncount, so a zero
+        // here is a broken invariant. It is reported, not wrapped round to
+        // `usize::MAX`, which would read as waiting handlers for good and
+        // pause the assignment.
+        if self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_err()
+        {
+            tracing::error!("in-place waiter count underflow: a wait ended that was never counted");
+            if cfg!(debug_assertions) && !std::thread::panicking() {
+                panic!("in-place waiter count underflow");
+            }
+        }
     }
 }
 
@@ -2057,6 +2077,13 @@ where
                 }
             }
         };
+        // The decode's own poll can complete in the instant a revoke lands,
+        // after the select around it read the token: read it once more
+        // before the handler runs, or the record would be handled on the
+        // old owner beside the new one.
+        if revoked.is_cancelled() {
+            return InPlaceEnd::Revoked;
+        }
         let mut metadata = build_message_metadata(headers, true, coordinates);
         metadata.retry_count = attempts;
         let handler = Arc::clone(handler);
@@ -5310,45 +5337,42 @@ impl KafkaConsumer {
                                     ShoveError::Connection("semaphore closed".to_string())
                                 })?,
                             };
-                            // Read again with the permit in hand. The permit
-                            // wait reads the stop before the permit, but a
-                            // stop from another thread can land between those
-                            // two polls, and the permit it then frees is the
-                            // one just taken: this record would reach a
-                            // handler during the drain, ahead of the record
-                            // that was waiting. It is tracked and never
-                            // completed, so the position stays below it and a
-                            // restart delivers it behind that record.
-                            if shutdown.is_cancelled() {
-                                drop(permit);
-                                tracing::debug!(
-                                    queue,
-                                    partition,
-                                    offset,
-                                    "shutdown fired while this record waited for a permit; left uncommitted for the restart"
-                                );
-                                continue;
-                            }
-                            // A revoke of this record's partition during the
-                            // wait ended the in-place wait that held the
-                            // permit; the record is the partition's next
-                            // owner's now. The tracker entry goes with the
-                            // queued revoke event on the next pass. The busy
-                            // flag is cleared here when no task holds a
-                            // permit: the ended wait's task cleared it only if
-                            // its permit was still free when it looked.
-                            if assignment.revoked.is_cancelled() {
-                                drop(permit);
-                                if semaphore.available_permits() == prefetch_count as usize {
-                                    processing.store(false, Ordering::Release);
+                            // Read again with the permit in hand, see
+                            // `after_wait`. A record left here is tracked and
+                            // never completed, so the position stays below it:
+                            // a restart delivers it behind the record that
+                            // was waiting, and the partition's next owner is
+                            // handed it from the committed offset.
+                            match after_wait(&shutdown, Some(&assignment.revoked)) {
+                                AfterWait::Dispatch => {}
+                                AfterWait::Stop => {
+                                    drop(permit);
+                                    tracing::debug!(
+                                        queue,
+                                        partition,
+                                        offset,
+                                        "shutdown fired while this record waited for a permit; left uncommitted for the restart"
+                                    );
+                                    continue;
                                 }
-                                tracing::debug!(
-                                    queue,
-                                    partition,
-                                    offset,
-                                    "partition revoked while this record waited for a permit; left to its next owner"
-                                );
-                                continue;
+                                // The tracker entry goes with the queued
+                                // revoke event on the next pass. The busy flag
+                                // is cleared here when no task holds a permit:
+                                // the ended wait's task cleared it only if its
+                                // permit was still free when it looked.
+                                AfterWait::Revoked => {
+                                    drop(permit);
+                                    if semaphore.available_permits() == prefetch_count as usize {
+                                        processing.store(false, Ordering::Release);
+                                    }
+                                    tracing::debug!(
+                                        queue,
+                                        partition,
+                                        offset,
+                                        "partition revoked while this record waited for a permit; left to its next owner"
+                                    );
+                                    continue;
+                                }
                             }
 
                             let task_client = client.clone();
@@ -7269,6 +7293,8 @@ impl KafkaConsumer {
                     // ahead of the record that was waiting. The record is
                     // dropped instead, and the loop's own shutdown arm drains
                     // on the next pass.
+                    #[cfg(feature = "test-support")]
+                    permit_wait_probe::BROADCAST_ENTERED.fetch_add(1, Ordering::SeqCst);
                     let permit = tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => {
@@ -7283,7 +7309,8 @@ impl KafkaConsumer {
                         permit = semaphore.clone().acquire_owned() => permit
                             .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?,
                     };
-                    if shutdown.is_cancelled() {
+                    // Read again with the slot in hand, see `after_wait`.
+                    if after_wait(&shutdown, None) == AfterWait::Stop {
                         drop(permit);
                         tracing::debug!(
                             queue,
@@ -9520,6 +9547,90 @@ mod in_place_wait_accounting_tests {
             "the count is released on exit"
         );
     }
+
+    /// A revoke during the registry retry wait of a redelivery ends it as
+    /// `Revoked`: that wait selects on the record's assignment token too.
+    /// The mock has answered the lookup and its one retry once it has been
+    /// asked twice, so the task is in the retry wait, or about to enter it
+    /// from a lookup the token ends the same way. The waiter is uncounted.
+    #[tokio::test]
+    async fn a_revoke_during_the_registry_retry_wait_ends_the_redelivery() {
+        let (registry, hits) = unavailable_registry().await;
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let revoked = CancellationToken::new();
+
+        let task = {
+            let registry = registry.clone();
+            let waiters = waiters.clone();
+            let shutdown = shutdown.clone();
+            let revoked = revoked.clone();
+            tokio::spawn(async move {
+                let hold = [HoldQueue {
+                    name: "in-place-wait-accounting-hold-10ms".into(),
+                    delay: Duration::from_millis(10),
+                }];
+                let mut payload = vec![0u8];
+                payload.extend_from_slice(&9u32.to_be_bytes());
+                payload.extend_from_slice(br#"{"id":1}"#);
+                let accepted: [Arc<str>; 1] = [Arc::from("in-place-wait-accounting-value")];
+                let decode = BatchDecodeCtx {
+                    queue: "in-place-wait-accounting",
+                    schema_registry: Some(&registry),
+                    schema_enforcement: SchemaEnforcement::Enforce,
+                    schema_accepted: &accepted,
+                    schema_message_index: None,
+                    registry_lookup_bound: Duration::from_secs(60),
+                };
+                let handler = Arc::new(Noop);
+                let ctx = Arc::new(());
+                let headers = Arc::new(HashMap::new());
+                let end = redeliver_in_place::<Notes, Noop>(
+                    &handler,
+                    &ctx,
+                    &decode,
+                    &payload,
+                    &headers,
+                    RecordCoordinates {
+                        partition: 0,
+                        offset: 0,
+                        timestamp_ms: None,
+                    },
+                    Outcome::Defer,
+                    0,
+                    10,
+                    &hold,
+                    None,
+                    None,
+                    "in-place-wait-accounting",
+                    None,
+                    &shutdown,
+                    &revoked,
+                    &waiters,
+                )
+                .await;
+                matches!(end, InPlaceEnd::Revoked)
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hits.load(Ordering::SeqCst) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the mock registry was not asked twice"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(waiters.load(Ordering::SeqCst), 1);
+
+        revoked.cancel();
+        assert!(
+            task.await.expect("redelivery task panicked"),
+            "a revoke during the registry retry wait ends the redelivery as Revoked"
+        );
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+        assert!(!shutdown.is_cancelled());
+    }
 }
 
 #[cfg(test)]
@@ -9544,6 +9655,38 @@ mod in_place_revoke_tests {
         }
     }
 
+    /// A JSON codec that cancels the token left for it as it decodes, so a
+    /// test can land a revoke inside a successful decode.
+    struct RevokingCodec;
+
+    static REVOKE_ON_DECODE: std::sync::Mutex<Option<CancellationToken>> =
+        std::sync::Mutex::new(None);
+
+    impl crate::Codec<Note> for RevokingCodec {
+        const NAME: &'static str = "revoking-json";
+
+        fn encode(value: &Note) -> Result<Vec<u8>> {
+            Ok(serde_json::to_vec(value)?)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Note> {
+            if let Some(token) = REVOKE_ON_DECODE.lock().unwrap().take() {
+                token.cancel();
+            }
+            Ok(serde_json::from_slice(bytes)?)
+        }
+    }
+
+    struct RevokedNotes;
+    impl Topic for RevokedNotes {
+        type Message = Note;
+        type Codec = RevokingCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("in-place-revoke-decode").build())
+        }
+    }
+
     /// Counts its calls and acks.
     struct Counting(AtomicUsize);
     impl MessageHandler<Notes> for Counting {
@@ -9552,6 +9695,84 @@ mod in_place_revoke_tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Outcome::Ack
         }
+    }
+    impl MessageHandler<RevokedNotes> for Counting {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+
+    /// A revoke that lands inside the decode of the redelivery, after the
+    /// select around the decode read the token and before the decode's own
+    /// poll completed, ends the wait as `Revoked` before the handler runs.
+    /// The codec cancels the token as it decodes; the handler must not see
+    /// the record, and the waiter is uncounted.
+    #[tokio::test]
+    async fn a_revoke_inside_the_decode_ends_the_wait_before_the_handler() {
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let revoked = CancellationToken::new();
+        *REVOKE_ON_DECODE.lock().unwrap() = Some(revoked.clone());
+        let handler = Arc::new(Counting(AtomicUsize::new(0)));
+        let hold = [HoldQueue {
+            name: "in-place-revoke-decode-hold-10ms".into(),
+            delay: Duration::from_millis(10),
+        }];
+        let decode = BatchDecodeCtx {
+            queue: "in-place-revoke-decode",
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted: &[],
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            registry_lookup_bound: Duration::from_secs(1),
+        };
+        let ctx = Arc::new(());
+        let headers = Arc::new(HashMap::new());
+        let end = redeliver_in_place::<RevokedNotes, Counting>(
+            &handler,
+            &ctx,
+            &decode,
+            br#"{"id":1}"#,
+            &headers,
+            RecordCoordinates {
+                partition: 3,
+                offset: 9,
+                timestamp_ms: None,
+            },
+            Outcome::Defer,
+            0,
+            10,
+            &hold,
+            None,
+            None,
+            "in-place-revoke-decode",
+            None,
+            &shutdown,
+            &revoked,
+            &waiters,
+        )
+        .await;
+        assert!(
+            revoked.is_cancelled(),
+            "the codec cancelled the token during the decode"
+        );
+        assert!(
+            matches!(end, InPlaceEnd::Revoked),
+            "a revoke inside the decode ends the redelivery as Revoked"
+        );
+        assert_eq!(
+            handler.0.load(Ordering::SeqCst),
+            0,
+            "the record was not handed to the handler"
+        );
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
     }
 
     /// A revoke of the record's partition during the delay ends the wait as
