@@ -1186,7 +1186,13 @@ impl RegistryStall {
     /// fired during the wait. A fault a handler task reports over `fault_rx`
     /// meanwhile ends the wait with that error: the loop's own fault arm sits
     /// in a `select!` this wait is nested inside, and an outage has no time
-    /// bound, so the wait must read the channel itself.
+    /// bound, so the wait must read the channel itself. The retry is read
+    /// last: a rebalance event librdkafka has queued is applied by the
+    /// `recv()` poll, inside which a revoke of the stalled record's partition
+    /// cancels the record's assignment token, and the concurrent loop reads
+    /// that token before it retries the decode, see `after_wait`. An
+    /// unbiased pick could take the retry first and leave the event for a
+    /// later poll.
     #[allow(clippy::too_many_arguments)]
     async fn wait(
         &mut self,
@@ -1219,7 +1225,8 @@ impl RegistryStall {
         tokio::pin!(fault);
         loop {
             tokio::select! {
-                _ = &mut retry => return Ok(true),
+                // Read in this order, the retry last; see the doc above.
+                biased;
                 _ = shutdown.cancelled() => return Ok(false),
                 e = &mut fault => return Err(e),
                 received = consumer.recv() => {
@@ -1246,6 +1253,7 @@ impl RegistryStall {
                         "record from a partition assigned during a schema registry wait put back; pause widened"
                     );
                 }
+                _ = &mut retry => return Ok(true),
             }
         }
     }
@@ -1273,6 +1281,11 @@ enum Staged<M> {
     /// Shutdown fired during a registry wait. The record is untouched and
     /// uncommitted; the loop's shutdown arm takes over.
     Stop,
+    /// The record's partition was revoked during a registry wait, which only
+    /// the concurrent loop can tell, through the record's assignment token.
+    /// The record is untouched and left to the partition's next owner; the
+    /// loop's next pass drains the revoke.
+    Revoked,
 }
 
 /// Count and settle a message dropped before the handler on the concurrent
@@ -4169,6 +4182,39 @@ fn put_back(
     settle_put_back_seek(queue, partition, offset, errors, still_assigned.as_ref())
 }
 
+/// What the receive loop does with a record it holds once a wait it polled
+/// `recv()` through has ended: the wait for a prefetch permit, or a schema
+/// registry stall. The stop and the record's assignment are read again then,
+/// with the wait over, because either can have moved during it and the
+/// record must not reach a handler after that. A stop from another thread
+/// can land between the wait's poll of the token and its poll of the permit,
+/// and the permit it then frees, from a cancelled in-place wait, is the one
+/// just taken. A revoke of the record's partition is applied inside the
+/// `recv()` poll, which cancels the token, and the record is the next
+/// owner's. `revoked` is `None` on the broadcast loop, which has no
+/// assignment to lose.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterWait {
+    /// Neither moved: the record goes on to its handler.
+    Dispatch,
+    /// Shutdown fired. The record is left uncommitted for the restart, which
+    /// delivers it behind the record that was waiting.
+    Stop,
+    /// The record's partition was revoked. The record is left to its next
+    /// owner, which is handed it from the committed offset.
+    Revoked,
+}
+
+fn after_wait(shutdown: &CancellationToken, revoked: Option<&CancellationToken>) -> AfterWait {
+    if shutdown.is_cancelled() {
+        AfterWait::Stop
+    } else if revoked.is_some_and(CancellationToken::is_cancelled) {
+        AfterWait::Revoked
+    } else {
+        AfterWait::Dispatch
+    }
+}
+
 /// The fault a handler task reported over the receive loop's channel, or a
 /// future that never resolves: a loop without such a channel passes `None`,
 /// and a channel whose senders are all gone has nothing more to report.
@@ -4945,6 +4991,16 @@ impl KafkaConsumer {
                                                     {
                                                         break Staged::Stop;
                                                     }
+                                                    // The wait polled `recv()`, inside which a
+                                                    // revoke of this record's partition cancels
+                                                    // its token: read before the decode is
+                                                    // retried, or the record would reach the
+                                                    // handler as the old owner's.
+                                                    match after_wait(&shutdown, Some(&assignment.revoked)) {
+                                                        AfterWait::Dispatch => {}
+                                                        AfterWait::Stop => break Staged::Stop,
+                                                        AfterWait::Revoked => break Staged::Revoked,
+                                                    }
                                                 }
                                                 // A deployment fault, not an outage: stop
                                                 // instead of waiting on it.
@@ -5002,6 +5058,18 @@ impl KafkaConsumer {
                                     // `shutdown.cancelled()` arm drains and commits
                                     // the rest on its next pass.
                                     Staged::Stop => continue,
+                                    // Untouched here too: the partition's next
+                                    // owner is handed the record, and the next
+                                    // pass drains the revoke.
+                                    Staged::Revoked => {
+                                        tracing::debug!(
+                                            queue,
+                                            partition,
+                                            offset,
+                                            "partition revoked during a schema registry wait; the record is left to its next owner"
+                                        );
+                                        continue;
+                                    }
                                 }
                             } else {
                                 match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
@@ -6330,7 +6398,7 @@ impl KafkaConsumer {
                                             .await;
                                             continue;
                                         }
-                                        Staged::Stop => continue,
+                                        Staged::Stop | Staged::Revoked => continue,
                                     }
                                 } else {
                                     match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
@@ -7032,7 +7100,7 @@ impl KafkaConsumer {
                             }
                             // Shutdown fired during a registry wait; the loop's
                             // `shutdown.cancelled()` arm ends it on its next pass.
-                            Staged::Stop => continue,
+                            Staged::Stop | Staged::Revoked => continue,
                         }
                     };
 
@@ -7525,7 +7593,7 @@ impl KafkaConsumer {
                                         consumer.commit_message(&msg, CommitMode::Async).ok();
                                         continue;
                                     }
-                                    Staged::Stop => continue,
+                                    Staged::Stop | Staged::Revoked => continue,
                                 }
                             } else {
                                 match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
@@ -9232,6 +9300,48 @@ mod in_place_revoke_tests {
             "the waiter is uncounted on exit"
         );
         assert!(!shutdown.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod after_wait_tests {
+    use super::*;
+
+    /// The cases of the check the receive loop makes once a wait it polled
+    /// through has ended, pinned here because the broker tests reach the
+    /// stop case only through a race the stop usually wins earlier, and the
+    /// revoke case only when the coordinator moves the partition whose
+    /// record is in the loop's hand.
+    #[test]
+    fn the_stop_is_read_first_then_the_assignment() {
+        let live = CancellationToken::new();
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let revoked = CancellationToken::new();
+        revoked.cancel();
+
+        assert_eq!(after_wait(&live, Some(&live)), AfterWait::Dispatch);
+        assert_eq!(
+            after_wait(&live, None),
+            AfterWait::Dispatch,
+            "the broadcast loop has no assignment to lose"
+        );
+        assert_eq!(
+            after_wait(&stopped, Some(&live)),
+            AfterWait::Stop,
+            "a stop that landed after the wait's own poll of the token"
+        );
+        assert_eq!(after_wait(&stopped, None), AfterWait::Stop);
+        assert_eq!(
+            after_wait(&live, Some(&revoked)),
+            AfterWait::Revoked,
+            "a revoke applied inside the wait's recv poll"
+        );
+        assert_eq!(
+            after_wait(&stopped, Some(&revoked)),
+            AfterWait::Stop,
+            "the stop is read first"
+        );
     }
 }
 
