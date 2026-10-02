@@ -56,8 +56,8 @@ pub enum ShoveError {
     /// The final offset commit of a stopping consumer was not confirmed.
     ///
     /// The Kafka receive loop returns this from its shutdown arm when the
-    /// synchronous commit it issues after the handler drain is rejected,
-    /// misses the shutdown deadline, or has no thread to run on. The member
+    /// synchronous commit it issues after the handler drain returns an
+    /// error, misses the shutdown deadline, or has no thread to run on. The member
     /// ends with this error instead of a clean exit: a group run counts it
     /// under [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors),
     /// so [`exit_code`](crate::SupervisorOutcome::exit_code) is `1`, and the
@@ -126,8 +126,12 @@ pub struct FailedCommit {
 pub enum CommitFailure {
     /// The commit returned an error, carried as text: the coordinator's
     /// answer, or a librdkafka local error, such as a timeout of its own or
-    /// an unknown partition. This commit did not land; the broker keeps the
-    /// last position it accepted.
+    /// an unknown partition. An answer from the coordinator says this
+    /// commit did not land. A local error raised after the request was
+    /// sent, such as a timeout, does not prove that: librdkafka reports it
+    /// after its own retries, and the broker may have accepted the commit
+    /// by then. The next member resumes from whatever position the broker
+    /// holds.
     ///
     /// The text is librdkafka's rendering of that error: the error code and
     /// its description, and nothing else. It never carries a record's

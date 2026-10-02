@@ -7773,11 +7773,56 @@ mod offset_tracker_tests {
     /// The one arm of `drain_all` a position the tracker computes cannot
     /// reach: `add_partition_offset` refuses an offset below zero, so a
     /// tracker seeded below zero drives it. The partition's position is not
-    /// carried, and the discards that position would have retired are
+    /// carried, the refusal is logged at error level with the partition and
+    /// the position, and the discards that position would have retired are
     /// settled as survived instead of riding a commit that could confirm
-    /// them without having carried them. The other partition rides as usual.
+    /// them without having carried them. The other partition rides as
+    /// usual.
     #[test]
     fn a_partition_the_commit_cannot_carry_keeps_its_discards_out_of_the_commit() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        /// The fields of one event: `partition` and `offset` as recorded,
+        /// and the message text.
+        #[derive(Debug, Default)]
+        struct Fields {
+            partition: Option<i64>,
+            offset: Option<i64>,
+            message: String,
+        }
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                }
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                match field.name() {
+                    "partition" => self.partition = Some(value),
+                    "offset" => self.offset = Some(value),
+                    _ => {}
+                }
+            }
+        }
+
+        /// Collects the fields of every ERROR event.
+        #[derive(Clone, Default)]
+        struct Errors(Arc<Mutex<Vec<Fields>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for Errors {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::ERROR {
+                    let mut fields = Fields::default();
+                    event.record(&mut fields);
+                    self.0.lock().unwrap().push(fields);
+                }
+            }
+        }
+
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, -2);
         tracker.track_received(0, -1);
@@ -7785,7 +7830,11 @@ mod offset_tracker_tests {
         tracker.track_received(1, 4);
         tracker.mark_complete(Completion::plain(1, 4));
 
-        let (tpl, discards) = tracker.drain_all().expect("two partitions");
+        let errors = Errors::default();
+        let drained = with_default(tracing_subscriber::registry().with(errors.clone()), || {
+            tracker.drain_all()
+        });
+        let (tpl, discards) = drained.expect("two partitions");
         assert_eq!(
             committed_offset(&tpl, 0),
             None,
@@ -7799,6 +7848,26 @@ mod offset_tracker_tests {
         assert!(
             discards.is_empty(),
             "the discard of the partition left out was settled, not handed to the commit"
+        );
+        let logged = errors.0.lock().unwrap();
+        assert_eq!(
+            logged.len(),
+            1,
+            "the refusal is logged once at error level: {logged:?}"
+        );
+        let refusal = &logged[0];
+        assert_eq!(refusal.partition, Some(0), "the partition left out");
+        assert_eq!(
+            refusal.offset,
+            Some(-1),
+            "the position the commit cannot carry"
+        );
+        assert!(
+            refusal
+                .message
+                .contains("could not add the partition to the final commit"),
+            "the log names the refusal: {}",
+            refusal.message
         );
     }
 
