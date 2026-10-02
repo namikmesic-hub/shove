@@ -169,6 +169,11 @@ The pause lasts until a slot frees: the slot that ends the wait serves the recor
 A shutdown during a wait completes nothing: the record stays uncommitted and is redelivered on restart.
 A record the consumer had fetched but not yet handed to a handler when shutdown fired is dropped unhandled too.
 It is redelivered on restart, behind the record that was waiting.
+A revoke of the partition ends the wait at once with nothing completed.
+The partition's next owner is handed the record again from the committed offset.
+A completion carries the assignment it was made under, and one from an earlier assignment of the partition is ignored.
+With one slot, no later record of a partition reaches the handler while a record of that partition waits in place.
+That holds while the consumer runs, on a stop, and across a rebalance.
 A waiting handler holds its slot for the whole delay, the contract a broadcast subscription has always had.
 Size `prefetch_count` for the number of records you accept to have waiting at once.
 
