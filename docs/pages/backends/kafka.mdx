@@ -171,7 +171,7 @@ A record the consumer had fetched but not yet handed to a handler when shutdown 
 It is redelivered on restart, behind the record that was waiting.
 A revoke of the partition ends the wait at once with nothing completed.
 The partition's next owner is handed the record again from the committed offset.
-A completion carries the assignment it was made under, and one from an earlier assignment of the partition is ignored.
+A handler result carries the assignment it was made under, and one from an earlier assignment of the partition is ignored.
 With one slot, no later record of a partition reaches the handler while a record of that partition waits in place.
 That holds while the consumer runs, on a stop, and across a rebalance.
 A waiting handler holds its slot until the delay ends, shutdown starts or its partition is revoked.
