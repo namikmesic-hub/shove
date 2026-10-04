@@ -492,8 +492,8 @@ If that thread cannot be spawned either, the handle is leaked and logged at erro
 The leaked consumer keeps heartbeating, so while the process lives its partitions stay assigned until `max.poll.interval.ms` (5 min) passes without a poll.
 Once the process exits, the broker drops the member after the session timeout, as after a crash.
 The consumer waits for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
-That wait covers the commit and the close that follows it on the same thread.
-A clean return therefore means the member has left its group.
+That wait covers the commit and the close that follows it on the same thread, and the thread reports the two separately.
+A close that outlives the deadline is logged at warn level and is never reported as a failed commit.
 Under `CommitPolicy::PerRecord` a commit in flight when shutdown fires is waited for first, for at most three quarters of that deadline.
 If it is accepted, the final commit carries the position again, as every final commit does.
 If it is rejected, the final commit re-offers its position.
