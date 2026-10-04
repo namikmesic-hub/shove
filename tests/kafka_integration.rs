@@ -7506,3 +7506,155 @@ async fn a_leaked_consumer_keeps_its_group_member_past_the_session_timeout() {
     );
     broker.close().await;
 }
+
+/// Under `CommitPolicy::PerRecord` a commit in flight when shutdown fires is
+/// waited for first, for its share of the shutdown deadline. Against a
+/// frozen coordinator that answer never comes: the stop then ends with
+/// `ShoveError::Commit` of the `Deadline` kind carrying that share, inside
+/// the deadline, issues no second commit, and names the position it could
+/// not get accepted. The
+/// member leaves its group once that commit returns, which the unpaused
+/// broker shows by reporting the group empty. The broker is paused while
+/// the handler holds the record, so the commit meets a frozen coordinator;
+/// the stop fires a moment after the handler has returned, once the commit
+/// is on its way. A resumed broker may expire the member's session before
+/// it reads the commit, so the commit's fate is the broker's and not
+/// asserted; the member being gone is what the error promised.
+// `test-support` gates the deadline seam and the container pause this test
+// uses; the Kafka coverage row enables it.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish() {
+    use shove::kafka::{
+        CommitPolicy, pending_commit_budget_for_test, shutdown_commit_deadline_for_test,
+    };
+
+    shove::define_topic!(
+        FrozenCommitTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-frozen-per-record").build()
+    );
+    const TOPIC: &str = "kafka-frozen-per-record";
+    const GROUP: &str = "kafka-frozen-per-record-consumer";
+    const HOLD: Duration = Duration::from_secs(3);
+    const MARGIN: Duration = Duration::from_secs(5);
+
+    /// Holds the first record for `HOLD` and acknowledges every record;
+    /// `returned` counts the handlers that have come back.
+    #[derive(Clone)]
+    struct HoldFirst {
+        seen: WaitableCounter,
+        returned: WaitableCounter,
+    }
+    impl MessageHandler<FrozenCommitTopic> for HoldFirst {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.seen.increment();
+            if self.seen.get() == 1 {
+                tokio::time::sleep(HOLD).await;
+            }
+            self.returned.increment();
+            Outcome::Ack
+        }
+    }
+
+    let deadline = shutdown_commit_deadline_for_test();
+    let share = pending_commit_budget_for_test();
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<FrozenCommitTopic>()
+        .await
+        .unwrap();
+
+    let handler = HoldFirst {
+        seen: WaitableCounter::new(),
+        returned: WaitableCounter::new(),
+    };
+    let shutdown = CancellationToken::new();
+    let run = {
+        let consumer = KafkaConsumer::new(tb.client());
+        let handler = handler.clone();
+        let token = shutdown.clone();
+        tokio::spawn(async move {
+            consumer
+                .run::<FrozenCommitTopic, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new()
+                        .with_prefetch_count(1)
+                        .with_concurrent_processing(true)
+                        .with_commit_policy(CommitPolicy::PerRecord)
+                        .with_shutdown(token),
+                )
+                .await
+        })
+    };
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<FrozenCommitTopic>(&SimpleMessage {
+            id: "held".into(),
+            content: String::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        handler.seen.wait_for(1, TIMEOUT).await,
+        "the record reaches the handler"
+    );
+
+    // Frozen while the handler holds the record: the commit that follows
+    // the completion meets a coordinator that never answers.
+    tb.pause().await;
+    assert!(
+        handler.returned.wait_for(1, TIMEOUT).await,
+        "the handler returns"
+    );
+    // The commit leaves within the pass that drains the completion; a short
+    // moment lets it do so before the stop, with nothing broker-side to
+    // observe while the broker is frozen.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stopped_at = Instant::now();
+    shutdown.cancel();
+    let result = run.await.expect("the run task completes");
+    let took = stopped_at.elapsed();
+
+    let err = result.expect_err("the stop reports the commit it could not finish");
+    let ShoveError::Commit(failed) = &err else {
+        panic!("a Commit error naming the unanswered commit: {err:?}");
+    };
+    assert_eq!(failed.topic, TOPIC);
+    assert_eq!(
+        failed.offsets.len(),
+        1,
+        "the held record's partition: {:?}",
+        failed.offsets
+    );
+    assert_eq!(
+        failed.offsets[0].1, 1,
+        "the held record's exclusive position"
+    );
+    assert_eq!(
+        failed.kind,
+        CommitFailure::Deadline(share),
+        "the Deadline kind carrying the share of the shutdown deadline"
+    );
+    assert!(
+        took >= share - Duration::from_millis(500) && took < deadline + MARGIN,
+        "the stop waits out its share and ends inside the deadline, took {took:?}"
+    );
+
+    // Unfrozen, the commit in flight is answered, the thread that carries
+    // it drops the handle, and the member leaves the group.
+    tb.unpause().await;
+    let settled_by = Instant::now() + TIMEOUT;
+    while group_state(tb.brokers(), GROUP).1 != 0 {
+        assert!(
+            Instant::now() < settled_by,
+            "the member leaves its group once the commit in flight returns"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    broker.close().await;
+}

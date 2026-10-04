@@ -98,17 +98,25 @@ On macOS, Homebrew's `cyrus-sasl` satisfies it.
 Only OpenSSL, and Cyrus SASL under `kafka-gssapi`, are linked from the system.
 The `rdkafka` crate's `dynamic-linking` feature is the opt-in exception, and shove does not enable it.
 
-**Consumer offsets are committed asynchronously, at most once per commit interval.** shove tracks handler completions and commits them asynchronously every 500 ms by default.
+**Consumer offsets are committed asynchronously, at most once per commit interval, under the default `CommitPolicy::Interval`.**
+Under `CommitPolicy::PerRecord` they are committed synchronously, once per record.
+shove tracks handler completions and commits them asynchronously every 500 ms by default.
 `with_commit_interval` on `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>` changes the cadence, trading coordinator requests for a wider replay window.
+`with_commit_policy(CommitPolicy::PerRecord)` on either commits every completion synchronously from a dedicated thread.
+The next record is handed out only once the coordinator has accepted that commit, and the consumer keeps polling while it waits.
+It is an opt-in for a handler that is not idempotent, and it needs one prefetch permit.
 On clean shutdown, shove first waits for the in-flight handlers to finish.
 That wait is bounded by the handler timeout.
 An in-place delay on an external topic does not extend it: shutdown cuts the delay short, and the record stays uncommitted.
-It then commits the final position synchronously from a dedicated thread and waits at most 20 s for that commit.
+It then commits the final position synchronously from a dedicated thread, which also closes the consumer, and waits at most 20 s for both.
 That 20 s bound covers the concurrent consumer's final commit only.
 A final commit that is rejected, has no answer within the bound, or has no thread to run on (`CommitFailure::NoThread`) ends the member with `ShoveError::Commit`.
 A group counts that under `errors`, so the run's exit code is 1.
 See [Offset commit semantics](/backends/kafka#offset-commit-semantics).
 A drain that times out while that commit is still waiting aborts the member instead, and the run reports `timed_out` with exit code 3.
+Under `CommitPolicy::PerRecord` a commit in flight at shutdown is waited for inside the same bound, and the final commit follows it.
+A commit still unanswered past its share of the bound ends the stop with `ShoveError::Commit` of the `Deadline` kind carrying that share.
+The member then leaves its group once that commit returns.
 A synchronous commit already in flight when shutdown fires, the one that retires a discarded record, blocks for as long as librdkafka retries it.
 A FIFO consumer commits a discarded message synchronously and a batch consumer commits every flush synchronously, and those commits block the same way.
 On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts.
