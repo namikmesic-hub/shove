@@ -377,6 +377,9 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::put_back_probe;
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::pending_commit_budget_for_test;
     /// Test-only seam (see the `test-support` feature): the receive loop's
     /// shutdown commit deadline, for tests that time a shutdown against it.
     #[cfg(feature = "test-support")]
