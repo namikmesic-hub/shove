@@ -340,10 +340,12 @@ pub struct ConsumerOptions<B: Backend> {
 
     /// Kafka-only: how often the concurrent consumer commits the offsets its
     /// handlers completed. `None` (the default) keeps the 500 ms gate. A
-    /// value here is the `CommitPolicy::Interval` it always meant, and it
-    /// wins: [`into_inner`](Self::into_inner) reads a set field as that
-    /// interval whatever policy a setter stored, so code that writes the
-    /// field after a setter keeps the behaviour it had.
+    /// value here is the `CommitPolicy::Interval` it always meant, and the
+    /// field is the one source of an interval: [`into_inner`](Self::into_inner)
+    /// reads a set field as that interval whatever policy a setter stored,
+    /// and a field cleared after `with_commit_interval` restores the
+    /// default, so code that writes the field after a setter keeps the
+    /// behaviour it had.
     /// [`ConsumerOptions::<Kafka>::with_commit_interval`] sets it, as it
     /// always did, and [`ConsumerOptions::<Kafka>::with_commit_policy`]
     /// keeps it in step: an `Interval` sets it and `PerRecord` clears it.
@@ -670,15 +672,19 @@ impl<B: Backend> ConsumerOptions<B> {
         // The public `kafka_commit_interval` field predates the policy and
         // means `Interval`; the setters write the policy slot and keep the
         // field in step. Folded here, the one funnel every direct and
-        // supervisor path passes through, so the loop reads one policy. A
-        // set field wins, as it did in 0.15: code that wrote the field after
-        // a setter keeps the behaviour it had. The bound on the interval
-        // itself is checked where the loop reads the policy, as before.
+        // supervisor path passes through, so the loop reads one policy. The
+        // interval case is read from the field alone, and the policy slot
+        // contributes only `PerRecord`, so a field written after a setter
+        // wins as it did in 0.15, for clearing too: a field set to `None`
+        // after `with_commit_interval` restores the 500 ms default. The
+        // bound on the interval itself is checked where the loop reads the
+        // policy, as before.
         #[cfg(feature = "kafka")]
-        let kafka_commit_policy = self
-            .kafka_commit_interval
-            .map(CommitPolicy::Interval)
-            .or(self.kafka_commit_policy);
+        let kafka_commit_policy = match (self.kafka_commit_interval, self.kafka_commit_policy) {
+            (Some(interval), _) => Some(CommitPolicy::Interval(interval)),
+            (None, Some(CommitPolicy::PerRecord)) => Some(CommitPolicy::PerRecord),
+            (None, _) => None,
+        };
         ConsumerOptionsInner {
             max_retries: self.max_retries,
             prefetch_count: effective_prefetch,
@@ -1491,6 +1497,26 @@ mod tests {
             opts.into_inner().kafka_commit_policy,
             Some(CommitPolicy::Interval(Duration::from_secs(9))),
             "a set field means the interval it always meant"
+        );
+    }
+
+    /// Clearing the field after `with_commit_interval` restores the 500 ms
+    /// default, as it did before the policy existed: the interval case is
+    /// read from the field alone, so a field written after a setter wins
+    /// for clearing too. `PerRecord` has no interval, so its field is
+    /// already clear and the policy stands.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_commit_interval_field_cleared_after_the_setter_restores_the_default() {
+        use crate::markers::Kafka;
+        let mut opts = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::from_secs(5));
+        opts.kafka_commit_interval = None;
+        assert_eq!(opts.into_inner().kafka_commit_policy, None);
+        let mut opts = ConsumerOptions::<Kafka>::new().with_commit_policy(CommitPolicy::PerRecord);
+        opts.kafka_commit_interval = None;
+        assert_eq!(
+            opts.into_inner().kafka_commit_policy,
+            Some(CommitPolicy::PerRecord)
         );
     }
 
