@@ -58,7 +58,7 @@ use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::topology::TopologyBuilder;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -299,21 +299,31 @@ async fn produce_on(bootstrap: &str, topic: &str, ids: &[&str]) {
 /// through a raw consumer that never joins the group. `None` before the
 /// first accepted commit.
 async fn committed_position(bootstrap: &str) -> Option<i64> {
+    committed_position_on(bootstrap, TOPIC, GROUP_ID, 0).await
+}
+
+/// [`committed_position`] for any topic, group and partition.
+async fn committed_position_on(
+    bootstrap: &str,
+    topic: &'static str,
+    group: &'static str,
+    partition: i32,
+) -> Option<i64> {
     let bootstrap = bootstrap.to_owned();
     tokio::task::spawn_blocking(move || {
         let probe: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", &bootstrap)
-            .set("group.id", GROUP_ID)
+            .set("group.id", group)
             .create()
             .expect("probe consumer");
         let mut tpl = TopicPartitionList::new();
-        tpl.add_partition(TOPIC, 0);
+        tpl.add_partition(topic, partition);
         probe
             .committed_offsets(tpl, Duration::from_secs(5))
             .expect("read the committed offsets")
             .elements()
             .iter()
-            .find(|e| e.partition() == 0)
+            .find(|e| e.partition() == partition)
             .and_then(|e| match e.offset() {
                 Offset::Offset(offset) => Some(offset),
                 _ => None,
@@ -1022,4 +1032,256 @@ async fn a_republish_that_fails_under_per_record_ends_the_member_before_the_next
         "nothing was committed behind the record"
     );
     drop(shutdown);
+}
+
+// ---------------------------------------------------------------------------
+// A partition handed back paused, with its assign drained by the receive arm
+// ---------------------------------------------------------------------------
+
+const RETURN_TOPIC: &str = "kafka-commit-policy-mock-return";
+/// The group the topic's default configuration joins: `{queue}-consumer`.
+const RETURN_GROUP_ID: &str = "kafka-commit-policy-mock-return-consumer";
+/// Two partitions, so that a second member's join moves exactly one.
+const RETURN_PARTITIONS: [i32; 2] = [0, 1];
+/// The per-record member's payload limit; a record padded past it is
+/// dropped before the handler.
+const SIZE_LIMIT: usize = 1024;
+/// The returned partition's record reaches the handler in well under this
+/// once the partition is resumed, and never while it stays paused.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(15);
+
+shove::define_topic!(
+    ReturnTopic,
+    Order,
+    TopologyBuilder::new(RETURN_TOPIC).external().build()
+);
+
+/// Acknowledges every record, records its id with the partition it came
+/// from, and holds every `hold-*` record until `release` says so.
+#[derive(Clone)]
+struct Holding {
+    seen: Arc<Mutex<Vec<(String, i32)>>>,
+    release: watch::Receiver<bool>,
+}
+
+impl Holding {
+    fn new(release: watch::Receiver<bool>) -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            release,
+        }
+    }
+
+    fn seen(&self) -> Vec<(String, i32)> {
+        self.seen.lock().expect("handler mutex poisoned").clone()
+    }
+
+    fn has(&self, id: &str) -> bool {
+        self.seen().iter().any(|(seen, _)| seen == id)
+    }
+}
+
+impl MessageHandler<ReturnTopic> for Holding {
+    type Context = ();
+    async fn handle(&self, msg: Order, meta: MessageMetadata, _: &()) -> Outcome {
+        let partition = meta.partition.expect("Kafka fills the partition");
+        self.seen
+            .lock()
+            .expect("handler mutex poisoned")
+            .push((msg.id.clone(), partition));
+        if msg.id.starts_with("hold-") {
+            let mut release = self.release.clone();
+            release
+                .wait_for(|released| *released)
+                .await
+                .expect("the release sender outlives the handler");
+        }
+        Outcome::Ack
+    }
+}
+
+/// Produces one record pinned to `partition` of the return topic and
+/// returns the offset the broker gave it.
+async fn produce_pinned(bootstrap: &str, id: &str, partition: i32) -> i64 {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .expect("mock producer");
+    let payload = serde_json::to_vec(&Order { id: id.into() }).expect("encode the record");
+    let delivery = producer
+        .send(
+            FutureRecord::<(), Vec<u8>>::to(RETURN_TOPIC)
+                .partition(partition)
+                .payload(&payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("produce to the mock cluster");
+    assert_eq!(
+        delivery.partition, partition,
+        "the record lands where it was pinned"
+    );
+    delivery.offset
+}
+
+/// Starts a direct consumer on the return topic with `handler` and
+/// `options`, and returns its run task and the token that stops it.
+fn start_on_return_topic(
+    client: KafkaClient,
+    handler: Holding,
+    options: impl FnOnce(CancellationToken) -> ConsumerOptions<Kafka>,
+) -> (
+    tokio::task::JoinHandle<Result<(), ShoveError>>,
+    CancellationToken,
+) {
+    let shutdown = CancellationToken::new();
+    let opts = options(shutdown.clone());
+    let run = tokio::spawn(async move {
+        KafkaConsumer::new(client)
+            .run::<ReturnTopic, _>(handler, (), opts)
+            .await
+    });
+    (run, shutdown)
+}
+
+/// A partition handed back to a per-record member that idles unpaused
+/// arrives paused: the member paused its whole assignment while it held a
+/// record, and librdkafka keeps a partition's pause flag across a revoke.
+/// The assign event is drained by whichever arm runs next, and when the
+/// next thing through `recv()` is a record on the member's other partition,
+/// that is the receive arm. A record dropped before the handler, here one
+/// over the size limit, runs no pause and resume cycle after it, so the
+/// returned partition stays paused unless the receive arm's drain re-applies
+/// the intent. The record produced onto the returned partition afterwards is
+/// the proof: it reaches the handler only once the partition is resumed.
+///
+/// The receive arm drains the assign when the oversize record lands before
+/// the next housekeeping tick, which the test arranges by producing it as
+/// soon as the member's rejoin has been answered. A tick that comes first
+/// drains the assign at the top of a pass, through the same helper, so the
+/// test passes either way with the fix and fails without it in every run
+/// the tick does not win.
+#[tokio::test]
+async fn a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign() {
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    mock.api()
+        .create_topic(RETURN_TOPIC, 2, 1)
+        .expect("create the return topic through the mock API");
+    mock.track_requests();
+    let (release, released) = watch::channel(false);
+
+    // Member A: a commit per record, one permit, and a payload limit a
+    // padded record exceeds. It holds a record on partition 0, so its
+    // whole assignment is paused.
+    let a = Holding::new(released.clone());
+    let (run_a, token_a) = start_on_return_topic(connect(&bootstrap).await, a.clone(), |token| {
+        options(CommitPolicy::PerRecord, token).with_max_message_size(SIZE_LIMIT)
+    });
+    produce_pinned(&bootstrap, "hold-0", 0).await;
+    wait_until(|| a.has("hold-0"), DELIVERY_TIMEOUT, "A holding its record").await;
+    // One probe per partition, unconsumed while A is paused: whichever
+    // partition moves to B, B's first record comes from it.
+    for partition in RETURN_PARTITIONS {
+        produce_pinned(&bootstrap, &format!("probe-{partition}"), partition).await;
+    }
+
+    // Member B joins, and the cooperative rebalance moves one partition to
+    // it while A is paused.
+    let b = Holding::new(released);
+    let (run_b, token_b) = start_on_return_topic(connect(&bootstrap).await, b.clone(), |token| {
+        ConsumerOptions::<Kafka>::new().with_shutdown(token)
+    });
+    wait_until(
+        || !b.seen().is_empty(),
+        DELIVERY_TIMEOUT,
+        "the rebalance moving a partition to B",
+    )
+    .await;
+    let moved = b.seen()[0].1;
+    let kept = RETURN_PARTITIONS
+        .into_iter()
+        .find(|&partition| partition != moved)
+        .expect("two partitions");
+
+    // The holds end. A commits what it kept and resumes its assignment,
+    // which no longer holds the moved partition: that one keeps A's pause
+    // flag. A then works through the kept partition, a commit per record,
+    // and idles unpaused once the last is committed.
+    release.send(true).expect("the handlers hold the receiver");
+    let on_kept: i64 = if kept == 0 { 2 } else { 1 };
+    wait_until(
+        || {
+            a.seen()
+                .iter()
+                .filter(|(_, partition)| *partition == kept)
+                .count()
+                == usize::try_from(on_kept).expect("a small count")
+        },
+        DELIVERY_TIMEOUT,
+        "A working through the kept partition",
+    )
+    .await;
+    let committed_by = Instant::now() + DELIVERY_TIMEOUT;
+    while committed_position_on(&bootstrap, RETURN_TOPIC, RETURN_GROUP_ID, kept).await
+        != Some(on_kept)
+    {
+        assert!(
+            Instant::now() < committed_by,
+            "A commits every record on the kept partition {kept}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // B leaves, and its partition comes back to A, paused. A's rejoin ends
+    // with a SyncGroup answer, and the assign follows it inside A's
+    // `recv()`, where A is parked.
+    let syncs = mock.requests_of(RDKafkaApiKey::SyncGroup);
+    token_b.cancel();
+    run_b
+        .await
+        .expect("B's task completes")
+        .expect("B ends clean");
+    wait_until(
+        || mock.requests_of(RDKafkaApiKey::SyncGroup) > syncs,
+        DELIVERY_TIMEOUT,
+        "A's rejoin being answered",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The next record through A's `recv()` is over the size limit: the
+    // receive arm drains the assign and drops the record before the
+    // handler. The drop is committed like a completion, which is the sync
+    // point.
+    let oversize = produce_pinned(&bootstrap, &"x".repeat(SIZE_LIMIT), kept).await;
+    let dropped_by = Instant::now() + DELIVERY_TIMEOUT;
+    while committed_position_on(&bootstrap, RETURN_TOPIC, RETURN_GROUP_ID, kept).await
+        != Some(oversize + 1)
+    {
+        assert!(
+            Instant::now() < dropped_by,
+            "the oversize record's drop is committed on partition {kept}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !a.seen().iter().any(|(id, _)| id.len() >= SIZE_LIMIT),
+        "the oversize record never reached the handler"
+    );
+
+    // The returned partition is resumed, so a record on it is delivered.
+    produce_pinned(&bootstrap, "after-return", moved).await;
+    wait_until(
+        || a.has("after-return"),
+        RESUME_TIMEOUT,
+        "the record on the returned partition reaching A",
+    )
+    .await;
+
+    token_a.cancel();
+    run_a
+        .await
+        .expect("A's task completes")
+        .expect("A ends clean");
 }

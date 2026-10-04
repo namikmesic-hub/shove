@@ -3549,6 +3549,38 @@ where
     }
 }
 
+/// Under `CommitPolicy::PerRecord` the pause is the receive loop's intent
+/// over its whole assignment, while librdkafka keeps a pause flag per
+/// partition: one revoked while paused and handed back later arrives
+/// paused, one assigned fresh arrives unpaused. So every drain of the
+/// rebalance channel that saw an assign event re-applies the intent, here:
+/// the drain at the top of a pass, and the one the receive arm runs before
+/// it tracks a record. The receive arm's drain is the one an assign meets
+/// while the loop is parked in `recv()`, and a record dropped before the
+/// handler runs no pause and resume cycle after it, so without this call
+/// there a partition handed back paused would stay paused until another
+/// record passed the handler. Nothing to do under `Interval`, which never
+/// pauses on its own account, or when the drain saw no assign.
+fn reconcile_pause_after_assign(
+    consumer: &KafkaStreamConsumer,
+    per_record: bool,
+    paused: bool,
+    assigned: bool,
+) -> Result<()> {
+    if !(per_record && assigned) {
+        return Ok(());
+    }
+    if paused {
+        consumer
+            .pause_assignment()
+            .map_err(|e| map_kafka_error("pause failed", e))
+    } else {
+        consumer
+            .resume_assignment()
+            .map_err(|e| map_kafka_error("resume failed", e))
+    }
+}
+
 /// What a wait for a confirmed commit ends with; see [`commit_confirmed`].
 enum CommitAnswer {
     /// The coordinator accepted the commit.
@@ -5162,23 +5194,7 @@ impl KafkaConsumer {
                     }
                     let now = Instant::now();
                     let assigned = tracker.apply_rebalance_events(&rebalance_rx, now);
-                    // A partition librdkafka hands this member keeps the
-                    // pause flag it last had: one revoked while paused and
-                    // handed back later arrives paused, one assigned fresh
-                    // arrives unpaused. Under `PerRecord` the pause is this
-                    // loop's intent, so it is re-applied over the whole
-                    // assignment on every assign event, either way.
-                    if per_record && assigned {
-                        if paused {
-                            consumer
-                                .pause_assignment()
-                                .map_err(|e| map_kafka_error("pause failed", e))?;
-                        } else {
-                            consumer
-                                .resume_assignment()
-                                .map_err(|e| map_kafka_error("resume failed", e))?;
-                        }
-                    }
+                    reconcile_pause_after_assign(&consumer, per_record, paused, assigned)?;
                     if let Some(partition) = tracker.fenced(now, fence_timeout) {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Kafka,
@@ -5647,8 +5663,12 @@ impl KafkaConsumer {
                             // message arrives from the same poll. Apply pending
                             // events BEFORE tracking — otherwise the next
                             // iteration's drain would wipe the tracker entry this
-                            // message is about to seed.
-                            tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
+                            // message is about to seed. An assign drained here
+                            // reconciles the pause as the top-of-pass drain
+                            // does, see `reconcile_pause_after_assign`.
+                            let assigned =
+                                tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
+                            reconcile_pause_after_assign(&consumer, per_record, paused, assigned)?;
 
                             // A paused assignment delivers nothing it held when
                             // the pause took effect, so a record that arrives

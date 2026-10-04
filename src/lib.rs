@@ -377,6 +377,9 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::put_back_probe;
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::pending_commit_budget_for_test;
     /// Test-only counters (see the `test-support` feature) on the records the
     /// receive loop held while it waited for a prefetch permit, and on those
     /// the broadcast loop held for its slot, for tests that must have a
