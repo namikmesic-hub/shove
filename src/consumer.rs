@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::capability::HasBroadcast;
 use crate::backend::{Backend, ConsumerOptionsInner};
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::{KafkaAutoOffsetReset, validate_commit_interval};
+use crate::backends::kafka::{CommitPolicy, KafkaAutoOffsetReset, validate_commit_policy};
 use crate::broadcast::BroadcastStart;
 use crate::error::{Result, ShoveError};
 #[cfg(feature = "kafka")]
@@ -339,14 +339,31 @@ pub struct ConsumerOptions<B: Backend> {
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
 
     /// Kafka-only: how often the concurrent consumer commits the offsets its
-    /// handlers completed. `None` (the default) keeps the 500 ms gate. Set via
-    /// [`ConsumerOptions::<Kafka>::with_commit_interval`], which bounds it; a
-    /// value written to the field directly is checked against the same bound
-    /// where the consumer starts, and panics there if it is zero or longer
-    /// than one hour.
+    /// handlers completed. `None` (the default) keeps the 500 ms gate. A
+    /// value here is the `CommitPolicy::Interval` it always meant, and it
+    /// wins: [`into_inner`](Self::into_inner) reads a set field as that
+    /// interval whatever policy a setter stored, so code that writes the
+    /// field after a setter keeps the behaviour it had.
+    /// [`ConsumerOptions::<Kafka>::with_commit_interval`] sets it, as it
+    /// always did, and [`ConsumerOptions::<Kafka>::with_commit_policy`]
+    /// keeps it in step: an `Interval` sets it and `PerRecord` clears it.
+    /// The setter bounds the interval; a value written to the field directly
+    /// is checked against the same bound where the consumer starts, and
+    /// panics there if it is zero or longer than one hour.
     #[cfg(feature = "kafka")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
     pub kafka_commit_interval: Option<Duration>,
+
+    /// Kafka-only: how the concurrent consumer commits completed offsets.
+    /// `None` (the default) keeps `CommitPolicy::Interval` at 500 ms.
+    ///
+    /// Crate-private on purpose, like `retry_strategy`: it is set through
+    /// `ConsumerOptions::<Kafka>::with_commit_policy` and its shorthand
+    /// `with_commit_interval`, the setters of the one backend that reads
+    /// it, so no other backend's options can carry a policy that nothing
+    /// reads.
+    #[cfg(feature = "kafka")]
+    pub(crate) kafka_commit_policy: Option<CommitPolicy>,
 
     /// Where a broadcast subscription starts reading. `None` (the default)
     /// and `Some(BroadcastStart::Tail)` keep deliver-new. Set via
@@ -410,6 +427,8 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: None,
+            #[cfg(feature = "kafka")]
+            kafka_commit_policy: None,
             broadcast_start: None,
             retry_strategy: None,
             shutdown: None,
@@ -648,6 +667,18 @@ impl<B: Backend> ConsumerOptions<B> {
         } else {
             1
         };
+        // The public `kafka_commit_interval` field predates the policy and
+        // means `Interval`; the setters write the policy slot and keep the
+        // field in step. Folded here, the one funnel every direct and
+        // supervisor path passes through, so the loop reads one policy. A
+        // set field wins, as it did in 0.15: code that wrote the field after
+        // a setter keeps the behaviour it had. The bound on the interval
+        // itself is checked where the loop reads the policy, as before.
+        #[cfg(feature = "kafka")]
+        let kafka_commit_policy = self
+            .kafka_commit_interval
+            .map(CommitPolicy::Interval)
+            .or(self.kafka_commit_policy);
         ConsumerOptionsInner {
             max_retries: self.max_retries,
             prefetch_count: effective_prefetch,
@@ -666,9 +697,11 @@ impl<B: Backend> ConsumerOptions<B> {
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
-            kafka_commit_interval: self.kafka_commit_interval,
+            kafka_commit_policy,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_fence_floor: None,
             broadcast_start: self.broadcast_start,
             retry_strategy: self.retry_strategy,
             #[cfg(feature = "kafka-schema-registry")]
@@ -728,6 +761,8 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             kafka_auto_offset_reset: self.kafka_auto_offset_reset,
             #[cfg(feature = "kafka")]
             kafka_commit_interval: self.kafka_commit_interval,
+            #[cfg(feature = "kafka")]
+            kafka_commit_policy: self.kafka_commit_policy,
             broadcast_start: self.broadcast_start,
             retry_strategy: self.retry_strategy,
             shutdown: self.shutdown.clone(),
@@ -865,7 +900,10 @@ impl ConsumerOptions<Kafka> {
     }
 
     /// How often the concurrent consumer commits the offsets its handlers
-    /// completed. Unset keeps the 500 ms default.
+    /// completed. Unset keeps the 500 ms default. Shorthand for
+    /// [`with_commit_policy`](Self::with_commit_policy) with
+    /// [`CommitPolicy::Interval`]: both setters write the one policy slot,
+    /// so the last call wins.
     ///
     /// Completions are tracked in memory and committed asynchronously at
     /// most once per interval, so a longer interval trades coordinator
@@ -882,9 +920,40 @@ impl ConsumerOptions<Kafka> {
     /// `KafkaConsumerGroupConfig::with_commit_interval` applies: the commit
     /// gate adds the interval to an `Instant`, so the bound keeps every
     /// deadline representable.
-    pub fn with_commit_interval(mut self, interval: Duration) -> Self {
-        validate_commit_interval(interval);
-        self.kafka_commit_interval = Some(interval);
+    pub fn with_commit_interval(self, interval: Duration) -> Self {
+        self.with_commit_policy(CommitPolicy::Interval(interval))
+    }
+
+    /// How the concurrent consumer commits completed offsets; see
+    /// [`CommitPolicy`]. Unset keeps [`CommitPolicy::Interval`] at its
+    /// 500 ms default.
+    ///
+    /// [`CommitPolicy::PerRecord`] commits every completion before the next
+    /// record is handed out, and needs one prefetch permit:
+    /// [`with_prefetch_count(1)`](Self::with_prefetch_count), or
+    /// [`with_concurrent_processing(false)`](Self::with_concurrent_processing),
+    /// which clamps the count to one. `KafkaConsumer::run` refuses the
+    /// options with more, before any consumer is created. Read by the
+    /// direct and supervisor paths; for the coordinated registry path the
+    /// equivalent is
+    /// [`KafkaConsumerGroupConfig::with_commit_policy`](crate::kafka::KafkaConsumerGroupConfig::with_commit_policy).
+    /// A FIFO consumer, a broadcast subscription and the DLQ drain refuse a
+    /// policy at their entry points, as they refuse an interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the policy is an `Interval` of zero or longer than one
+    /// hour, the bound [`with_commit_interval`](Self::with_commit_interval)
+    /// applies.
+    pub fn with_commit_policy(mut self, policy: CommitPolicy) -> Self {
+        validate_commit_policy(policy);
+        self.kafka_commit_policy = Some(policy);
+        // The released field keeps reporting what it always reported: the
+        // interval the consumer commits on, and nothing under `PerRecord`.
+        self.kafka_commit_interval = match policy {
+            CommitPolicy::Interval(interval) => Some(interval),
+            CommitPolicy::PerRecord => None,
+        };
         self
     }
 
@@ -1334,6 +1403,8 @@ mod tests {
         assert_eq!(inner.kafka_auto_offset_reset, None);
     }
 
+    /// `with_commit_interval(d)` is shorthand for the `Interval(d)` policy:
+    /// one slot, so the two setters cannot configure a conflicting pair.
     #[cfg(feature = "kafka")]
     #[test]
     fn kafka_with_commit_interval_propagates_through_into_inner() {
@@ -1341,15 +1412,97 @@ mod tests {
         let inner = ConsumerOptions::<Kafka>::new()
             .with_commit_interval(Duration::from_secs(5))
             .into_inner();
-        assert_eq!(inner.kafka_commit_interval, Some(Duration::from_secs(5)));
+        assert_eq!(
+            inner.kafka_commit_policy,
+            Some(CommitPolicy::Interval(Duration::from_secs(5)))
+        );
     }
 
     #[cfg(feature = "kafka")]
     #[test]
-    fn kafka_commit_interval_defaults_to_none() {
+    fn kafka_with_commit_policy_propagates_through_into_inner() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new()
+            .with_commit_interval(Duration::from_secs(5))
+            .with_commit_policy(CommitPolicy::PerRecord)
+            .into_inner();
+        assert_eq!(
+            inner.kafka_commit_policy,
+            Some(CommitPolicy::PerRecord),
+            "the last setter call wins"
+        );
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_commit_policy_defaults_to_none() {
         use crate::markers::Kafka;
         let inner = ConsumerOptions::<Kafka>::new().into_inner();
-        assert_eq!(inner.kafka_commit_interval, None);
+        assert_eq!(inner.kafka_commit_policy, None);
+    }
+
+    /// The released field keeps its observable behaviour: the interval
+    /// setter still writes it, the policy setter keeps it in step.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_commit_interval_field_follows_both_setters() {
+        use crate::markers::Kafka;
+        let opts = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::from_secs(5));
+        assert_eq!(opts.kafka_commit_interval, Some(Duration::from_secs(5)));
+        let opts = opts.with_commit_policy(CommitPolicy::PerRecord);
+        assert_eq!(
+            opts.kafka_commit_interval, None,
+            "no interval under PerRecord"
+        );
+        let opts = opts.with_commit_policy(CommitPolicy::Interval(Duration::from_secs(7)));
+        assert_eq!(opts.kafka_commit_interval, Some(Duration::from_secs(7)));
+    }
+
+    /// The public `kafka_commit_interval` field, written past the setter,
+    /// still reaches the loop as the `Interval` policy it always meant.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_commit_interval_field_folds_into_the_interval_policy() {
+        use crate::markers::Kafka;
+        let mut opts = ConsumerOptions::<Kafka>::new();
+        opts.kafka_commit_interval = Some(Duration::from_secs(9));
+        assert_eq!(
+            opts.into_inner().kafka_commit_policy,
+            Some(CommitPolicy::Interval(Duration::from_secs(9)))
+        );
+    }
+
+    /// A field written after the setter wins, as it did in 0.15: the
+    /// released knob keeps its observable behaviour whatever the setter
+    /// stored before it.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_commit_interval_field_written_after_the_setter_wins() {
+        use crate::markers::Kafka;
+        let mut opts = ConsumerOptions::<Kafka>::new().with_commit_interval(Duration::from_secs(9));
+        opts.kafka_commit_interval = Some(Duration::from_secs(5));
+        assert_eq!(
+            opts.into_inner().kafka_commit_policy,
+            Some(CommitPolicy::Interval(Duration::from_secs(5)))
+        );
+        let mut opts = ConsumerOptions::<Kafka>::new().with_commit_policy(CommitPolicy::PerRecord);
+        opts.kafka_commit_interval = Some(Duration::from_secs(9));
+        assert_eq!(
+            opts.into_inner().kafka_commit_policy,
+            Some(CommitPolicy::Interval(Duration::from_secs(9))),
+            "a set field means the interval it always meant"
+        );
+    }
+
+    /// The policy setter applies the interval bound the interval setter
+    /// applies.
+    #[cfg(feature = "kafka")]
+    #[test]
+    #[should_panic(expected = "commit_interval must be positive")]
+    fn kafka_with_commit_policy_rejects_a_zero_interval() {
+        use crate::markers::Kafka;
+        let _ = ConsumerOptions::<Kafka>::new()
+            .with_commit_policy(CommitPolicy::Interval(Duration::ZERO));
     }
 
     #[cfg(feature = "kafka")]

@@ -220,9 +220,11 @@ mod bounds_smoke {
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
-            kafka_commit_interval: None,
+            kafka_commit_policy: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_fence_floor: None,
             broadcast_start: None,
             retry_strategy: None,
             #[cfg(feature = "kafka-schema-registry")]

@@ -21,8 +21,8 @@ use shove::consumer::ConsumerOptions;
 use shove::error::Result as ShoveResult;
 use shove::handler::MessageHandler;
 use shove::kafka::{
-    KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer, KafkaLagStatsProvider,
-    KafkaQueueStatsProvider,
+    CommitPolicy, KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer,
+    KafkaLagStatsProvider, KafkaQueueStatsProvider,
 };
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
@@ -80,6 +80,40 @@ impl MessageHandler<RebalanceTopic> for SetHandler {
         self.seen.lock().await.insert(msg.id);
         self.own_count.fetch_add(1, Ordering::Relaxed);
         Outcome::Ack
+    }
+}
+
+/// A `SetHandler` that can be told to hold the next record it is handed
+/// for a while before acknowledging it, so a test can keep a per-record
+/// member paused across a rebalance.
+#[derive(Clone)]
+struct HoldNextHandler {
+    inner: SetHandler,
+    hold_next: Arc<std::sync::Mutex<Option<Duration>>>,
+}
+
+impl HoldNextHandler {
+    fn new(seen: Arc<Mutex<HashSet<String>>>) -> Self {
+        Self {
+            inner: SetHandler::new(seen),
+            hold_next: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn hold_next(&self, hold: Duration) {
+        *self.hold_next.lock().expect("hold mutex poisoned") = Some(hold);
+    }
+}
+
+impl MessageHandler<RebalanceTopic> for HoldNextHandler {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, meta: MessageMetadata, ctx: &()) -> Outcome {
+        let hold = self.hold_next.lock().expect("hold mutex poisoned").take();
+        let outcome = self.inner.handle(msg, meta, ctx).await;
+        if let Some(hold) = hold {
+            tokio::time::sleep(hold).await;
+        }
+        outcome
     }
 }
 
@@ -671,4 +705,112 @@ async fn a_partition_revoked_with_work_pending_is_left_out_of_the_final_commit()
         .await
         .expect("B's task completes")
         .expect("B ends clean");
+}
+
+/// The same cycle under `CommitPolicy::PerRecord`, with A paused when B's
+/// join revokes partitions from it. A per-record member pauses its whole
+/// assignment while a record is in the handler, and librdkafka keeps a
+/// partition's pause flag across a revoke, so the partitions B hands back
+/// arrive paused, at a moment A is idle and not paused. The loop re-applies
+/// its intent on every assign event, so they are resumed; without that, the
+/// final batch's records on the returned partitions never reach A and the
+/// wait below times out.
+#[tokio::test]
+async fn per_record_member_resumes_partitions_returned_after_a_paused_revoke() {
+    const HOLD: Duration = Duration::from_secs(12);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("shove=debug")
+        .try_init();
+    let container = KafkaContainer::default()
+        .start()
+        .await
+        .expect("failed to start Kafka container");
+    let port = container
+        .get_host_port_ipv4(apache::KAFKA_PORT)
+        .await
+        .expect("failed to get Kafka port");
+    let bootstrap_servers = format!("127.0.0.1:{port}");
+    let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&bootstrap_servers), 10)
+        .await
+        .expect("failed to connect to Kafka");
+    let broker = Broker::<Kafka>::from_client(client.clone());
+    broker.topology().declare::<RebalanceTopic>().await.unwrap();
+
+    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Phase 1: A alone, one permit, a commit per record; a first batch is
+    // processed and committed on every partition.
+    let handler_a = HoldNextHandler::new(seen.clone());
+    let shutdown_a = CancellationToken::new();
+    let handle_a = {
+        let consumer = KafkaConsumer::new(client.clone());
+        let handler = handler_a.clone();
+        let shutdown = shutdown_a.clone();
+        tokio::spawn(async move {
+            consumer
+                .run::<RebalanceTopic, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new()
+                        .with_shutdown(shutdown)
+                        .with_prefetch_count(1)
+                        .with_concurrent_processing(true)
+                        .with_commit_policy(CommitPolicy::PerRecord),
+                )
+                .await
+        })
+    };
+    let batch1 = publish_batch(&broker, "b1", 16).await;
+    wait_for_ids(&seen, &batch1, "batch-1").await;
+    wait_for_zero_lag(
+        &client,
+        &bootstrap_servers,
+        "after batch 1 (single consumer)",
+    )
+    .await;
+
+    // Phase 2: A is handed one record and holds it, so it is paused, and B
+    // joins meanwhile: the cooperative rebalance revokes partitions from a
+    // paused member.
+    handler_a.hold_next(HOLD);
+    let held = publish_batch(&broker, "held", 1).await;
+    wait_for_ids(&seen, &held, "the held record").await;
+    let handler_b = SetHandler::new(seen.clone());
+    let shutdown_b = CancellationToken::new();
+    let handle_b = spawn_consumer(client.clone(), handler_b.clone(), shutdown_b.clone());
+    let join_deadline = Instant::now() + WAIT;
+    let mut probe = 0u32;
+    while handler_b.own_count.load(Ordering::Relaxed) == 0 {
+        assert!(
+            Instant::now() < join_deadline,
+            "consumer B never processed a message: the rebalance did not move partitions to it"
+        );
+        publish_batch(&broker, &format!("probe-{probe}"), 8).await;
+        probe += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Everything published so far is processed and committed, on A's
+    // partitions once its hold ends and on B's as they come. A is then idle
+    // and not paused.
+    let batch2 = publish_batch(&broker, "b2", 16).await;
+    wait_for_ids(&seen, &batch2, "batch-2").await;
+    wait_for_zero_lag(&client, &bootstrap_servers, "after batch 2 (two consumers)").await;
+
+    // Phase 3: B leaves; its partitions, paused when they left A, return to
+    // an idle A. A third batch must be processed and committed on every
+    // partition, the returned ones included.
+    shutdown_b.cancel();
+    handle_b.await.unwrap().ok();
+    let batch3 = publish_batch(&broker, "b3", 100).await;
+    wait_for_ids(&seen, &batch3, "batch-3").await;
+    wait_for_zero_lag(
+        &client,
+        &bootstrap_servers,
+        "after batch 3 (B's partitions back on a per-record A)",
+    )
+    .await;
+
+    shutdown_a.cancel();
+    handle_a.await.unwrap().ok();
+    broker.close().await;
 }

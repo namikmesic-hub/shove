@@ -14,7 +14,8 @@ use tracing::{debug, info, warn};
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::{
-    KafkaConsumer, reject_fifo_commit_interval, reject_fifo_in_place, resolve_retry_strategy,
+    KafkaConsumer, check_per_record_prefetch, reject_fifo_commit_policy, reject_fifo_in_place,
+    resolve_retry_strategy,
 };
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::RetryStrategy;
@@ -133,6 +134,52 @@ impl KafkaAutoOffsetReset {
 // KafkaConsumerGroupConfig
 // ---------------------------------------------------------------------------
 
+/// How the concurrent Kafka consumer commits the offsets its handlers
+/// completed.
+///
+/// Set with `with_commit_policy` on [`KafkaConsumerGroupConfig`] or on
+/// `ConsumerOptions::<Kafka>`; `with_commit_interval(d)` on either is
+/// shorthand for `Interval(d)`. Unset keeps `Interval` at its 500 ms
+/// default. Standard consumers only: a FIFO consumer and the DLQ drain
+/// commit each message as it settles, and a broadcast subscription commits
+/// nothing, so each refuses a policy at its entry point.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitPolicy {
+    /// Asynchronously, at most once per interval: completions are tracked
+    /// in memory and the position is committed when the window reopens, so
+    /// a crash replays about one interval of completed records. The
+    /// default, with a 500 ms interval. The interval must be positive and
+    /// at most one hour.
+    Interval(Duration),
+    /// On every completion, accepted by the coordinator before the next
+    /// record is handed out: the position is committed synchronously on a
+    /// thread of its own, the assignment is paused from the hand-out until
+    /// the commit is accepted, and the loop keeps polling meanwhile, so the
+    /// member serves its rebalance callbacks and stays inside
+    /// `max.poll.interval.ms`. The wait ends on shutdown, and is otherwise
+    /// bounded by librdkafka's request timeout, after which the commit
+    /// counts as rejected and is re-offered with the assignment still
+    /// paused. A crash therefore replays every record since the commit the
+    /// coordinator applied last: on a stable coordinator connection that is
+    /// the one record whose completion was not yet accepted, in the
+    /// handler, in a republish that had not landed, or in a commit still
+    /// unanswered or rejected, and it can be more when a commit was in
+    /// flight across a coordinator reconnect, because librdkafka retries an
+    /// abandoned commit on the next connection and the broker may apply the
+    /// abandoned copy after later commits; the Kafka page cites the lines.
+    /// A `Retry` or `Defer` whose republish fails ends the member with a
+    /// connection error, so the reconnect redelivers that record and
+    /// nothing behind it was handed out meanwhile. Every record
+    /// costs a commit round trip and a fetch round trip, because the resume
+    /// refetches from the position; an opt-in for a handler that is not
+    /// idempotent. Needs one prefetch permit: `prefetch_count(1)`, or
+    /// concurrent processing off. With more, a completion above an
+    /// unfinished lower offset confirms nothing, so the policy refuses the
+    /// configuration where the consumer starts.
+    PerRecord,
+}
+
 /// The one commit-interval check both `with_commit_interval` setters apply,
 /// on [`KafkaConsumerGroupConfig`] and on `ConsumerOptions::<Kafka>`, so the
 /// registry, direct and supervisor paths refuse the same values at the same
@@ -145,6 +192,16 @@ pub(crate) fn validate_commit_interval(interval: Duration) {
         "commit_interval must be at most {:?}, got {interval:?}",
         super::constants::MAX_COMMIT_INTERVAL
     );
+}
+
+/// The check both `with_commit_policy` setters apply: an `Interval` carries
+/// the interval bound, and `PerRecord` has nothing to check here, because
+/// its one constraint, a single prefetch permit, involves two settings and
+/// is checked where the consumer starts and at group registration.
+pub(crate) fn validate_commit_policy(policy: CommitPolicy) {
+    if let CommitPolicy::Interval(interval) = policy {
+        validate_commit_interval(interval);
+    }
 }
 #[derive(Clone)]
 pub struct KafkaConsumerGroupConfig {
@@ -170,10 +227,11 @@ pub struct KafkaConsumerGroupConfig {
     /// of `Earliest` (replay history). Override to `Latest` for tail-only
     /// consumers or to `None` to refuse silent replay/skip on a fresh group.
     auto_offset_reset: Option<KafkaAutoOffsetReset>,
-    /// How often each consumer commits the offsets its handlers completed.
-    /// `None` keeps the 500 ms default gate. See
+    /// How each consumer commits the offsets its handlers completed. `None`
+    /// keeps the 500 ms interval. See
+    /// [`with_commit_policy`](Self::with_commit_policy) and its shorthand
     /// [`with_commit_interval`](Self::with_commit_interval).
-    commit_interval: Option<Duration>,
+    commit_policy: Option<CommitPolicy>,
     /// How the members carry out `Retry` and `Defer`, see
     /// [`with_retry_strategy`](Self::with_retry_strategy). `None` lets the
     /// topology's ownership decide.
@@ -182,6 +240,10 @@ pub struct KafkaConsumerGroupConfig {
     /// [`with_max_poll_interval_for_test`](Self::with_max_poll_interval_for_test).
     #[cfg(feature = "test-support")]
     max_poll_interval: Option<Duration>,
+    /// Test-only floor of the fenced consumer detector's threshold, see
+    /// [`with_commit_fence_floor_for_test`](Self::with_commit_fence_floor_for_test).
+    #[cfg(feature = "test-support")]
+    fence_floor: Option<Duration>,
 
     /// Schema Registry client shared across every consumer spawned by this
     /// group. `None` disables registry-based decoding for the group.
@@ -233,10 +295,12 @@ impl KafkaConsumerGroupConfig {
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             group_id: None,
             auto_offset_reset: None,
-            commit_interval: None,
+            commit_policy: None,
             retry_strategy: None,
             #[cfg(feature = "test-support")]
             max_poll_interval: None,
+            #[cfg(feature = "test-support")]
+            fence_floor: None,
             #[cfg(feature = "kafka-schema-registry")]
             schema_registry: None,
             #[cfg(feature = "kafka-schema-registry")]
@@ -361,7 +425,10 @@ impl KafkaConsumerGroupConfig {
     }
 
     /// How often each consumer in the group commits the offsets its handlers
-    /// completed. Unset keeps the 500 ms default.
+    /// completed. Unset keeps the 500 ms default. Shorthand for
+    /// [`with_commit_policy`](Self::with_commit_policy) with
+    /// [`CommitPolicy::Interval`]: both setters write the one policy slot,
+    /// so the last call wins.
     ///
     /// Completions are tracked in memory and committed asynchronously at most
     /// once per interval, so a longer interval trades coordinator requests
@@ -380,9 +447,33 @@ impl KafkaConsumerGroupConfig {
     /// the interval to an `Instant`, so the bound keeps every deadline
     /// representable, and an hour is already far past any sane commit
     /// cadence: the interval is the replay window after a crash.
-    pub fn with_commit_interval(mut self, interval: Duration) -> Self {
-        validate_commit_interval(interval);
-        self.commit_interval = Some(interval);
+    pub fn with_commit_interval(self, interval: Duration) -> Self {
+        self.with_commit_policy(CommitPolicy::Interval(interval))
+    }
+
+    /// How each consumer in the group commits the offsets its handlers
+    /// completed; see [`CommitPolicy`]. Unset keeps
+    /// [`CommitPolicy::Interval`] at its 500 ms default.
+    ///
+    /// [`CommitPolicy::PerRecord`] commits every completion before the next
+    /// record is handed out, and needs one prefetch permit:
+    /// `with_prefetch_count(1)`, or concurrent processing off, which clamps
+    /// the count to one. `register` refuses a config with more, before
+    /// anything is declared or a member spawned. The fenced consumer
+    /// detector keeps its 60 s floor under `PerRecord`, because there is no
+    /// interval to scale it by.
+    ///
+    /// Standard groups only: `register_fifo` refuses a config that sets a
+    /// policy, as it refuses an interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the policy is an `Interval` of zero or longer than one
+    /// hour, the bound [`with_commit_interval`](Self::with_commit_interval)
+    /// applies.
+    pub fn with_commit_policy(mut self, policy: CommitPolicy) -> Self {
+        validate_commit_policy(policy);
+        self.commit_policy = Some(policy);
         self
     }
 
@@ -398,10 +489,31 @@ impl KafkaConsumerGroupConfig {
         self
     }
 
+    /// Test-only seam (see the `test-support` feature): judge the group's
+    /// concurrent members' rejected commits by this floor instead of the
+    /// pinned sixty seconds, so a test can watch the fenced consumer
+    /// detector fire in seconds. The threshold still grows with the commit
+    /// interval above the floor.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_commit_fence_floor_for_test(mut self, floor: Duration) -> Self {
+        self.fence_floor = Some(floor);
+        self
+    }
+
     /// Returns the explicitly configured commit interval, or `None` if the
-    /// 500 ms default should apply.
+    /// 500 ms default should apply or the policy is not an interval.
     pub fn commit_interval(&self) -> Option<Duration> {
-        self.commit_interval
+        match self.commit_policy {
+            Some(CommitPolicy::Interval(interval)) => Some(interval),
+            _ => None,
+        }
+    }
+
+    /// Returns the explicitly configured commit policy, or `None` if the
+    /// default, [`CommitPolicy::Interval`] at 500 ms, should apply.
+    pub fn commit_policy(&self) -> Option<CommitPolicy> {
+        self.commit_policy
     }
 
     /// How the group's members carry out `Retry` and `Defer`; see
@@ -969,11 +1081,12 @@ impl KafkaConsumerGroup {
             options.kafka_group_id = Some(Arc::from(gid.as_str()));
         }
         options.kafka_auto_offset_reset = self.config.auto_offset_reset;
-        options.kafka_commit_interval = self.config.commit_interval;
+        options.kafka_commit_policy = self.config.commit_policy;
         options.retry_strategy = self.config.retry_strategy;
         #[cfg(feature = "test-support")]
         {
             options.kafka_max_poll_interval = self.config.max_poll_interval;
+            options.kafka_fence_floor = self.config.fence_floor;
         }
         #[cfg(feature = "kafka-schema-registry")]
         {
@@ -1095,6 +1208,17 @@ impl KafkaConsumerGroupRegistry {
             &name,
             "KafkaConsumerGroupRegistry::register",
         )?;
+        // The same fail-fast point for the one constraint a per-record
+        // policy has: `KafkaConsumerGroup::new` clamps the count to one when
+        // concurrent processing is off, so only the concurrent case can
+        // carry more than one permit into a member.
+        if config.commit_policy == Some(CommitPolicy::PerRecord) && config.concurrent_processing {
+            check_per_record_prefetch(
+                config.prefetch_count,
+                &name,
+                "KafkaConsumerGroupRegistry::register",
+            )?;
+        }
 
         if self.groups.contains_key(&name) {
             metrics::record_backend_error(
@@ -1157,8 +1281,8 @@ impl KafkaConsumerGroupRegistry {
         if config.concurrent_processing() {
             return Err(reject_fifo_concurrency(T::topology().queue()));
         }
-        if config.commit_interval().is_some() {
-            return Err(reject_fifo_commit_interval(T::topology().queue()));
+        if config.commit_policy().is_some() {
+            return Err(reject_fifo_commit_policy(T::topology().queue()));
         }
         if config.retry_strategy() == Some(RetryStrategy::InPlace) {
             return Err(reject_fifo_in_place(T::topology().queue()));
@@ -1824,6 +1948,55 @@ mod tests {
         assert_eq!(cfg.commit_interval(), Some(Duration::from_secs(5)));
     }
 
+    // -- commit policy --
+
+    #[test]
+    fn commit_policy_defaults_to_none() {
+        assert_eq!(KafkaConsumerGroupConfig::new(1..=1).commit_policy(), None);
+    }
+
+    /// `with_commit_interval(d)` is shorthand for `with_commit_policy(Interval(d))`:
+    /// both setters write the one slot, so the last call wins and no
+    /// conflicting pair can be configured.
+    #[test]
+    fn with_commit_interval_is_shorthand_for_the_interval_policy() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_commit_interval(Duration::from_secs(5));
+        assert_eq!(
+            cfg.commit_policy(),
+            Some(CommitPolicy::Interval(Duration::from_secs(5)))
+        );
+        let cfg = cfg.with_commit_policy(CommitPolicy::PerRecord);
+        assert_eq!(cfg.commit_policy(), Some(CommitPolicy::PerRecord));
+        assert_eq!(
+            cfg.commit_interval(),
+            None,
+            "a per-record policy has no interval to report"
+        );
+    }
+
+    #[test]
+    fn with_commit_policy_interval_reports_through_the_interval_getter() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1)
+            .with_commit_policy(CommitPolicy::Interval(Duration::from_secs(7)));
+        assert_eq!(cfg.commit_interval(), Some(Duration::from_secs(7)));
+    }
+
+    /// The policy setter applies the interval bound the interval setter
+    /// applies, so the two cannot admit different values.
+    #[test]
+    #[should_panic(expected = "commit_interval must be positive")]
+    fn with_commit_policy_rejects_a_zero_interval() {
+        let _ = KafkaConsumerGroupConfig::new(1..=1)
+            .with_commit_policy(CommitPolicy::Interval(Duration::ZERO));
+    }
+
+    #[test]
+    #[should_panic(expected = "commit_interval must be at most")]
+    fn with_commit_policy_rejects_an_unrepresentable_interval() {
+        let _ = KafkaConsumerGroupConfig::new(1..=1)
+            .with_commit_policy(CommitPolicy::Interval(Duration::MAX));
+    }
+
     #[test]
     fn with_retry_strategy_is_unset_by_default_and_stores_the_choice() {
         assert_eq!(KafkaConsumerGroupConfig::new(1..=1).retry_strategy(), None);
@@ -2241,6 +2414,91 @@ mod tests {
                     && msg.contains("commits each message as it settles"),
                 "message must name the topic and the refused setting: {msg}"
             );
+        }
+
+        /// A FIFO consumer commits each message as it settles, so a
+        /// per-record policy would change nothing there and is refused like
+        /// the interval is.
+        #[tokio::test]
+        async fn register_fifo_rejects_a_per_record_commit_policy() {
+            let config =
+                KafkaConsumerGroupConfig::new(1..=4).with_commit_policy(CommitPolicy::PerRecord);
+
+            let err = registry()
+                .register_fifo::<GuardLedger, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("with_commit_policy must be rejected on a FIFO consumer");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-fifo-concurrency-guard")
+                    && msg.contains("is sequenced")
+                    && msg.contains("with_commit_policy")
+                    && msg.contains("commits each message as it settles"),
+                "message must name the topic and the refused setting: {msg}"
+            );
+        }
+
+        /// `CommitPolicy::PerRecord` needs one prefetch permit: with more,
+        /// a completion above an unfinished lower offset confirms nothing,
+        /// so a commit per record is not exact. Refused at registration,
+        /// before anything is declared or a member spawned, on the same
+        /// fail-fast point as the FIFO refusals.
+        #[tokio::test]
+        async fn register_rejects_per_record_commits_with_more_than_one_permit() {
+            let config = KafkaConsumerGroupConfig::new(1..=4)
+                .with_concurrent_processing(true)
+                .with_prefetch_count(2)
+                .with_commit_policy(CommitPolicy::PerRecord);
+
+            let err = registry()
+                .register::<GuardExternal, _>(config, || NoopHandler, ())
+                .await
+                .expect_err("PerRecord with two permits must be rejected");
+
+            let ShoveError::Topology(msg) = err else {
+                panic!("expected ShoveError::Topology, got {err:?}");
+            };
+            assert!(
+                msg.contains("kafka-register-guard-external")
+                    && msg.contains("CommitPolicy::PerRecord")
+                    && msg.contains("prefetch_count")
+                    && msg.contains("KafkaConsumerGroupRegistry::register"),
+                "message must name the topic, the policy and the entry point: {msg}"
+            );
+        }
+
+        /// Negative control: one permit is admitted, whether configured as
+        /// `prefetch_count(1)` with concurrent processing or as the clamp
+        /// concurrent processing off applies. The call runs past the guard
+        /// and only then fails on the absent client.
+        #[tokio::test]
+        async fn register_admits_per_record_commits_with_one_permit() {
+            for config in [
+                KafkaConsumerGroupConfig::new(1..=4)
+                    .with_concurrent_processing(true)
+                    .with_prefetch_count(1)
+                    .with_commit_policy(CommitPolicy::PerRecord),
+                KafkaConsumerGroupConfig::new(1..=4)
+                    .with_concurrent_processing(false)
+                    .with_prefetch_count(2)
+                    .with_commit_policy(CommitPolicy::PerRecord),
+            ] {
+                let err = registry()
+                    .register::<GuardExternal, _>(config, || NoopHandler, ())
+                    .await
+                    .expect_err("a client-less registry cannot finish registering");
+
+                let ShoveError::Topology(msg) = err else {
+                    panic!("expected ShoveError::Topology, got {err:?}");
+                };
+                assert!(
+                    msg.contains("registry has no client"),
+                    "expected to reach the client lookup past the guard, got: {msg}"
+                );
+            }
         }
 
         /// Negative control: the guard is conditional on the flag, not

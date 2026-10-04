@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::KafkaAutoOffsetReset;
+use crate::backends::kafka::{CommitPolicy, KafkaAutoOffsetReset};
 use crate::broadcast::BroadcastStart;
 use crate::consumer::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, RetryStrategy,
@@ -59,12 +59,14 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka")]
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
 
-    /// Kafka-only: the concurrent consumer's commit-gate window. `None`
-    /// keeps the 500 ms default. Propagated from
-    /// `KafkaConsumerGroupConfig::with_commit_interval` on the registry path
-    /// and from `ConsumerOptions::<Kafka>::with_commit_interval` otherwise.
+    /// Kafka-only: how the concurrent consumer commits completed offsets.
+    /// `None` keeps `CommitPolicy::Interval` at its 500 ms default.
+    /// Propagated from `KafkaConsumerGroupConfig::with_commit_policy` on
+    /// the registry path and from `ConsumerOptions::<Kafka>::with_commit_policy`
+    /// otherwise; `with_commit_interval` on either writes the same slot, and
+    /// `into_inner` folds the public `kafka_commit_interval` field into it.
     #[cfg(feature = "kafka")]
-    pub kafka_commit_interval: Option<Duration>,
+    pub kafka_commit_policy: Option<CommitPolicy>,
 
     /// Kafka-only, `test-support` builds: the `max.poll.interval.ms` the
     /// concurrent and FIFO members are created with, in place of the pinned
@@ -73,6 +75,14 @@ pub(crate) struct ConsumerOptionsInner {
     /// Propagated from `KafkaConsumerGroupConfig::with_max_poll_interval_for_test`.
     #[cfg(all(feature = "kafka", feature = "test-support"))]
     pub kafka_max_poll_interval: Option<Duration>,
+
+    /// Kafka-only, `test-support` builds: the floor of the fenced consumer
+    /// detector's threshold, in place of the pinned `COMMIT_FENCE_TIMEOUT`,
+    /// so an integration test can watch the fence fire in seconds rather
+    /// than a minute. Propagated from
+    /// `KafkaConsumerGroupConfig::with_commit_fence_floor_for_test`.
+    #[cfg(all(feature = "kafka", feature = "test-support"))]
+    pub kafka_fence_floor: Option<Duration>,
 
     /// Where a broadcast subscription starts reading. `None` keeps the tail.
     /// Propagated from `ConsumerOptions::with_broadcast_start`; read by
@@ -138,9 +148,11 @@ impl ConsumerOptionsInner {
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka")]
-            kafka_commit_interval: None,
+            kafka_commit_policy: None,
             #[cfg(all(feature = "kafka", feature = "test-support"))]
             kafka_max_poll_interval: None,
+            #[cfg(all(feature = "kafka", feature = "test-support"))]
+            kafka_fence_floor: None,
             broadcast_start: None,
             retry_strategy: None,
             #[cfg(feature = "kafka-schema-registry")]
