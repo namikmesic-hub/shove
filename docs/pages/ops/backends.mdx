@@ -107,7 +107,8 @@ The next record is handed out only once the coordinator has accepted that commit
 It is an opt-in for a handler that is not idempotent, and it needs one prefetch permit.
 On clean shutdown, shove first waits for the in-flight handlers to finish.
 That wait is bounded by the handler timeout and by any in-place delays on an external topic.
-It then commits the final position synchronously from a dedicated thread, which also closes the consumer, and waits at most 20 s for both, each reported on its own.
+It then commits the final position synchronously from a dedicated thread, which also closes the consumer.
+It waits at most 20 s for both, and the thread reports the two separately.
 That 20 s bound covers the concurrent consumer's final commit only.
 A final commit that is rejected, has no answer within the bound, or has no thread to run on (`CommitFailure::NoThread`) ends the member with `ShoveError::Commit`.
 A group counts that under `errors`, so the run's exit code is 1.
