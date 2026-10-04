@@ -3274,9 +3274,10 @@ pub(super) fn check_per_record_prefetch(
 ///
 /// `consumer` must be the loop's last `Arc` of the handle: the thread drops
 /// it after the commit, which is where `rd_kafka_consumer_close` runs, and
-/// reports its result only once that drop is done, so a result inside the
-/// deadline means the member has left the group. The one other holder there
-/// can be is a per-record commit thread shutdown did not wait out (see
+/// reports the commit's result and the close separately, each waited for
+/// inside `deadline`, so a close that outlives the deadline is logged and
+/// never read as a commit that missed it. The one other holder there can
+/// be is a per-record commit thread shutdown did not wait out (see
 /// [`commit_confirmed`]); then the close runs on whichever of the two
 /// threads drops last, off the runtime either way. `None` for `tpl` means
 /// there is nothing to commit and the thread only closes. The thread is
@@ -3366,10 +3367,12 @@ impl FinalCommit for Arc<KafkaStreamConsumer> {
 /// answering, is [`CommitFailure::Deadline`] with the time waited, its
 /// result unknown.
 ///
-/// The result is sent after the drop, not before it, so a result that
-/// arrives inside `deadline` means the close has run and the member has
-/// left its group; `run` returning cleanly says so. Past the deadline the
-/// thread finishes on its own, close included.
+/// The commit's result and the close are reported on two channels. The
+/// result goes out before the drop, so a landed commit followed by a slow
+/// LeaveGroup is a landed commit and not a missed deadline; the close is
+/// then waited for inside what is left of `deadline`, and a close that
+/// outlives it is logged, never returned. Past the deadline the thread
+/// finishes on its own, close included.
 async fn final_commit_on_thread<C, S>(
     consumer: C,
     tpl: Option<TopicPartitionList>,
@@ -3382,7 +3385,8 @@ where
     S: FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
 {
     let started = Instant::now();
-    let (done_tx, done_rx) = oneshot::channel::<KafkaResult<()>>();
+    let (committed_tx, committed_rx) = oneshot::channel::<KafkaResult<()>>();
+    let (closed_tx, closed_rx) = oneshot::channel::<()>();
     let handed = hand_to_new_thread(
         spawn,
         format!("shove-kafka-final-commit {queue}"),
@@ -3392,11 +3396,14 @@ where
                 Some(tpl) => consumer.commit_sync(&tpl),
                 None => Ok(()),
             };
+            // The commit's result goes out before the close, so a slow
+            // close is never read as a slow commit. Nobody may be listening
+            // any more; that is the deadline case.
+            let _ = committed_tx.send(result);
             // The last `Arc`: `rd_kafka_consumer_close` runs here, off the
             // runtime, however long the broker takes to answer.
             drop(consumer);
-            // Nobody may be listening any more; that is the deadline case.
-            let _ = done_tx.send(result);
+            let _ = closed_tx.send(());
         },
     );
     if let Err(((consumer, _tpl), e)) = handed {
@@ -3409,7 +3416,7 @@ where
         close_off_runtime_or_leak(consumer, queue, spawn);
         return Err(CommitFailure::NoThread);
     }
-    match tokio::time::timeout(deadline, done_rx).await {
+    let committed = match tokio::time::timeout(deadline, committed_rx).await {
         // librdkafka's text for the broker's answer: the error code and its
         // description, and nothing of the records behind the positions.
         Ok(Ok(result)) => result.map_err(|e| CommitFailure::Rejected(e.to_string())),
@@ -3432,7 +3439,29 @@ where
             );
             Err(CommitFailure::Deadline(deadline))
         }
+    };
+    // The close, inside what is left of the deadline. It is reported apart
+    // from the commit: a LeaveGroup the broker is slow to answer is logged
+    // here and changes nothing about `committed`.
+    let remaining = deadline.saturating_sub(started.elapsed());
+    match tokio::time::timeout(remaining, closed_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_recv)) => {
+            tracing::warn!(
+                queue,
+                "final commit thread ended before it reported the consumer's close"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                queue,
+                ?deadline,
+                "the consumer's close did not finish within the shutdown deadline; the thread \
+                 finishes it on its own"
+            );
+        }
     }
+    committed
 }
 
 /// Spawn a thread that waits for one `value`, then hand `value` to it.
@@ -11448,10 +11477,13 @@ mod final_commit_thread_tests {
 
     /// Stands in for the consumer: a commit answers as `answer` says and is
     /// recorded with its offsets, and the drop reports the thread it ran on.
+    /// With `close_release` set the drop first blocks until it is signalled
+    /// or dropped, like a close waiting on a slow LeaveGroup.
     struct DropProbe {
         events: std_mpsc::Sender<Event>,
         /// `None` for a commit that lands; the broker's error otherwise.
         answer: Option<KafkaError>,
+        close_release: Option<std_mpsc::Receiver<()>>,
     }
 
     impl FinalCommit for DropProbe {
@@ -11498,6 +11530,9 @@ mod final_commit_thread_tests {
 
     impl Drop for DropProbe {
         fn drop(&mut self) {
+            if let Some(release) = &self.close_release {
+                let _ = release.recv();
+            }
             let thread = std::thread::current();
             let _ = self.events.send(Event::Drop {
                 thread: thread.id(),
@@ -11512,7 +11547,30 @@ mod final_commit_thread_tests {
 
     fn probe_answering(answer: Option<KafkaError>) -> (DropProbe, std_mpsc::Receiver<Event>) {
         let (events, seen) = std_mpsc::channel();
-        (DropProbe { events, answer }, seen)
+        (
+            DropProbe {
+                events,
+                answer,
+                close_release: None,
+            },
+            seen,
+        )
+    }
+
+    /// A probe whose commit lands and whose close blocks until `release` is
+    /// signalled.
+    fn probe_with_slow_close(
+        release: std_mpsc::Receiver<()>,
+    ) -> (DropProbe, std_mpsc::Receiver<Event>) {
+        let (events, seen) = std_mpsc::channel();
+        (
+            DropProbe {
+                events,
+                answer: None,
+                close_release: Some(release),
+            },
+            seen,
+        )
     }
 
     /// `std::thread::Builder`, as production uses it.
@@ -11584,8 +11642,8 @@ mod final_commit_thread_tests {
         )
         .await;
         assert!(result.is_ok(), "{result:?}");
-        // The result is sent after the drop, so both events are already
-        // queued when it arrives: a clean result means the close has run.
+        // The close is waited for inside the deadline, so both events are
+        // already queued when the result arrives.
         let events: Vec<Event> = seen.try_iter().collect();
         let [
             Event::Commit {
@@ -11698,6 +11756,47 @@ mod final_commit_thread_tests {
                 [Event::Commit { .. }, Event::Drop { .. }]
             ),
             "the commit, then the close: {events:?}"
+        );
+    }
+
+    /// A commit that lands, followed by a close that outlives the deadline,
+    /// is a landed commit: the result comes back `Ok` at the deadline while
+    /// the close is still running, and the thread finishes the close on its
+    /// own. Before the commit and the close were reported apart, the close
+    /// held the result back and a slow LeaveGroup read as a commit that
+    /// missed its deadline.
+    #[tokio::test]
+    async fn a_landed_commit_followed_by_a_slow_close_is_not_a_failed_commit() {
+        const DEADLINE: Duration = Duration::from_millis(500);
+        let (release_tx, release) = std_mpsc::channel::<()>();
+        let (probe, seen) = probe_with_slow_close(release);
+        let started = Instant::now();
+        let result = final_commit_on_thread(
+            probe,
+            Some(one_offset()),
+            "orders",
+            DEADLINE,
+            &mut real_spawner(),
+        )
+        .await;
+        assert_eq!(result, Ok(()), "the commit landed, whatever the close does");
+        assert!(
+            started.elapsed() >= DEADLINE,
+            "the close is waited for inside the deadline, returned after {:?}",
+            started.elapsed()
+        );
+        let events: Vec<Event> = seen.try_iter().collect();
+        assert!(
+            matches!(events.as_slice(), [Event::Commit { .. }]),
+            "the commit has run and the close has not finished: {events:?}"
+        );
+        // Let the close finish; it runs on the thread, late, and reports to
+        // nobody.
+        let _ = release_tx.send(());
+        let events = events_until_the_drop(&seen);
+        assert!(
+            matches!(events.as_slice(), [Event::Drop { .. }]),
+            "the close finishes on its own thread: {events:?}"
         );
     }
 
