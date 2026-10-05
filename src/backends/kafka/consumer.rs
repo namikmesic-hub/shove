@@ -3077,8 +3077,9 @@ pub mod per_record_probe {
     /// Assigns a per-record loop reconciled from the drain at the top of a
     /// pass.
     pub static RECONCILED_AT_TOP_OF_PASS: AtomicUsize = AtomicUsize::new(0);
-    /// Assigns a per-record loop reconciled from the receive arm's drain.
-    pub static RECONCILED_AT_RECEIVE_ARM: AtomicUsize = AtomicUsize::new(0);
+    /// Assigns a per-record loop's receive arm drained ahead of the record
+    /// that brought them, whose pause and resume cycle then covers them.
+    pub static ASSIGNS_DRAINED_AT_RECEIVE_ARM: AtomicUsize = AtomicUsize::new(0);
 
     pub fn commit_attempts() -> usize {
         COMMIT_ATTEMPTS.load(Ordering::SeqCst)
@@ -3092,8 +3093,8 @@ pub mod per_record_probe {
         RECONCILED_AT_TOP_OF_PASS.load(Ordering::SeqCst)
     }
 
-    pub fn reconciled_at_receive_arm() -> usize {
-        RECONCILED_AT_RECEIVE_ARM.load(Ordering::SeqCst)
+    pub fn assigns_drained_at_receive_arm() -> usize {
+        ASSIGNS_DRAINED_AT_RECEIVE_ARM.load(Ordering::SeqCst)
     }
 }
 
@@ -3372,15 +3373,17 @@ where
 /// Under `CommitPolicy::PerRecord` the pause is the receive loop's intent
 /// over its whole assignment, while librdkafka keeps a pause flag per
 /// partition: one revoked while paused and handed back later arrives
-/// paused, one assigned fresh arrives unpaused. So every drain of the
-/// rebalance channel that saw an assign event re-applies the intent, here:
-/// the drain at the top of a pass, and the one the receive arm runs before
-/// it tracks a record. The receive arm's drain is the one an assign meets
-/// while the loop is parked in `recv()`, and a record dropped before the
-/// handler runs no pause and resume cycle after it, so without this call
-/// there a partition handed back paused would stay paused until another
-/// record passed the handler. Nothing to do under `Interval`, which never
-/// pauses on its own account, or when the drain saw no assign.
+/// paused, one assigned fresh arrives unpaused. The drain at the top of a
+/// pass re-applies the intent when it saw an assign event: that drain is
+/// the one an assign meets when nothing comes through `recv()`, on the
+/// housekeeping tick of an idle member, and without this call a partition
+/// handed back paused would stay paused until a record on another
+/// partition was taken. The receive arm's drain needs no call of its own:
+/// the record that brought it is taken next, and under `PerRecord` taking
+/// a record pauses the whole assignment and the commit of its completion,
+/// or of its drop, resumes the whole assignment, the returned partition
+/// included. Nothing to do under `Interval`, which never pauses on its own
+/// account, or when the drain saw no assign.
 fn reconcile_pause_after_assign(
     consumer: &KafkaStreamConsumer,
     per_record: bool,
@@ -5467,15 +5470,22 @@ impl KafkaConsumer {
                             // events BEFORE tracking — otherwise the next
                             // iteration's drain would wipe the tracker entry this
                             // message is about to seed. An assign drained here
-                            // reconciles the pause as the top-of-pass drain
-                            // does, see `reconcile_pause_after_assign`.
+                            // needs no reconciling of its own: under
+                            // `PerRecord` the record below pauses the whole
+                            // assignment the moment it is taken, and the
+                            // commit of its completion, or of its drop,
+                            // resumes the whole assignment, a partition handed
+                            // back paused included. The top-of-pass drain is
+                            // the one that must reconcile, see
+                            // `reconcile_pause_after_assign`.
+                            #[cfg_attr(not(feature = "test-support"), allow(unused_variables))]
                             let assigned =
                                 tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
                             #[cfg(feature = "test-support")]
                             if per_record && assigned {
-                                per_record_probe::RECONCILED_AT_RECEIVE_ARM.fetch_add(1, Ordering::SeqCst);
+                                per_record_probe::ASSIGNS_DRAINED_AT_RECEIVE_ARM
+                                    .fetch_add(1, Ordering::SeqCst);
                             }
-                            reconcile_pause_after_assign(&consumer, per_record, paused, assigned)?;
 
                             // A paused assignment delivers nothing it held when
                             // the pause took effect, so a record that arrives

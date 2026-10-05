@@ -105,7 +105,7 @@ pub enum ShoveError {
 /// can be added later.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "final offset commit on '{topic}' for {} was not confirmed: {kind}",
+    "offset commit at shutdown on '{topic}' for {} was not confirmed: {kind}",
     format_offsets(offsets)
 )]
 #[non_exhaustive]
@@ -262,7 +262,7 @@ mod tests {
     fn display_commit_error_names_the_topic_the_offsets_and_the_kind() {
         assert_eq!(
             commit_error().to_string(),
-            "final offset commit on 'orders' for [0@8, 3@12] was not confirmed: \
+            "offset commit at shutdown on 'orders' for [0@8, 3@12] was not confirmed: \
              rejected: Broker: Group authorization failed"
         );
         let deadline = ShoveError::Commit(Box::new(FailedCommit {
@@ -272,7 +272,7 @@ mod tests {
         }));
         assert_eq!(
             deadline.to_string(),
-            "final offset commit on 'orders' for [0@8] was not confirmed: no answer after \
+            "offset commit at shutdown on 'orders' for [0@8] was not confirmed: no answer after \
              waiting 20s; the result is unknown"
         );
         assert_eq!(

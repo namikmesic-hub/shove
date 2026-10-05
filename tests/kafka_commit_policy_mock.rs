@@ -533,14 +533,14 @@ async fn per_record_issues_one_offset_commit_per_completion() {
 
 /// The control: six records under `Interval` cost one commit inside the
 /// window and one at the stop, against the six a `PerRecord` member makes.
-/// The window is thirty seconds, so the five completions after the first
-/// fall inside it whatever the runner's speed: the first completion finds
-/// the gate open and is committed at once, the rest wait for the window,
-/// and the stop's final commit carries them. An exact count of two inside
-/// a two second window depended on the runner.
+/// The window is twice the test's own delivery bound, so every schedule the
+/// test accepts falls inside it: the first completion finds the gate open
+/// and is committed at once, the rest wait for the window, and the stop's
+/// final commit carries them. An exact count inside a window shorter than
+/// the bound depended on the runner.
 #[tokio::test]
 async fn interval_commits_once_inside_the_window_and_once_at_the_stop_over_six_records() {
-    const INTERVAL: Duration = Duration::from_secs(30);
+    const INTERVAL: Duration = DELIVERY_TIMEOUT.saturating_mul(2);
     let mock = Mock::start();
     let bootstrap = mock.bootstrap();
     produce(&bootstrap, &["o1", "o2", "o3", "o4", "o5", "o6"]).await;
@@ -1563,15 +1563,17 @@ impl ReturnCycle {
 /// The assign event is drained by whichever arm runs next, and when the
 /// next thing through `recv()` is a record on the member's other partition,
 /// that is the receive arm. A record dropped before the handler, here one
-/// over the size limit, runs no pause and resume cycle after it, so the
-/// returned partition stays paused unless the receive arm's drain re-applies
-/// the intent. The record produced onto the returned partition afterwards is
-/// the proof: it reaches the handler only once the partition is resumed.
+/// over the size limit, is taken like any other: the pause the moment it is
+/// taken and the resume once its drop is committed cover the whole
+/// assignment, the returned partition included. The record produced onto
+/// the returned partition afterwards is the proof: it reaches the handler
+/// only once the partition is resumed. Red without the pause at the take,
+/// where the drop ran no cycle and the partition stayed paused.
 ///
-/// The drain-site probe says which drain reconciled the assign. The
-/// oversize record is produced as soon as the assign is queued, so the
-/// receive arm meets it unless the housekeeping tick fires first, in which
-/// case the cycle runs again; the top-of-pass path has its own test below.
+/// The drain-site probe says which drain took the assign. The oversize
+/// record is produced as soon as the assign is queued, so the receive arm
+/// drains it unless the housekeeping tick fires first, in which case the
+/// cycle runs again; the top-of-pass path has its own test below.
 #[tokio::test]
 async fn a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign() {
     let mut cycle = ReturnCycle::start().await;
@@ -1579,11 +1581,12 @@ async fn a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_t
     for round in 1..=RECEIVE_ARM_ATTEMPTS {
         let (moved, kept) = cycle.hand_a_partition_back_paused(round).await;
         let at_top_of_pass = per_record_probe::reconciled_at_top_of_pass();
-        let at_receive_arm = per_record_probe::reconciled_at_receive_arm();
+        let at_receive_arm = per_record_probe::assigns_drained_at_receive_arm();
         cycle.drop_an_oversize_record_on(kept).await;
-        if per_record_probe::reconciled_at_receive_arm() > at_receive_arm {
-            // The receive arm drained the assign and reconciled it: the
-            // returned partition was resumed with the rest.
+        if per_record_probe::assigns_drained_at_receive_arm() > at_receive_arm {
+            // The receive arm drained the assign ahead of the oversize
+            // record, whose pause and resume cycle resumed the returned
+            // partition with the rest.
             cycle
                 .prove_resumed(moved, &format!("after-return-{round}"))
                 .await;
@@ -1619,7 +1622,7 @@ async fn a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign
     let mut cycle = ReturnCycle::start().await;
     let (moved, _kept) = cycle.hand_a_partition_back_paused(1).await;
     let at_top_of_pass = per_record_probe::reconciled_at_top_of_pass();
-    let at_receive_arm = per_record_probe::reconciled_at_receive_arm();
+    let at_receive_arm = per_record_probe::assigns_drained_at_receive_arm();
 
     // Nothing is produced, so the next pass is the housekeeping tick's.
     tokio::time::sleep(housekeeping_interval_for_test() + Duration::from_secs(1)).await;
@@ -1628,7 +1631,7 @@ async fn a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign
         "the housekeeping pass drained the assign and reconciled it"
     );
     assert_eq!(
-        per_record_probe::reconciled_at_receive_arm(),
+        per_record_probe::assigns_drained_at_receive_arm(),
         at_receive_arm,
         "nothing came through recv meanwhile"
     );
