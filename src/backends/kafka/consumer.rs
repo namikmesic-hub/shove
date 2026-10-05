@@ -3052,6 +3052,27 @@ async fn final_commit_off_runtime(
     .await
 }
 
+/// Test-only counters (see the `test-support` feature) for what a
+/// `CommitPolicy::PerRecord` loop does that nothing else observes: a commit
+/// attempted while no thread can carry it leaves no request at the broker
+/// and no record at the handler, so a test that holds the next record
+/// behind it needs this to know the attempt was made. nextest runs each
+/// test in its own process, so the counters belong to that test's
+/// consumers alone.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod per_record_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Entries into `commit_confirmed`: every per-record commit the loop
+    /// attempted, carried or not.
+    pub static COMMIT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn commit_attempts() -> usize {
+        COMMIT_ATTEMPTS.load(Ordering::SeqCst)
+    }
+}
+
 /// Test-only switch (see the `test-support` feature): refuses every thread
 /// the shutdown path asks for, and every per-record commit thread (see
 /// [`commit_confirmed`]), the way an exhausted host does, so an integration
@@ -3386,6 +3407,8 @@ async fn commit_confirmed(
     queue: &str,
     paused: &mut bool,
 ) -> Result<CommitAnswer> {
+    #[cfg(feature = "test-support")]
+    per_record_probe::COMMIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
     let (done_tx, done_rx) = oneshot::channel::<KafkaResult<()>>();
     let handed = hand_to_new_thread(
         &mut |name, body| {
@@ -4977,6 +5000,24 @@ impl KafkaConsumer {
                                         tracker.mark_dirty(partition, now);
                                     }
                                     commit_gate.mark_rejected(now);
+                                    // A rejected position holds the next
+                                    // record back whatever brought the loop
+                                    // here. A record taken paused the
+                                    // assignment already; a position
+                                    // re-offered after a rebalance was
+                                    // committed with nothing paused, and its
+                                    // rejection pauses the same way, until a
+                                    // re-offer is accepted.
+                                    if !paused {
+                                        consumer
+                                            .pause_assignment()
+                                            .map_err(|e| map_kafka_error("pause failed", e))?;
+                                        paused = true;
+                                        tracing::info!(
+                                            queue,
+                                            "offset commit rejected; assignment paused until a re-offer is accepted"
+                                        );
+                                    }
                                 }
                                 CommitAnswer::Cancelled(answer) => {
                                     // Shutdown fired during the wait. The
@@ -5024,9 +5065,9 @@ impl KafkaConsumer {
                     }
 
                     // Under `PerRecord` the assignment is paused from the
-                    // moment a record is handed out until the commit of its
-                    // completion is accepted, see the pause below the
-                    // handler spawn: librdkafka hands the next record to any
+                    // moment a record is taken until the commit of its
+                    // completion, or of its drop, is accepted, see the pause
+                    // in the receive arm: librdkafka hands the next record to any
                     // `recv()`, and the loop must keep calling `recv()` to
                     // serve rebalance callbacks and its poll budget, so the
                     // one way to poll without taking a record is to pause.
@@ -5403,6 +5444,31 @@ impl KafkaConsumer {
                                 continue;
                             }
                             tracker.track_received(partition, offset);
+
+                            // Under `PerRecord` nothing may be taken until
+                            // the commit of this record's completion is
+                            // accepted, and the loop keeps polling meanwhile,
+                            // so the assignment is paused here, the moment
+                            // the record is taken and before anything decides
+                            // its fate. A record dropped before the handler,
+                            // oversize or undecodable, commits its position
+                            // like a completion and must hold the next record
+                            // back the same way, so the pause cannot wait for
+                            // the handler spawn below. Resumed at the top of
+                            // the pass that finds nothing left to commit; see
+                            // the resume for the reasoning.
+                            if per_record && !paused {
+                                consumer
+                                    .pause_assignment()
+                                    .map_err(|e| map_kafka_error("pause failed", e))?;
+                                paused = true;
+                                tracing::debug!(
+                                    queue,
+                                    partition,
+                                    offset,
+                                    "record taken; assignment paused until its commit is accepted"
+                                );
+                            }
 
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
 
@@ -5826,25 +5892,6 @@ impl KafkaConsumer {
                                     task_processing.store(false, Ordering::Release);
                                 }
                             });
-
-                            // Under `PerRecord` nothing may be taken until
-                            // the commit of this record's completion is
-                            // accepted, and the loop keeps polling meanwhile,
-                            // so the assignment is paused here and resumed at
-                            // the top of the pass that finds nothing left to
-                            // commit; see the resume for the reasoning.
-                            if per_record && !paused {
-                                consumer
-                                    .pause_assignment()
-                                    .map_err(|e| map_kafka_error("pause failed", e))?;
-                                paused = true;
-                                tracing::debug!(
-                                    queue,
-                                    partition,
-                                    offset,
-                                    "record handed out; assignment paused until its commit is accepted"
-                                );
-                            }
                         }
                     }
                 }
