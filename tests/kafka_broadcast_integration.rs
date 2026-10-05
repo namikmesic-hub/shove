@@ -1582,6 +1582,11 @@ async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
 
     let broker = tb.broker().await;
     let handler = GatedFirst::new(Outcome::Defer);
+    // The count before the loop starts: every record the loop takes
+    // passes through the slot wait, "1" included, which is handed the
+    // free slot at once, so the second entry from here is "2", held for
+    // the slot "1" holds.
+    let entered_before = permit_wait_probe::broadcast_entered();
     let mut sub = broker.broadcast_subscriber();
     sub.subscribe::<StopTopic, _>(
         handler.clone(),
@@ -1597,8 +1602,10 @@ async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
     }
     assert_eq!(handler.calls().await, vec!["1".to_string()]);
     // "1" runs at the gate holding the slot; "2" is in the loop's hand
-    // behind it once the loop has entered the slot wait.
-    while permit_wait_probe::broadcast_entered() == 0 {
+    // behind it once the loop has entered the slot wait a second time.
+    // The first entry alone is "1"'s own, made before its call was seen,
+    // and a stop landed on it would land before "2" is read at all.
+    while permit_wait_probe::broadcast_entered() < entered_before + 2 {
         assert!(
             Instant::now() < deadline,
             "record 2 never reached the slot wait behind the first record"
@@ -1650,6 +1657,11 @@ async fn a_stop_in_the_instant_the_slot_is_acquired_drops_the_record_in_hand() {
 
     let broker = tb.broker().await;
     let handler = GatedFirst::new(Outcome::Ack);
+    // The count before the loop starts: every record the loop takes
+    // passes through the slot wait, "1" included, which is handed the
+    // free slot at once, so the second entry from here is "2", held for
+    // the slot "1" holds.
+    let entered_before = permit_wait_probe::broadcast_entered();
     let mut sub = broker.broadcast_subscriber();
     sub.subscribe::<StopTopic, _>(
         handler.clone(),
@@ -1664,7 +1676,9 @@ async fn a_stop_in_the_instant_the_slot_is_acquired_drops_the_record_in_hand() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(handler.calls().await, vec!["1".to_string()]);
-    while permit_wait_probe::broadcast_entered() == 0 {
+    // The second entry is "2", held behind "1": the first is "1"'s own,
+    // made before its call was seen.
+    while permit_wait_probe::broadcast_entered() < entered_before + 2 {
         assert!(
             Instant::now() < deadline,
             "record 2 never reached the slot wait behind the first record"
