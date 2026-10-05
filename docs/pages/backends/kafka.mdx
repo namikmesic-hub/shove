@@ -460,7 +460,9 @@ That threshold grows with the interval, because the streak can only clear on a d
 Under `CommitPolicy::PerRecord`, set with `with_commit_policy` on the same two configs, every completion is committed at once.
 The next record is handed out only once the coordinator has accepted that commit.
 The commit runs synchronously on a thread of its own, so it never blocks the runtime thread.
-The consumer pauses its assignment when it hands a record out and keeps polling, so rebalance callbacks are served and the member stays inside `max.poll.interval.ms`.
+The consumer pauses its assignment the moment it takes a record, before anything decides its fate, and keeps polling.
+Rebalance callbacks are therefore served, and the member stays inside `max.poll.interval.ms`.
+A record dropped before the handler, oversize or undecodable, commits its position the same way and holds the next record back until that commit is accepted.
 It resumes once the commit is accepted and refetches from the position, so every record costs a fetch round trip beside its commit.
 The wait for the answer ends on shutdown, and is otherwise bounded by librdkafka's request timeout, `socket.timeout.ms`, after which the commit counts as rejected.
 A rejected commit is re-offered as under `Interval`, spaced by the default 500 ms.

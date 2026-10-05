@@ -52,7 +52,7 @@ use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
     CommitPolicy, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig, fence_probe,
-    final_commit_spawn_probe, shutdown_commit_deadline_for_test,
+    final_commit_spawn_probe, per_record_probe, shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
@@ -275,6 +275,22 @@ async fn connect(bootstrap: &str) -> KafkaClient {
 /// JSON.
 async fn produce(bootstrap: &str, ids: &[&str]) {
     produce_on(bootstrap, TOPIC, ids).await;
+}
+
+/// Produces one record onto the topic with `payload` as is, so a test can
+/// put a record the topic's codec cannot decode in front of valid ones.
+async fn produce_raw(bootstrap: &str, payload: Vec<u8>) {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .expect("mock producer");
+    producer
+        .send(
+            FutureRecord::<(), Vec<u8>>::to(TOPIC).payload(&payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("produce to the mock cluster");
 }
 
 /// `produce` onto another topic of the same shape.
@@ -754,6 +770,158 @@ async fn a_commit_without_a_thread_is_not_confirmed_and_is_re_offered() {
         mock.offset_commit_requests(),
         2,
         "the refused attempts sent nothing; one commit per record once threads were allowed"
+    );
+
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+}
+
+/// A record dropped before the handler, here one the codec cannot decode,
+/// is committed like a completion and holds the next record back the same
+/// way. Every commit thread is refused, so the drop's commit confirms
+/// nothing and is re-offered with the assignment paused: the valid record
+/// behind it must not reach the handler meanwhile. Once threads are allowed
+/// the re-offer lands, and the valid record arrives with the drop's
+/// position already committed. Red before: the drop ran no pause, so the
+/// valid record reached the handler with nothing committed.
+#[tokio::test]
+async fn a_record_dropped_before_the_handler_holds_the_next_record_until_its_commit_is_accepted() {
+    /// Four re-offer windows: long enough for the drop's commit to be
+    /// re-offered, short enough to keep the test to its scenario.
+    const HOLD: Duration = Duration::from_secs(2);
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce_raw(&bootstrap, b"not the topic's json".to_vec()).await;
+    produce(&bootstrap, &["o2"]).await;
+    mock.track_requests();
+    final_commit_spawn_probe::refuse_threads(true);
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::PerRecord, token)
+    });
+
+    // The drop's commit is attempted, has no thread, and is re-offered;
+    // nothing reaches the broker and the valid record waits behind it.
+    wait_until(
+        || per_record_probe::commit_attempts() >= 1,
+        DELIVERY_TIMEOUT,
+        "the drop's commit being attempted",
+    )
+    .await;
+    tokio::time::sleep(HOLD).await;
+    assert_eq!(
+        handler.count(),
+        0,
+        "the valid record waits behind the unconfirmed drop: {:?}",
+        handler.ids()
+    );
+    assert_eq!(
+        mock.offset_commit_requests(),
+        0,
+        "no thread, so nothing reached the broker"
+    );
+    assert_eq!(committed_position(&bootstrap).await, None);
+    assert!(
+        per_record_probe::commit_attempts() >= 2,
+        "the drop's commit was re-offered meanwhile, attempts {}",
+        per_record_probe::commit_attempts()
+    );
+
+    // Threads again: the re-offer lands, the assignment resumes, and the
+    // valid record arrives behind a committed position.
+    final_commit_spawn_probe::refuse_threads(false);
+    wait_until(
+        || handler.count() == 1,
+        DELIVERY_TIMEOUT,
+        "the valid record reaching the handler",
+    )
+    .await;
+    assert_eq!(handler.ids(), vec!["o2".to_string()]);
+    assert!(
+        committed_position(&bootstrap).await.unwrap_or(0) >= 1,
+        "the drop's position was committed before the valid record was handed out"
+    );
+    wait_for_committed_position(&bootstrap, 2, DELIVERY_TIMEOUT).await;
+    assert_eq!(
+        mock.offset_commit_requests(),
+        2,
+        "the drop's re-offer that landed, and the valid record's commit"
+    );
+
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+}
+
+/// The same drop with its commit rejected twice by the broker: the valid
+/// record waits while the position is re-offered, and arrives once the
+/// third attempt is accepted, behind a committed position. The valid record
+/// is produced only once the first rejection is at the broker, so it meets
+/// an idle member between re-offers and not the commit wait, whose own
+/// put-back would pause for it. Red before: the drop ran no pause and the
+/// rejection paused nothing, so the valid record reached the handler while
+/// the drop's position was still rejected.
+#[tokio::test]
+async fn a_record_dropped_before_the_handler_holds_the_next_record_while_its_commit_is_rejected() {
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce_raw(&bootstrap, b"not the topic's json".to_vec()).await;
+    mock.track_requests();
+    mock.reject_commits(2);
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::PerRecord, token)
+    });
+
+    // The first rejection is at the broker; the valid record arrives behind
+    // a rejected position, with the member between re-offers.
+    wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "the drop's commit being rejected once",
+    )
+    .await;
+    produce(&bootstrap, &["o2"]).await;
+
+    // The second rejection, and the valid record still waiting.
+    wait_until(
+        || mock.offset_commit_requests() >= 2,
+        DELIVERY_TIMEOUT,
+        "the drop's commit being rejected twice",
+    )
+    .await;
+    assert_eq!(
+        handler.count(),
+        0,
+        "the valid record waits while the drop's position is rejected: {:?}",
+        handler.ids()
+    );
+    assert_eq!(committed_position(&bootstrap).await, None);
+
+    // The third attempt is accepted, and the valid record follows it.
+    wait_until(
+        || handler.count() == 1,
+        DELIVERY_TIMEOUT,
+        "the valid record reaching the handler",
+    )
+    .await;
+    assert_eq!(handler.ids(), vec!["o2".to_string()]);
+    assert!(
+        committed_position(&bootstrap).await.unwrap_or(0) >= 1,
+        "the drop's position was accepted before the valid record was handed out"
+    );
+    wait_for_committed_position(&bootstrap, 2, DELIVERY_TIMEOUT).await;
+    assert_eq!(
+        mock.offset_commit_requests(),
+        4,
+        "two rejections and the accepted re-offer for the drop, then the valid record's commit"
     );
 
     shutdown.cancel();

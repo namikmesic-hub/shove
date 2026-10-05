@@ -405,6 +405,9 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::final_commit_spawn_probe;
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::per_record_probe;
 
     /// Test-only seam (see the `test-support` feature): the consumer
     /// `session.timeout.ms`, for tests that wait past it.

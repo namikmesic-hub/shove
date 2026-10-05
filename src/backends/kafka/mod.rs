@@ -57,6 +57,9 @@ pub use consumer::fence_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::final_commit_spawn_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::per_record_probe;
 
 /// Test-only seam (see the `test-support` feature): the `session.timeout.ms`
 /// every shove consumer is created with, so a test that waits past it asserts
