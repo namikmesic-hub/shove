@@ -27,6 +27,7 @@
 //! enable it, so the suite runs in each.
 
 #![cfg(all(feature = "kafka", feature = "test-support"))]
+#![allow(clippy::mutable_key_type)] // metrics-util's CompositeKey has interior mutability
 
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
@@ -35,7 +36,7 @@ use std::time::Duration;
 use rdkafka::bindings::{
     rd_kafka_handle_mock_cluster, rd_kafka_mock_broker_push_request_error_rtts,
     rd_kafka_mock_get_requests, rd_kafka_mock_request_api_key, rd_kafka_mock_request_destroy_array,
-    rd_kafka_mock_start_request_tracking,
+    rd_kafka_mock_request_timestamp, rd_kafka_mock_start_request_tracking,
 };
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::mocking::MockCluster;
@@ -52,7 +53,8 @@ use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
     CommitPolicy, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig, fence_probe,
-    final_commit_spawn_probe, per_record_probe, shutdown_commit_deadline_for_test,
+    final_commit_spawn_probe, housekeeping_interval_for_test, per_record_probe,
+    shutdown_commit_deadline_for_test,
 };
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
@@ -219,6 +221,27 @@ impl Mock {
         self.requests_of(RDKafkaApiKey::OffsetCommit)
     }
 
+    /// When each request of `api_key` reached the broker since
+    /// `track_requests`, in arrival order, in microseconds of the mock's
+    /// clock.
+    fn request_timestamps(&self, api_key: RDKafkaApiKey) -> Vec<i64> {
+        let mut count = 0usize;
+        let requests = unsafe { rd_kafka_mock_get_requests(self.cluster, &mut count) };
+        if requests.is_null() {
+            return Vec::new();
+        }
+        let wanted = i16::from(api_key);
+        let stamps = (0..count)
+            .filter_map(|i| {
+                let request = unsafe { *requests.add(i) };
+                (unsafe { rd_kafka_mock_request_api_key(request) } == wanted)
+                    .then(|| unsafe { rd_kafka_mock_request_timestamp(request) })
+            })
+            .collect();
+        unsafe { rd_kafka_mock_request_destroy_array(requests, count) };
+        stamps
+    }
+
     /// Refuse the next `count` OffsetCommit requests with an error
     /// librdkafka neither retries nor rejoins the group over; the ones after
     /// are accepted.
@@ -234,6 +257,12 @@ impl Mock {
     /// connection waits behind it, but fetches and the group protocol on
     /// other connections do not.
     fn delay_next_offset_commit_answer(&self, delay: Duration) {
+        self.answer_next_offset_commit_late(delay, RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR);
+    }
+
+    /// Hold the answer to the next OffsetCommit for `delay`, then answer it
+    /// with `err`: a rejection that arrives late, when `err` is one.
+    fn answer_next_offset_commit_late(&self, delay: Duration, err: RDKafkaRespErr) {
         let delay_ms = c_int::try_from(delay.as_millis()).expect("delay fits a C int");
         let err = unsafe {
             rd_kafka_mock_broker_push_request_error_rtts(
@@ -241,7 +270,7 @@ impl Mock {
                 BROKER_ID,
                 i16::from(RDKafkaApiKey::OffsetCommit),
                 1,
-                RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR as c_int,
+                err as c_int,
                 delay_ms,
             )
         };
@@ -500,13 +529,16 @@ async fn per_record_issues_one_offset_commit_per_completion() {
         .expect("a clean stop");
 }
 
-/// The control: the same consumer under `Interval` of two seconds sends two
-/// OffsetCommit requests for the same six records. The first completion
-/// finds the gate open and is committed at once; the five behind it
-/// complete inside the window and ride one commit when it reopens.
+/// The control: six records under `Interval` cost one commit inside the
+/// window and one at the stop, against the six a `PerRecord` member makes.
+/// The window is thirty seconds, so the five completions after the first
+/// fall inside it whatever the runner's speed: the first completion finds
+/// the gate open and is committed at once, the rest wait for the window,
+/// and the stop's final commit carries them. An exact count of two inside
+/// a two second window depended on the runner.
 #[tokio::test]
-async fn interval_issues_two_offset_commits_over_six_records() {
-    const INTERVAL: Duration = Duration::from_secs(2);
+async fn interval_commits_once_inside_the_window_and_once_at_the_stop_over_six_records() {
+    const INTERVAL: Duration = Duration::from_secs(30);
     let mock = Mock::start();
     let bootstrap = mock.bootstrap();
     produce(&bootstrap, &["o1", "o2", "o3", "o4", "o5", "o6"]).await;
@@ -519,22 +551,33 @@ async fn interval_issues_two_offset_commits_over_six_records() {
     });
 
     wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "the first completion's commit reaching the broker",
+    )
+    .await;
+    wait_until(
         || handler.count() == 6,
         DELIVERY_TIMEOUT,
         "six records reaching the handler",
     )
     .await;
-    wait_for_committed_position(&bootstrap, 6, INTERVAL + DELIVERY_TIMEOUT).await;
     assert_eq!(
         mock.offset_commit_requests(),
-        2,
-        "the first completion at once, the rest when the window reopens"
+        1,
+        "the completions after the first wait for the window"
     );
 
     shutdown.cancel();
     run.await
         .expect("the run task completes")
         .expect("a clean stop");
+    assert_eq!(
+        mock.offset_commit_requests(),
+        2,
+        "the final commit carries the rest"
+    );
+    assert_eq!(committed_position(&bootstrap).await, Some(6));
 }
 
 /// A member killed the moment it holds the second record replays nothing of
@@ -666,6 +709,21 @@ async fn a_rejected_commit_is_re_offered_until_the_fence_fires() {
         "the rejected commit was re-offered, requests: {}",
         mock.offset_commit_requests()
     );
+    // The re-offers are spaced by the default interval the page states,
+    // 500 ms, so the loop polls between them: every gap between two
+    // OffsetCommit requests at the broker is at least that, less a margin
+    // for the clock. Read before the stop, whose final commit follows the
+    // last re-offer at no such distance.
+    let stamps = mock.request_timestamps(RDKafkaApiKey::OffsetCommit);
+    for pair in stamps.windows(2) {
+        let gap = Duration::from_micros(
+            u64::try_from(pair[1] - pair[0]).expect("timestamps in arrival order"),
+        );
+        assert!(
+            gap >= Duration::from_millis(450),
+            "re-offers are spaced by the default interval, gap {gap:?} in {stamps:?}"
+        );
+    }
     assert_eq!(
         committed_position(&bootstrap).await,
         None,
@@ -1203,7 +1261,8 @@ async fn a_republish_that_fails_under_per_record_ends_the_member_before_the_next
 }
 
 // ---------------------------------------------------------------------------
-// A partition handed back paused, with its assign drained by the receive arm
+// A partition handed back paused: the assign drained at the top of a pass, or
+// by the receive arm
 // ---------------------------------------------------------------------------
 
 const RETURN_TOPIC: &str = "kafka-commit-policy-mock-return";
@@ -1217,6 +1276,9 @@ const SIZE_LIMIT: usize = 1024;
 /// The returned partition's record reaches the handler in well under this
 /// once the partition is resumed, and never while it stays paused.
 const RESUME_TIMEOUT: Duration = Duration::from_secs(15);
+/// Cycles the receive-arm test runs before it gives up on meeting an assign
+/// in the receive arm; the housekeeping tick wins one in a hundred or so.
+const RECEIVE_ARM_ATTEMPTS: u32 = 3;
 
 shove::define_topic!(
     ReturnTopic,
@@ -1225,15 +1287,16 @@ shove::define_topic!(
 );
 
 /// Acknowledges every record, records its id with the partition it came
-/// from, and holds every `hold-*` record until `release` says so.
+/// from, and holds every `hold-{round}` record until `release` has reached
+/// that round.
 #[derive(Clone)]
 struct Holding {
     seen: Arc<Mutex<Vec<(String, i32)>>>,
-    release: watch::Receiver<bool>,
+    release: watch::Receiver<u32>,
 }
 
 impl Holding {
-    fn new(release: watch::Receiver<bool>) -> Self {
+    fn new(release: watch::Receiver<u32>) -> Self {
         Self {
             seen: Arc::new(Mutex::new(Vec::new())),
             release,
@@ -1257,10 +1320,11 @@ impl MessageHandler<ReturnTopic> for Holding {
             .lock()
             .expect("handler mutex poisoned")
             .push((msg.id.clone(), partition));
-        if msg.id.starts_with("hold-") {
+        if let Some(round) = msg.id.strip_prefix("hold-") {
+            let round: u32 = round.parse().expect("a hold record names its round");
             let mut release = self.release.clone();
             release
-                .wait_for(|released| *released)
+                .wait_for(|released| *released >= round)
                 .await
                 .expect("the release sender outlives the handler");
         }
@@ -1312,6 +1376,185 @@ fn start_on_return_topic(
     (run, shutdown)
 }
 
+/// Polls the broker until the group's committed position on `partition` of
+/// the return topic is `expected`.
+async fn wait_for_return_position(bootstrap: &str, partition: i32, expected: i64, what: &str) {
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    while committed_position_on(bootstrap, RETURN_TOPIC, RETURN_GROUP_ID, partition).await
+        != Some(expected)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: partition {partition} did not reach position {expected} within {DELIVERY_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The two-partition return topic with a per-record member A on it, and the
+/// cycle that hands A a partition back paused: A holds `hold-{round}` on
+/// partition 0 and is paused over both partitions, B joins and the
+/// cooperative rebalance moves one partition to it, A's hold ends and A
+/// works through what it kept, B leaves, and the moved partition returns to
+/// an idle, unpaused A with the pause flag it left with. `produced` counts
+/// the records on each partition, so a committed position can be waited
+/// for whoever consumed the records.
+struct ReturnCycle {
+    /// Lives for the cluster; the broker is reached through `bootstrap`.
+    _mock: Mock,
+    bootstrap: String,
+    a: Holding,
+    run_a: tokio::task::JoinHandle<Result<(), ShoveError>>,
+    token_a: CancellationToken,
+    release: watch::Sender<u32>,
+    produced: [i64; 2],
+}
+
+impl ReturnCycle {
+    async fn start() -> Self {
+        let mock = Mock::start();
+        let bootstrap = mock.bootstrap();
+        mock.api()
+            .create_topic(RETURN_TOPIC, 2, 1)
+            .expect("create the return topic through the mock API");
+        mock.track_requests();
+        let (release, released) = watch::channel(0);
+        // Member A: a commit per record, one permit, and a payload limit a
+        // padded record exceeds.
+        let a = Holding::new(released);
+        let (run_a, token_a) =
+            start_on_return_topic(connect(&bootstrap).await, a.clone(), |token| {
+                options(CommitPolicy::PerRecord, token).with_max_message_size(SIZE_LIMIT)
+            });
+        Self {
+            _mock: mock,
+            bootstrap,
+            a,
+            run_a,
+            token_a,
+            release,
+            produced: [0, 0],
+        }
+    }
+
+    fn produced_on(&self, partition: i32) -> i64 {
+        self.produced[usize::try_from(partition).expect("a partition index")]
+    }
+
+    async fn produce(&mut self, id: &str, partition: i32) {
+        produce_pinned(&self.bootstrap, id, partition).await;
+        self.produced[usize::try_from(partition).expect("a partition index")] += 1;
+    }
+
+    /// One cycle, see the type's doc. Returns once A's assign event for the
+    /// returned partition has been queued, with the moved and the kept
+    /// partition.
+    async fn hand_a_partition_back_paused(&mut self, round: u32) -> (i32, i32) {
+        let hold = format!("hold-{round}");
+        self.produce(&hold, 0).await;
+        wait_until(
+            || self.a.has(&hold),
+            DELIVERY_TIMEOUT,
+            "A holding its record",
+        )
+        .await;
+        // One probe per partition, unconsumed while A is paused: whichever
+        // partition moves to B, B's first record comes from it.
+        for partition in RETURN_PARTITIONS {
+            self.produce(&format!("probe-{round}-{partition}"), partition)
+                .await;
+        }
+
+        // Member B joins, and the cooperative rebalance moves one partition
+        // to it while A is paused.
+        let b = Holding::new(self.release.subscribe());
+        let (run_b, token_b) =
+            start_on_return_topic(connect(&self.bootstrap).await, b.clone(), |token| {
+                ConsumerOptions::<Kafka>::new().with_shutdown(token)
+            });
+        wait_until(
+            || !b.seen().is_empty(),
+            DELIVERY_TIMEOUT,
+            "the rebalance moving a partition to B",
+        )
+        .await;
+        let moved = b.seen()[0].1;
+        let kept = RETURN_PARTITIONS
+            .into_iter()
+            .find(|&partition| partition != moved)
+            .expect("two partitions");
+
+        // The holds end. A commits what it kept and resumes its assignment,
+        // which no longer holds the moved partition: that one keeps A's
+        // pause flag. A then works through the kept partition, a commit per
+        // record, and idles unpaused once the last is committed.
+        self.release
+            .send(round)
+            .expect("the handlers hold the receiver");
+        wait_for_return_position(
+            &self.bootstrap,
+            kept,
+            self.produced_on(kept),
+            "A working through the kept partition",
+        )
+        .await;
+
+        // B leaves, and its partition comes back to A, paused. A's rejoin
+        // ends with the assign the rebalance callback queues for the loop,
+        // which the probe counts.
+        let queued = per_record_probe::assigns_queued();
+        token_b.cancel();
+        run_b
+            .await
+            .expect("B's task completes")
+            .expect("B ends clean");
+        wait_until(
+            || per_record_probe::assigns_queued() > queued,
+            DELIVERY_TIMEOUT,
+            "A's assign being queued",
+        )
+        .await;
+        (moved, kept)
+    }
+
+    /// Drops an oversize record on `kept` before the handler, and waits for
+    /// its drop to be committed: the next thing through A's `recv()`.
+    async fn drop_an_oversize_record_on(&mut self, kept: i32) {
+        self.produce(&"x".repeat(SIZE_LIMIT), kept).await;
+        wait_for_return_position(
+            &self.bootstrap,
+            kept,
+            self.produced_on(kept),
+            "the oversize record's drop being committed",
+        )
+        .await;
+        assert!(
+            !self.a.seen().iter().any(|(id, _)| id.len() >= SIZE_LIMIT),
+            "the oversize record never reached the handler"
+        );
+    }
+
+    /// Produces `id` on the returned partition and waits for A to receive
+    /// it: the proof that the partition was resumed.
+    async fn prove_resumed(&mut self, moved: i32, id: &str) {
+        self.produce(id, moved).await;
+        wait_until(
+            || self.a.has(id),
+            RESUME_TIMEOUT,
+            "the record on the returned partition reaching A",
+        )
+        .await;
+    }
+
+    async fn stop(self) {
+        self.token_a.cancel();
+        self.run_a
+            .await
+            .expect("A's task completes")
+            .expect("A ends clean");
+    }
+}
+
 /// A partition handed back to a per-record member that idles unpaused
 /// arrives paused: the member paused its whole assignment while it held a
 /// record, and librdkafka keeps a partition's pause flag across a revoke.
@@ -1323,133 +1566,237 @@ fn start_on_return_topic(
 /// the intent. The record produced onto the returned partition afterwards is
 /// the proof: it reaches the handler only once the partition is resumed.
 ///
-/// The receive arm drains the assign when the oversize record lands before
-/// the next housekeeping tick, which the test arranges by producing it as
-/// soon as the member's rejoin has been answered. A tick that comes first
-/// drains the assign at the top of a pass, through the same helper, so the
-/// test passes either way with the fix and fails without it in every run
-/// the tick does not win.
+/// The drain-site probe says which drain reconciled the assign. The
+/// oversize record is produced as soon as the assign is queued, so the
+/// receive arm meets it unless the housekeeping tick fires first, in which
+/// case the cycle runs again; the top-of-pass path has its own test below.
 #[tokio::test]
 async fn a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign() {
-    let mock = Mock::start();
-    let bootstrap = mock.bootstrap();
-    mock.api()
-        .create_topic(RETURN_TOPIC, 2, 1)
-        .expect("create the return topic through the mock API");
-    mock.track_requests();
-    let (release, released) = watch::channel(false);
-
-    // Member A: a commit per record, one permit, and a payload limit a
-    // padded record exceeds. It holds a record on partition 0, so its
-    // whole assignment is paused.
-    let a = Holding::new(released.clone());
-    let (run_a, token_a) = start_on_return_topic(connect(&bootstrap).await, a.clone(), |token| {
-        options(CommitPolicy::PerRecord, token).with_max_message_size(SIZE_LIMIT)
-    });
-    produce_pinned(&bootstrap, "hold-0", 0).await;
-    wait_until(|| a.has("hold-0"), DELIVERY_TIMEOUT, "A holding its record").await;
-    // One probe per partition, unconsumed while A is paused: whichever
-    // partition moves to B, B's first record comes from it.
-    for partition in RETURN_PARTITIONS {
-        produce_pinned(&bootstrap, &format!("probe-{partition}"), partition).await;
-    }
-
-    // Member B joins, and the cooperative rebalance moves one partition to
-    // it while A is paused.
-    let b = Holding::new(released);
-    let (run_b, token_b) = start_on_return_topic(connect(&bootstrap).await, b.clone(), |token| {
-        ConsumerOptions::<Kafka>::new().with_shutdown(token)
-    });
-    wait_until(
-        || !b.seen().is_empty(),
-        DELIVERY_TIMEOUT,
-        "the rebalance moving a partition to B",
-    )
-    .await;
-    let moved = b.seen()[0].1;
-    let kept = RETURN_PARTITIONS
-        .into_iter()
-        .find(|&partition| partition != moved)
-        .expect("two partitions");
-
-    // The holds end. A commits what it kept and resumes its assignment,
-    // which no longer holds the moved partition: that one keeps A's pause
-    // flag. A then works through the kept partition, a commit per record,
-    // and idles unpaused once the last is committed.
-    release.send(true).expect("the handlers hold the receiver");
-    let on_kept: i64 = if kept == 0 { 2 } else { 1 };
-    wait_until(
-        || {
-            a.seen()
-                .iter()
-                .filter(|(_, partition)| *partition == kept)
-                .count()
-                == usize::try_from(on_kept).expect("a small count")
-        },
-        DELIVERY_TIMEOUT,
-        "A working through the kept partition",
-    )
-    .await;
-    let committed_by = Instant::now() + DELIVERY_TIMEOUT;
-    while committed_position_on(&bootstrap, RETURN_TOPIC, RETURN_GROUP_ID, kept).await
-        != Some(on_kept)
-    {
+    let mut cycle = ReturnCycle::start().await;
+    let mut met_in_the_receive_arm = false;
+    for round in 1..=RECEIVE_ARM_ATTEMPTS {
+        let (moved, kept) = cycle.hand_a_partition_back_paused(round).await;
+        let at_top_of_pass = per_record_probe::reconciled_at_top_of_pass();
+        let at_receive_arm = per_record_probe::reconciled_at_receive_arm();
+        cycle.drop_an_oversize_record_on(kept).await;
+        if per_record_probe::reconciled_at_receive_arm() > at_receive_arm {
+            // The receive arm drained the assign and reconciled it: the
+            // returned partition was resumed with the rest.
+            cycle
+                .prove_resumed(moved, &format!("after-return-{round}"))
+                .await;
+            met_in_the_receive_arm = true;
+            break;
+        }
         assert!(
-            Instant::now() < committed_by,
-            "A commits every record on the kept partition {kept}"
+            per_record_probe::reconciled_at_top_of_pass() > at_top_of_pass,
+            "the assign was reconciled by one drain or the other"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // B leaves, and its partition comes back to A, paused. A's rejoin ends
-    // with a SyncGroup answer, and the assign follows it inside A's
-    // `recv()`, where A is parked.
-    let syncs = mock.requests_of(RDKafkaApiKey::SyncGroup);
-    token_b.cancel();
-    run_b
-        .await
-        .expect("B's task completes")
-        .expect("B ends clean");
-    wait_until(
-        || mock.requests_of(RDKafkaApiKey::SyncGroup) > syncs,
-        DELIVERY_TIMEOUT,
-        "A's rejoin being answered",
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // The next record through A's `recv()` is over the size limit: the
-    // receive arm drains the assign and drops the record before the
-    // handler. The drop is committed like a completion, which is the sync
-    // point.
-    let oversize = produce_pinned(&bootstrap, &"x".repeat(SIZE_LIMIT), kept).await;
-    let dropped_by = Instant::now() + DELIVERY_TIMEOUT;
-    while committed_position_on(&bootstrap, RETURN_TOPIC, RETURN_GROUP_ID, kept).await
-        != Some(oversize + 1)
-    {
-        assert!(
-            Instant::now() < dropped_by,
-            "the oversize record's drop is committed on partition {kept}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The housekeeping tick came first and the top-of-pass drain took
+        // the assign; the partition is resumed all the same. Again.
+        cycle
+            .prove_resumed(moved, &format!("after-return-{round}"))
+            .await;
     }
     assert!(
-        !a.seen().iter().any(|(id, _)| id.len() >= SIZE_LIMIT),
-        "the oversize record never reached the handler"
+        met_in_the_receive_arm,
+        "the receive arm drained no assign in {RECEIVE_ARM_ATTEMPTS} cycles"
+    );
+    cycle.stop().await;
+}
+
+/// The same return with nothing through `recv()` afterwards: the assign
+/// waits in the channel until the housekeeping tick, the one arm due on an
+/// idle member, runs a pass, and the drain at the top of that pass
+/// reconciles it. The record produced onto the returned partition after the
+/// tick is the proof it was resumed, and the drain-site probe says which
+/// drain did it. Red without the top-of-pass call: the assign is drained
+/// and discarded there, and the record never arrives.
+#[tokio::test]
+async fn a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign() {
+    let mut cycle = ReturnCycle::start().await;
+    let (moved, _kept) = cycle.hand_a_partition_back_paused(1).await;
+    let at_top_of_pass = per_record_probe::reconciled_at_top_of_pass();
+    let at_receive_arm = per_record_probe::reconciled_at_receive_arm();
+
+    // Nothing is produced, so the next pass is the housekeeping tick's.
+    tokio::time::sleep(housekeeping_interval_for_test() + Duration::from_secs(1)).await;
+    assert!(
+        per_record_probe::reconciled_at_top_of_pass() > at_top_of_pass,
+        "the housekeeping pass drained the assign and reconciled it"
+    );
+    assert_eq!(
+        per_record_probe::reconciled_at_receive_arm(),
+        at_receive_arm,
+        "nothing came through recv meanwhile"
     );
 
-    // The returned partition is resumed, so a record on it is delivered.
-    produce_pinned(&bootstrap, "after-return", moved).await;
+    cycle.prove_resumed(moved, "after-return").await;
+    cycle.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The discard a dropped record carries, counted once, on the commit that
+// retires it
+// ---------------------------------------------------------------------------
+
+/// `shove_messages_discarded_total` for `topic`, summed over its reasons,
+/// from one draining snapshot of the debugging recorder.
+#[cfg(feature = "metrics")]
+fn discarded_total(snapshotter: &metrics_util::debugging::Snapshotter, topic: &str) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snapshotter
+        .snapshot()
+        .into_hashmap()
+        .iter()
+        .filter(|(key, _)| key.key().name() == "shove_messages_discarded_total")
+        .filter(|(key, _)| {
+            key.key()
+                .labels()
+                .any(|label| label.key() == "topic" && label.value() == topic)
+        })
+        .map(|(_, (_, _, value))| match value {
+            DebugValue::Counter(n) => *n,
+            other => panic!("shove_messages_discarded_total is not a counter: {other:?}"),
+        })
+        .sum()
+}
+
+/// Installs the debugging recorder as the process's global recorder; one
+/// per test process, which nextest gives every test.
+#[cfg(feature = "metrics")]
+fn install_recorder() -> metrics_util::debugging::Snapshotter {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    recorder.install().expect("install the debugging recorder");
+    snapshotter
+}
+
+/// A record dropped before the handler on a topic with no DLQ is gone for
+/// good once its position is committed, and `messages_discarded_total`
+/// counts it then, once: the drop's commit under `PerRecord` is accepted at
+/// once, and the counter moves on its confirmation.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn a_dropped_records_discard_is_counted_once_when_its_commit_is_accepted() {
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce_raw(&bootstrap, b"not the topic's json".to_vec()).await;
+    produce(&bootstrap, &["o2"]).await;
+    mock.track_requests();
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::PerRecord, token)
+    });
+    wait_for_committed_position(&bootstrap, 2, DELIVERY_TIMEOUT).await;
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
+
+    assert_eq!(
+        discarded_total(&snapshotter, TOPIC),
+        1,
+        "the dropped record is counted once its commit is accepted"
+    );
+}
+
+/// The same drop with its commit rejected twice: the discard rides each
+/// re-offer and is counted once, on the third attempt the broker accepts,
+/// never on a rejection and never twice.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn a_dropped_records_discard_is_counted_once_when_a_re_offer_is_accepted() {
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce_raw(&bootstrap, b"not the topic's json".to_vec()).await;
+    mock.track_requests();
+    mock.reject_commits(2);
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::PerRecord, token)
+    });
     wait_until(
-        || a.has("after-return"),
-        RESUME_TIMEOUT,
-        "the record on the returned partition reaching A",
+        || mock.offset_commit_requests() >= 2,
+        DELIVERY_TIMEOUT,
+        "the drop's commit being rejected twice",
     )
     .await;
+    produce(&bootstrap, &["o2"]).await;
+    wait_for_committed_position(&bootstrap, 2, DELIVERY_TIMEOUT).await;
+    assert_eq!(
+        mock.offset_commit_requests(),
+        4,
+        "two rejections, the accepted re-offer, and the valid record's commit"
+    );
+    // The stop's final commit carries the position again and confirms no
+    // discard: the one discard was settled by the re-offer that landed.
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("a clean stop");
 
-    token_a.cancel();
-    run_a
-        .await
-        .expect("A's task completes")
-        .expect("A ends clean");
+    assert_eq!(
+        discarded_total(&snapshotter, TOPIC),
+        1,
+        "the discard is counted once, on the re-offer the broker accepted"
+    );
+}
+
+/// The drop's commit is in flight when the stop lands and comes back
+/// rejected: the shutdown arm hands the discard back, the final commit
+/// carries the position again, the broker accepts it, and the discard is
+/// counted once on that commit, with the position where the final commit
+/// put it.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn a_discard_behind_a_commit_rejected_at_the_stop_is_counted_once_by_the_final_commit() {
+    const HELD: Duration = Duration::from_secs(3);
+    let snapshotter = install_recorder();
+    let mock = Mock::start();
+    let bootstrap = mock.bootstrap();
+    produce_raw(&bootstrap, b"not the topic's json".to_vec()).await;
+    mock.track_requests();
+    mock.answer_next_offset_commit_late(
+        HELD,
+        RDKafkaRespErr::RD_KAFKA_RESP_ERR_GROUP_AUTHORIZATION_FAILED,
+    );
+
+    let handler = Acking::default();
+    let h = handler.clone();
+    let (run, shutdown) = start(connect(&bootstrap).await, h, |token| {
+        options(CommitPolicy::PerRecord, token)
+    });
+    wait_until(
+        || mock.offset_commit_requests() >= 1,
+        DELIVERY_TIMEOUT,
+        "the drop's commit reaching the broker",
+    )
+    .await;
+    shutdown.cancel();
+    run.await
+        .expect("the run task completes")
+        .expect("the final commit is accepted, so the stop is clean");
+
+    assert_eq!(
+        mock.offset_commit_requests(),
+        2,
+        "the commit in flight, rejected late, and the final commit"
+    );
+    assert_eq!(
+        committed_position(&bootstrap).await,
+        Some(1),
+        "the final commit carried the dropped record's position"
+    );
+    assert_eq!(
+        discarded_total(&snapshotter, TOPIC),
+        1,
+        "the discard handed back at the stop is counted once, by the final commit"
+    );
 }
