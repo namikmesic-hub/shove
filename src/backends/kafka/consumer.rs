@@ -2343,6 +2343,8 @@ impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
                     ?partitions,
                     "rebalance: partitions assigned"
                 );
+                #[cfg(feature = "test-support")]
+                per_record_probe::ASSIGNS_QUEUED.fetch_add(1, Ordering::SeqCst);
                 RebalanceEvent::Assign(partitions)
             }
             Rebalance::Revoke(tpl) => {
@@ -2837,7 +2839,7 @@ const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(60);
 
 /// How often the concurrent receive loop wakes to drain rebalance events and
 /// retry commits when no messages or completions arrive to wake it.
-const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long a partition may sit with offset commits continuously rejected,
 /// no resolving rebalance ever arriving, before the receive loop treats
@@ -3021,8 +3023,10 @@ pub(super) fn check_per_record_prefetch(
 /// inside `deadline`, so a close that outlives the deadline is logged and
 /// never read as a commit that missed it. The one other holder there can
 /// be is a per-record commit thread shutdown did not wait out (see
-/// [`commit_confirmed`]); then the close runs on whichever of the two
-/// threads drops last, off the runtime either way. `None` for `tpl` means
+/// [`commit_confirmed`]); then this thread's drop closes nothing, the
+/// thread says so, the loop logs that the close follows that commit, and
+/// the close runs when that thread drops its clone, off the runtime either
+/// way. `None` for `tpl` means
 /// there is nothing to commit and the thread only closes. The thread is
 /// spawned before it is handed the consumer, and a spawn failure disposes of
 /// the consumer off the runtime too; see [`final_commit_on_thread`] and
@@ -3067,9 +3071,29 @@ pub mod per_record_probe {
     /// Entries into `commit_confirmed`: every per-record commit the loop
     /// attempted, carried or not.
     pub static COMMIT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    /// Assign events the rebalance callback queued for the loop, from any
+    /// consumer in the process.
+    pub static ASSIGNS_QUEUED: AtomicUsize = AtomicUsize::new(0);
+    /// Assigns a per-record loop reconciled from the drain at the top of a
+    /// pass.
+    pub static RECONCILED_AT_TOP_OF_PASS: AtomicUsize = AtomicUsize::new(0);
+    /// Assigns a per-record loop reconciled from the receive arm's drain.
+    pub static RECONCILED_AT_RECEIVE_ARM: AtomicUsize = AtomicUsize::new(0);
 
     pub fn commit_attempts() -> usize {
         COMMIT_ATTEMPTS.load(Ordering::SeqCst)
+    }
+
+    pub fn assigns_queued() -> usize {
+        ASSIGNS_QUEUED.load(Ordering::SeqCst)
+    }
+
+    pub fn reconciled_at_top_of_pass() -> usize {
+        RECONCILED_AT_TOP_OF_PASS.load(Ordering::SeqCst)
+    }
+
+    pub fn reconciled_at_receive_arm() -> usize {
+        RECONCILED_AT_RECEIVE_ARM.load(Ordering::SeqCst)
     }
 }
 
@@ -3104,11 +3128,21 @@ pub mod final_commit_spawn_probe {
 /// thread choreography is testable with a drop probe instead of a broker.
 trait FinalCommit: Send + 'static {
     fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()>;
+
+    /// Whether dropping this handle runs the consumer's close: true unless
+    /// another holder remains, see [`final_commit_off_runtime`].
+    fn is_last_handle(&self) -> bool {
+        true
+    }
 }
 
 impl FinalCommit for Arc<KafkaStreamConsumer> {
     fn commit_sync(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
         self.commit(tpl, CommitMode::Sync)
+    }
+
+    fn is_last_handle(&self) -> bool {
+        Arc::strong_count(self) == 1
     }
 }
 
@@ -3150,7 +3184,7 @@ where
 {
     let started = Instant::now();
     let (committed_tx, committed_rx) = oneshot::channel::<KafkaResult<()>>();
-    let (closed_tx, closed_rx) = oneshot::channel::<()>();
+    let (closed_tx, closed_rx) = oneshot::channel::<bool>();
     let handed = hand_to_new_thread(
         spawn,
         format!("shove-kafka-final-commit {queue}"),
@@ -3165,9 +3199,11 @@ where
             // any more; that is the deadline case.
             let _ = committed_tx.send(result);
             // The last `Arc`: `rd_kafka_consumer_close` runs here, off the
-            // runtime, however long the broker takes to answer.
+            // runtime, however long the broker takes to answer. With another
+            // holder left, this drop closes nothing, and the signal says so.
+            let closes = consumer.is_last_handle();
             drop(consumer);
-            let _ = closed_tx.send(());
+            let _ = closed_tx.send(closes);
         },
     );
     if let Err(((consumer, _tpl), e)) = handed {
@@ -3209,7 +3245,14 @@ where
     // here and changes nothing about `committed`.
     let remaining = deadline.saturating_sub(started.elapsed());
     match tokio::time::timeout(remaining, closed_rx).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            tracing::warn!(
+                queue,
+                "the consumer handle was dropped but another holder remains, the per-record commit \
+                 thread shutdown did not wait out; the close runs when that commit returns"
+            );
+        }
         Ok(Err(_recv)) => {
             tracing::warn!(
                 queue,
@@ -3393,8 +3436,14 @@ struct PendingCommit {
 /// callbacks and the poll budget instead. A record it does yield belongs to
 /// a partition assigned during the pause, and is put back with the pause
 /// widened. The wait ends on the answer, on shutdown, or on a fault a
-/// handler task reports, and is otherwise bounded by librdkafka's own
-/// request timeout, `socket.timeout.ms`, after which the commit comes back
+/// handler task reports. The answer is librdkafka's result for the whole
+/// commit operation, which it waits for without a timeout of its own
+/// (bundled librdkafka 2.12.1, `rdkafka_offset.c:403-406`): a request
+/// unanswered for `socket.timeout.ms` is retried up to two times
+/// (`rdkafka_buf.c:161-162`, `rdkafka_proto.h:47`,
+/// `rdkafka_request.c:1784-1787`), and a commit with no coordinator waits
+/// for one up to `session.timeout.ms` (`rdkafka_cgrp.c:3744-3746`), so the
+/// wait can run for several socket timeouts before the commit comes back
 /// as rejected. A spawn failure leaves the loop's `Arc` where it is: the
 /// clone is dropped here, which closes nothing while the loop holds its own.
 /// The thread drops its clone before it answers, so once the answer is in
@@ -4860,18 +4909,17 @@ impl KafkaConsumer {
                 // surfaced at once rather than silently accumulating (sec-K-4).
                 let (completion_tx, mut completion_rx) =
                     mpsc::channel::<Completion>(prefetch_count as usize + 1);
-                // A registry deployment fault met inside a handler task's
-                // in-place redelivery ends this loop the way the loop ends
-                // when it meets the fault itself: at once, with the `Topology`
-                // error and the record uncommitted rather than pinned in a
-                // consumer that keeps polling. The broadcast loop owns the
-                // same channel. The sender stays alive here for the loop's
-                // lifetime so the arm below stays pending; tasks clone it
-                // only under `kafka-schema-registry`, the one build with such
-                // a fault to report.
+                // A fault a handler task meets ends this loop the way the
+                // loop ends when it meets the fault itself: at once, with
+                // the error and the record uncommitted rather than pinned in
+                // a consumer that keeps polling. Two senders report here: a
+                // registry deployment fault met inside an in-place
+                // redelivery, under `kafka-schema-registry`, and under
+                // `CommitPolicy::PerRecord` a republish that failed, see
+                // `run_delayed_republish`. The broadcast loop owns the same
+                // channel. The sender stays alive here for the loop's
+                // lifetime so the arm below stays pending.
                 let (fault_tx, mut fault_rx) = mpsc::channel::<ShoveError>(1);
-                #[cfg(not(feature = "kafka-schema-registry"))]
-                let _ = &fault_tx;
                 // Handler tasks wait on this child rather than on `shutdown`
                 // itself. A shutdown still reaches them through the parent,
                 // and a fault lets the loop end every sibling's in-place wait
@@ -4917,6 +4965,10 @@ impl KafkaConsumer {
                     }
                     let now = Instant::now();
                     let assigned = tracker.apply_rebalance_events(&rebalance_rx, now);
+                    #[cfg(feature = "test-support")]
+                    if per_record && assigned {
+                        per_record_probe::RECONCILED_AT_TOP_OF_PASS.fetch_add(1, Ordering::SeqCst);
+                    }
                     reconcile_pause_after_assign(&consumer, per_record, paused, assigned)?;
                     if let Some(partition) = tracker.fenced(now, fence_timeout) {
                         metrics::record_backend_error(
@@ -5402,6 +5454,10 @@ impl KafkaConsumer {
                             // does, see `reconcile_pause_after_assign`.
                             let assigned =
                                 tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
+                            #[cfg(feature = "test-support")]
+                            if per_record && assigned {
+                                per_record_probe::RECONCILED_AT_RECEIVE_ARM.fetch_add(1, Ordering::SeqCst);
+                            }
                             reconcile_pause_after_assign(&consumer, per_record, paused, assigned)?;
 
                             // A paused assignment delivers nothing it held when
@@ -10562,6 +10618,20 @@ mod final_commit_thread_tests {
         }
     }
 
+    /// Stands in for a handle another thread still holds: the commit lands
+    /// and the drop closes nothing.
+    struct SharedProbe;
+
+    impl FinalCommit for SharedProbe {
+        fn commit_sync(&self, _tpl: &TopicPartitionList) -> KafkaResult<()> {
+            Ok(())
+        }
+
+        fn is_last_handle(&self) -> bool {
+            false
+        }
+    }
+
     impl Drop for DropProbe {
         fn drop(&mut self) {
             if let Some(release) = &self.close_release {
@@ -10831,6 +10901,66 @@ mod final_commit_thread_tests {
         assert!(
             matches!(events.as_slice(), [Event::Drop { .. }]),
             "the close finishes on its own thread: {events:?}"
+        );
+    }
+
+    /// With another holder of the handle left, the per-record commit thread
+    /// a stop did not wait out, the final thread's drop closes nothing: the
+    /// commit's result is still the result, and the loop logs that the close
+    /// follows that holder instead of claiming it ran.
+    #[tokio::test]
+    async fn a_drop_with_another_holder_left_reports_the_close_as_following_that_holder() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        /// The message of one WARN event.
+        struct Message(String);
+
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        /// Collects the messages of every WARN event.
+        #[derive(Clone, Default)]
+        struct Warnings(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> Layer<S> for Warnings {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut message = Message(String::new());
+                    event.record(&mut message);
+                    self.0.lock().unwrap().push(message.0);
+                }
+            }
+        }
+
+        let warnings = Warnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let result = final_commit_on_thread(
+            SharedProbe,
+            Some(one_offset()),
+            "orders",
+            SHUTDOWN_COMMIT_DEADLINE,
+            &mut real_spawner(),
+        )
+        .await;
+        assert_eq!(result, Ok(()), "the commit landed, whoever closes");
+        let logged = warnings.0.lock().unwrap();
+        assert_eq!(
+            logged.len(),
+            1,
+            "one warning, that the close follows the other holder: {logged:?}"
+        );
+        assert!(
+            logged[0].contains("another holder remains"),
+            "the warning names the other holder: {}",
+            logged[0]
         );
     }
 

@@ -6560,7 +6560,8 @@ async fn a_leaked_consumer_keeps_its_group_member_past_the_session_timeout() {
 #[tokio::test]
 async fn a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish() {
     use shove::kafka::{
-        CommitPolicy, pending_commit_budget_for_test, shutdown_commit_deadline_for_test,
+        CommitPolicy, pending_commit_budget_for_test, per_record_probe,
+        shutdown_commit_deadline_for_test,
     };
 
     shove::define_topic!(
@@ -6645,10 +6646,19 @@ async fn a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_co
         handler.returned.wait_for(1, TIMEOUT).await,
         "the handler returns"
     );
-    // The commit leaves within the pass that drains the completion; a short
-    // moment lets it do so before the stop, with nothing broker-side to
-    // observe while the broker is frozen.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The commit leaves within the pass that drains the completion. Nothing
+    // broker-side can be observed while the broker is frozen, so the stop
+    // waits for the loop to have attempted that commit, which the probe
+    // counts: a stop before it would meet the final-commit path and report
+    // the whole deadline instead of the share.
+    let attempted_by = Instant::now() + TIMEOUT;
+    while per_record_probe::commit_attempts() == 0 {
+        assert!(
+            Instant::now() < attempted_by,
+            "the loop attempts the held record's commit within the bound"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let stopped_at = Instant::now();
     shutdown.cancel();
     let result = run.await.expect("the run task completes");

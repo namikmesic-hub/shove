@@ -157,10 +157,13 @@ pub enum CommitPolicy {
     /// thread of its own, the assignment is paused from the hand-out until
     /// the commit is accepted, and the loop keeps polling meanwhile, so the
     /// member serves its rebalance callbacks and stays inside
-    /// `max.poll.interval.ms`. The wait ends on shutdown, and is otherwise
-    /// bounded by librdkafka's request timeout, after which the commit
-    /// counts as rejected and is re-offered with the assignment still
-    /// paused. A crash therefore replays every record since the commit the
+    /// `max.poll.interval.ms`. The wait ends on shutdown, and otherwise when
+    /// librdkafka reports the result of the whole commit operation, which
+    /// retries a request unanswered for `socket.timeout.ms` up to two times
+    /// and waits for a missing coordinator up to `session.timeout.ms`; the
+    /// Kafka page cites the lines. After that the commit counts as rejected
+    /// and is re-offered with the assignment still paused. A crash
+    /// therefore replays every record since the commit the
     /// coordinator applied last: on a stable coordinator connection that is
     /// the one record whose completion was not yet accepted, in the
     /// handler, in a republish that had not landed, or in a commit still
