@@ -3216,6 +3216,7 @@ where
         close_off_runtime_or_leak(consumer, queue, spawn);
         return Err(CommitFailure::NoThread);
     }
+    let mut answered = true;
     let committed = match tokio::time::timeout(deadline, committed_rx).await {
         // librdkafka's text for the broker's answer: the error code and its
         // description, and nothing of the records behind the positions.
@@ -3237,9 +3238,21 @@ where
                  giving up on its result, redelivery may start from the last position the \
                  broker accepted"
             );
+            answered = false;
             Err(CommitFailure::Deadline(deadline))
         }
     };
+    if !answered {
+        // The thread is still inside the commit, so the close has not begun
+        // and a close deadline here would report nothing true: the close
+        // follows the commit when librdkafka answers it.
+        tracing::warn!(
+            queue,
+            "the consumer's close follows the commit the thread is still waiting on; the member \
+             leaves its group once that commit returns"
+        );
+        return committed;
+    }
     // The close, inside what is left of the deadline. It is reported apart
     // from the commit: a LeaveGroup the broker is slow to answer is logged
     // here and changes nothing about `committed`.
@@ -5127,13 +5140,17 @@ impl KafkaConsumer {
                     // partition and the permit is back in hand; a rejected
                     // commit keeps `has_committable` true until its re-offer
                     // lands, so no record is taken behind an unconfirmed
-                    // position. A pause purges the fetch queue and a resume
-                    // refetches from the position, so every record costs a
-                    // fetch round trip beside its commit, the price of the
-                    // policy.
+                    // position. A commit shutdown cut short is pending, not
+                    // committable, and nothing resumes behind it either: the
+                    // shutdown arm wins the next select, and the resume would
+                    // only hand librdkafka a fetch to purge. A pause purges
+                    // the fetch queue and a resume refetches from the
+                    // position, so every record costs a fetch round trip
+                    // beside its commit, the price of the policy.
                     if per_record
                         && paused
                         && spare_permit.is_some()
+                        && pending_commit.is_none()
                         && !tracker.has_committable()
                     {
                         consumer
@@ -10618,6 +10635,41 @@ mod final_commit_thread_tests {
         }
     }
 
+    /// The message of one WARN event.
+    struct Message(String);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Collects the messages of every WARN event the current thread emits.
+    #[derive(Clone, Default)]
+    struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+
+    impl Warnings {
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
     /// Stands in for a handle another thread still holds: the commit lands
     /// and the drop closes nothing.
     struct SharedProbe;
@@ -10910,34 +10962,7 @@ mod final_commit_thread_tests {
     /// follows that holder instead of claiming it ran.
     #[tokio::test]
     async fn a_drop_with_another_holder_left_reports_the_close_as_following_that_holder() {
-        use std::sync::{Arc, Mutex};
-        use tracing::field::{Field, Visit};
-        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-
-        /// The message of one WARN event.
-        struct Message(String);
-
-        impl Visit for Message {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-        }
-
-        /// Collects the messages of every WARN event.
-        #[derive(Clone, Default)]
-        struct Warnings(Arc<Mutex<Vec<String>>>);
-
-        impl<S: tracing::Subscriber> Layer<S> for Warnings {
-            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    let mut message = Message(String::new());
-                    event.record(&mut message);
-                    self.0.lock().unwrap().push(message.0);
-                }
-            }
-        }
+        use tracing_subscriber::layer::SubscriberExt;
 
         let warnings = Warnings::default();
         let _guard =
@@ -10951,7 +10976,7 @@ mod final_commit_thread_tests {
         )
         .await;
         assert_eq!(result, Ok(()), "the commit landed, whoever closes");
-        let logged = warnings.0.lock().unwrap();
+        let logged = warnings.messages();
         assert_eq!(
             logged.len(),
             1,
@@ -10971,6 +10996,11 @@ mod final_commit_thread_tests {
     /// the real 20 s.
     #[tokio::test(start_paused = true)]
     async fn a_commit_past_the_deadline_is_reported_as_the_deadline() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let warnings = Warnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
         let (release_tx, release) = std_mpsc::channel::<()>();
         let result = final_commit_on_thread(
             BlockingProbe { release },
@@ -10983,6 +11013,19 @@ mod final_commit_thread_tests {
         assert_eq!(
             result,
             Err(CommitFailure::Deadline(SHUTDOWN_COMMIT_DEADLINE))
+        );
+        // The thread is still inside the commit, so no close deadline is
+        // claimed: the loop says the close follows the commit instead.
+        let logged = warnings.messages();
+        assert!(
+            logged.iter().any(|m| m.contains("follows the commit")),
+            "the close is reported as following the commit: {logged:?}"
+        );
+        assert!(
+            !logged
+                .iter()
+                .any(|m| m.contains("close did not finish within the shutdown deadline")),
+            "no close deadline is claimed while the commit is still waiting: {logged:?}"
         );
         // Let the thread finish; its late answer has nobody listening.
         let _ = release_tx.send(());
