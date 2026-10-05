@@ -2071,6 +2071,22 @@ where
                 match decoded {
                     BatchDecode::Decoded(m) => break m,
                     BatchDecode::Dlq { reason, fail } => {
+                        // The decode's own poll can complete in the instant a
+                        // revoke lands, after the select around it read the
+                        // token. Read it again before the bytes are condemned:
+                        // on `Undecodable` the caller publishes a dead letter
+                        // from this member, and the partition's next owner
+                        // would publish a second one for the same bytes.
+                        if revoked.is_cancelled() {
+                            tracing::debug!(
+                                queue = topic,
+                                partition = coordinates.partition,
+                                offset = coordinates.offset,
+                                "partition revoked during an in-place redelivery's decode; \
+                                 the record is left to its next owner"
+                            );
+                            return InPlaceEnd::Revoked;
+                        }
                         return InPlaceEnd::Undecodable {
                             reason,
                             fail,
@@ -2108,7 +2124,8 @@ where
         // The decode's own poll can complete in the instant a revoke lands,
         // after the select around it read the token: read it once more
         // before the handler runs, or the record would be handled on the
-        // old owner beside the new one.
+        // old owner beside the new one. The `Dlq` arm above makes the same
+        // read before the bytes are dead-lettered.
         if revoked.is_cancelled() {
             return InPlaceEnd::Revoked;
         }
@@ -9766,6 +9783,40 @@ mod in_place_revoke_tests {
         }
     }
 
+    /// A codec that cancels the token left for it and then fails to decode,
+    /// so a test can land a revoke inside a decode that condemns the bytes.
+    /// Its own token slot, so the test it serves and the one above can run
+    /// in one process side by side.
+    struct RevokingUndecodableCodec;
+
+    static REVOKE_ON_UNDECODABLE: std::sync::Mutex<Option<CancellationToken>> =
+        std::sync::Mutex::new(None);
+
+    impl crate::Codec<Note> for RevokingUndecodableCodec {
+        const NAME: &'static str = "revoking-undecodable-json";
+
+        fn encode(value: &Note) -> Result<Vec<u8>> {
+            Ok(serde_json::to_vec(value)?)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Note> {
+            if let Some(token) = REVOKE_ON_UNDECODABLE.lock().unwrap().take() {
+                token.cancel();
+            }
+            Ok(serde_json::from_slice(bytes)?)
+        }
+    }
+
+    struct RevokedUndecodableNotes;
+    impl Topic for RevokedUndecodableNotes {
+        type Message = Note;
+        type Codec = RevokingUndecodableCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("in-place-revoke-undecodable").build())
+        }
+    }
+
     /// Counts its calls and acks.
     struct Counting(AtomicUsize);
     impl MessageHandler<Notes> for Counting {
@@ -9776,6 +9827,13 @@ mod in_place_revoke_tests {
         }
     }
     impl MessageHandler<RevokedNotes> for Counting {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+    impl MessageHandler<RevokedUndecodableNotes> for Counting {
         type Context = ();
         async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -9852,6 +9910,85 @@ mod in_place_revoke_tests {
             "the record was not handed to the handler"
         );
         assert_eq!(waiters.load(Ordering::SeqCst), 0);
+    }
+
+    /// A revoke that lands inside a decode which then condemns the bytes
+    /// ends the wait as `Revoked`, not `Undecodable`. `Undecodable` is the
+    /// end the caller dead-letters on, from this member; the partition's
+    /// next owner dead-letters the same bytes once it is handed them from
+    /// the committed offset. One dead letter for the record, not two. The
+    /// codec cancels the token and then fails on the bytes; the handler
+    /// must not see the record, and the waiter is uncounted.
+    #[tokio::test]
+    async fn a_revoke_inside_an_undecodable_decode_leaves_the_dead_letter_to_the_next_owner() {
+        let waiters = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let revoked = CancellationToken::new();
+        *REVOKE_ON_UNDECODABLE.lock().unwrap() = Some(revoked.clone());
+        let handler = Arc::new(Counting(AtomicUsize::new(0)));
+        let hold = [HoldQueue {
+            name: "in-place-revoke-undecodable-hold-10ms".into(),
+            delay: Duration::from_millis(10),
+        }];
+        let decode = BatchDecodeCtx {
+            queue: "in-place-revoke-undecodable",
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted: &[],
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_message_index: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            registry_lookup_bound: Duration::from_secs(1),
+        };
+        let ctx = Arc::new(());
+        let headers = Arc::new(HashMap::new());
+        let end = redeliver_in_place::<RevokedUndecodableNotes, Counting>(
+            &handler,
+            &ctx,
+            &decode,
+            b"not json",
+            &headers,
+            RecordCoordinates {
+                partition: 3,
+                offset: 9,
+                timestamp_ms: None,
+            },
+            Outcome::Defer,
+            0,
+            10,
+            &hold,
+            None,
+            None,
+            "in-place-revoke-undecodable",
+            None,
+            &shutdown,
+            &revoked,
+            &waiters,
+        )
+        .await;
+        assert!(
+            revoked.is_cancelled(),
+            "the codec cancelled the token during the decode"
+        );
+        assert!(
+            !matches!(end, InPlaceEnd::Undecodable { .. }),
+            "a revoke inside the decode must not end the redelivery as Undecodable, \
+             the end the caller dead-letters on"
+        );
+        assert!(
+            matches!(end, InPlaceEnd::Revoked),
+            "a revoke inside an undecodable decode ends the redelivery as Revoked"
+        );
+        assert_eq!(
+            handler.0.load(Ordering::SeqCst),
+            0,
+            "the record was not handed to the handler"
+        );
+        assert_eq!(waiters.load(Ordering::SeqCst), 0);
+        assert!(!shutdown.is_cancelled());
     }
 
     /// A revoke of the record's partition during the delay ends the wait as
