@@ -153,33 +153,36 @@ pub enum CommitPolicy {
     /// at most one hour.
     Interval(Duration),
     /// On every completion, accepted by the coordinator before the next
-    /// record is handed out: the position is committed synchronously on a
-    /// thread of its own, the assignment is paused from the hand-out until
-    /// the commit is accepted, and the loop keeps polling meanwhile, so the
-    /// member serves its rebalance callbacks and stays inside
-    /// `max.poll.interval.ms`. The wait ends on shutdown, and otherwise when
-    /// librdkafka reports the result of the whole commit operation, which
-    /// retries a request unanswered for `socket.timeout.ms` up to two times
-    /// and waits for a missing coordinator up to `session.timeout.ms`; the
-    /// Kafka page cites the lines. After that the commit counts as rejected
-    /// and is re-offered with the assignment still paused. A crash
-    /// therefore replays every record since the commit the
-    /// coordinator applied last: on a stable coordinator connection that is
-    /// the one record whose completion was not yet accepted, in the
-    /// handler, in a republish that had not landed, or in a commit still
-    /// unanswered or rejected, and it can be more when a commit was in
-    /// flight across a coordinator reconnect, because librdkafka retries an
-    /// abandoned commit on the next connection and the broker may apply the
-    /// abandoned copy after later commits; the Kafka page cites the lines.
-    /// A `Retry` or `Defer` whose republish fails ends the member with a
-    /// connection error, so the reconnect redelivers that record and
-    /// nothing behind it was handed out meanwhile. Every record
-    /// costs a commit round trip and a fetch round trip, because the resume
-    /// refetches from the position; an opt-in for a handler that is not
-    /// idempotent. Needs one prefetch permit: `prefetch_count(1)`, or
-    /// concurrent processing off. With more, a completion above an
-    /// unfinished lower offset confirms nothing, so the policy refuses the
-    /// configuration where the consumer starts.
+    /// record is handed out. The position is committed synchronously on a
+    /// thread of its own. The assignment is paused from the moment a record
+    /// is taken until the commit is accepted, and the loop keeps polling
+    /// meanwhile. The member therefore serves its rebalance callbacks and
+    /// stays inside `max.poll.interval.ms`. The wait ends on shutdown, and
+    /// otherwise when librdkafka reports the result of the whole commit
+    /// operation. That operation retries a request unanswered for
+    /// `socket.timeout.ms` up to two times and waits for a missing
+    /// coordinator up to `session.timeout.ms`. The Kafka page cites the
+    /// lines. After that the commit counts as rejected and is re-offered
+    /// with the assignment still paused.
+    ///
+    /// A crash therefore replays every record since the commit the
+    /// coordinator applied last. On a stable coordinator connection that is
+    /// one record, the one whose completion was not yet accepted. That
+    /// record is in the handler, in a republish that had not landed, or in
+    /// a commit still unanswered or rejected. It can be more when a commit
+    /// was in flight across a coordinator reconnect. librdkafka retries an
+    /// abandoned commit on the next connection, and the broker may apply
+    /// the abandoned copy after later commits. The Kafka page cites those
+    /// lines too. A `Retry` or `Defer` whose republish fails ends the member
+    /// with a connection error. The reconnect redelivers that record, and
+    /// nothing behind it was handed out meanwhile.
+    ///
+    /// Every record costs a commit round trip and a fetch round trip,
+    /// because the resume refetches from the position: an opt-in for a
+    /// handler that is not idempotent. Needs one prefetch permit,
+    /// `prefetch_count(1)` or concurrent processing off. With more, a
+    /// completion above an unfinished lower offset confirms nothing, so the
+    /// policy refuses the configuration where the consumer starts.
     PerRecord,
 }
 
