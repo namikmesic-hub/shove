@@ -234,7 +234,7 @@ pub use consumer::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, RetryStrategy,
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
-pub use error::ShoveError;
+pub use error::{CommitFailure, FailedCommit, ShoveError};
 pub use handler::{BatchMessageHandler, MessageHandler, MessageHandlerExt};
 pub use metadata::{
     DeadMessageMetadata, DeadMessageMetadataBuilder, MessageMetadata, MessageMetadataBuilder,

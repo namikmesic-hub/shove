@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::batch::BatchFailure;
 
 /// Errors that can occur during pub/sub operations.
@@ -50,6 +52,112 @@ pub enum ShoveError {
     /// [`Publisher::publish_batch`]: crate::publisher::Publisher::publish_batch
     #[error("batch publish: {0}")]
     PartialBatch(Box<BatchFailure>),
+
+    /// The final offset commit of a stopping consumer was not confirmed.
+    ///
+    /// The Kafka receive loop returns this from its shutdown arm when the
+    /// synchronous commit it issues after the handler drain returns an
+    /// error, misses the shutdown deadline, or has no thread to run on. The member
+    /// ends with this error instead of a clean exit: a group run counts it
+    /// under [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors),
+    /// so [`exit_code`](crate::SupervisorOutcome::exit_code) is `1`, and the
+    /// run otherwise ends as before. It is not retryable, so a consumer that
+    /// reconnects on transient errors returns it instead.
+    ///
+    /// The next member of the group resumes each partition from the last
+    /// position the broker accepted, which an earlier asynchronous commit
+    /// may have advanced past some of the records this commit covered; the
+    /// records from that position on are redelivered, which is at-least-once
+    /// delivery made visible. The error is not raised for a position the
+    /// member never tried to commit: an acknowledged offset on a partition a
+    /// rebalance revoked is dropped with the partition and redelivered by
+    /// its new owner, silently, as before.
+    ///
+    /// A member the autoscaler retires on scale-down makes the same final
+    /// commit, and a coordinator in the middle of the rebalance that
+    /// retirement triggers can reject it with a rebalance in progress or a
+    /// stale generation; that rejection counts under `errors` like any
+    /// other, and the new owner redelivers from the last accepted position.
+    ///
+    /// Why the result is surfaced at all: Apache Kafka's Java consumer
+    /// raises the result of an explicit `commitSync()` as an exception, and
+    /// its `close()` commits only under auto-commit, which shove turns off;
+    /// librdkafka's `rd_kafka_commit` returns the error code of a
+    /// synchronous commit, while `rd_kafka_consumer_close` reports only the
+    /// close itself. shove makes an explicit synchronous commit and returns
+    /// its result, because a process that gates its restart on the exit
+    /// code cannot read a log line.
+    ///
+    /// Boxed to keep `ShoveError` small, like [`PartialBatch`](Self::PartialBatch).
+    #[error(transparent)]
+    Commit(Box<FailedCommit>),
+}
+
+/// A final offset commit that was not confirmed: what the commit carried
+/// and why it was not confirmed. The payload of [`ShoveError::Commit`].
+///
+/// `#[non_exhaustive]`: read the fields, and match with `..`, so a field
+/// can be added later.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "final offset commit on '{topic}' for {} was not confirmed: {kind}",
+    format_offsets(offsets)
+)]
+#[non_exhaustive]
+pub struct FailedCommit {
+    /// The topic the member consumed.
+    pub topic: String,
+    /// The offsets the consumer tried to commit, per partition: one
+    /// `(partition, offset)` pair per partition the member held, the
+    /// offset exclusive as Kafka commits it. Never empty: a member with
+    /// nothing to commit has no commit to fail.
+    pub offsets: Vec<(i32, i64)>,
+    /// How the commit failed: the error it returned, no answer within the
+    /// deadline, or no thread to run it on.
+    pub kind: CommitFailure,
+}
+
+/// Why the final offset commit of a stopping consumer was not confirmed;
+/// the `kind` of [`ShoveError::Commit`].
+///
+/// `#[non_exhaustive]`: match with a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CommitFailure {
+    /// The commit returned an error, carried as text: the coordinator's
+    /// answer, or a librdkafka local error, such as a timeout of its own or
+    /// an unknown partition. An answer from the coordinator says this
+    /// commit did not land. A local error raised after the request was
+    /// sent, such as a timeout, does not prove that: librdkafka reports it
+    /// after its own retries, and the broker may have accepted the commit
+    /// by then. The next member resumes from whatever position the broker
+    /// holds.
+    ///
+    /// The text is librdkafka's rendering of that error: the error code and
+    /// its description, and nothing else. It never carries a record's
+    /// payload, key or headers, nor a personal or account identifier taken
+    /// from one, so it is safe to log and to return as is.
+    #[error("rejected: {0}")]
+    Rejected(String),
+    /// The commit had no answer within the time it carries: the shutdown
+    /// deadline, or the time waited when the commit thread ended without
+    /// reporting. The result is unknown: the detached commit thread may
+    /// still land it after the consumer has returned.
+    #[error("no answer after waiting {0:?}; the result is unknown")]
+    Deadline(Duration),
+    /// No thread could be spawned to run the commit, so this commit was
+    /// never made and the consumer's close moved off the runtime by itself.
+    #[error("no thread could be spawned for the commit; this commit was never made")]
+    NoThread,
+}
+
+/// `[p0@o0, p1@o1]`, the `offsets` of [`FailedCommit`] in its message.
+fn format_offsets(offsets: &[(i32, i64)]) -> String {
+    let pairs: Vec<String> = offsets
+        .iter()
+        .map(|(partition, offset)| format!("{partition}@{offset}"))
+        .collect();
+    format!("[{}]", pairs.join(", "))
 }
 
 impl ShoveError {
@@ -122,6 +230,55 @@ mod tests {
             source: inner,
         };
         assert!(!err.is_retryable());
+    }
+
+    fn commit_error() -> ShoveError {
+        ShoveError::Commit(Box::new(FailedCommit {
+            topic: "orders".into(),
+            offsets: vec![(0, 8), (3, 12)],
+            kind: CommitFailure::Rejected("Broker: Group authorization failed".into()),
+        }))
+    }
+
+    /// The payload is boxed so that the error every fallible call returns
+    /// by value stays the size it was before the variant existed.
+    #[test]
+    fn the_commit_payload_is_boxed_so_the_error_stays_small() {
+        assert!(
+            std::mem::size_of::<ShoveError>() <= 40,
+            "ShoveError is {} bytes; box a large payload",
+            std::mem::size_of::<ShoveError>()
+        );
+    }
+
+    #[test]
+    fn display_commit_error_names_the_topic_the_offsets_and_the_kind() {
+        assert_eq!(
+            commit_error().to_string(),
+            "final offset commit on 'orders' for [0@8, 3@12] was not confirmed: \
+             rejected: Broker: Group authorization failed"
+        );
+        let deadline = ShoveError::Commit(Box::new(FailedCommit {
+            topic: "orders".into(),
+            offsets: vec![(0, 8)],
+            kind: CommitFailure::Deadline(Duration::from_secs(20)),
+        }));
+        assert_eq!(
+            deadline.to_string(),
+            "final offset commit on 'orders' for [0@8] was not confirmed: no answer after \
+             waiting 20s; the result is unknown"
+        );
+        assert_eq!(
+            CommitFailure::NoThread.to_string(),
+            "no thread could be spawned for the commit; this commit was never made"
+        );
+    }
+
+    /// A failed final commit is never retried: a reconnect would rejoin the
+    /// group with the position still uncommitted and read as a clean member.
+    #[test]
+    fn commit_error_is_not_retryable() {
+        assert!(!commit_error().is_retryable());
     }
 
     /// `PartialBatch` has no retryability of its own — it inherits the

@@ -24,6 +24,7 @@ use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
 use shove::topic::Topic as _;
 use shove::topology::{SequenceFailure, TopologyBuilder};
+use shove::{CommitFailure, ShoveError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -4704,11 +4705,13 @@ async fn commit_interval_bounds_how_far_committed_offsets_lag() {
 /// ready, consumes a second record whose completion therefore stays
 /// uncommitted, and shuts its consumer down when a line arrives on stdin.
 /// The parent has frozen the broker by then, so the final synchronous commit
-/// blocks: the consumer must give up at `SHUTDOWN_COMMIT_DEADLINE` and this
-/// process must exit while the commit thread is still stuck.
+/// blocks: the consumer must give up at `SHUTDOWN_COMMIT_DEADLINE`, end with
+/// `ShoveError::Commit` of the `Deadline` kind instead of a clean exit, and
+/// this process must exit, with a failure status, while the commit thread
+/// is still stuck.
 #[tokio::test]
 #[ignore = "child process of shutdown_exits_the_process_while_the_broker_is_frozen"]
-async fn child_consumes_then_shuts_down_on_stdin() {
+async fn child_consumes_then_shuts_down_on_stdin() -> Result<(), String> {
     use std::io::Write as _;
 
     shove::define_topic!(
@@ -4778,13 +4781,30 @@ async fn child_consumes_then_shuts_down_on_stdin() {
 
     let started = Instant::now();
     shutdown.cancel();
-    run.await.unwrap().expect("run returns Ok after shutdown");
+    let result = run.await.unwrap();
     println!("run returned after {} ms", started.elapsed().as_millis());
+    // The frozen coordinator never answers the final commit, so the consumer
+    // gives up at the deadline and ends with the typed error instead of a
+    // clean exit. Printed for the parent, which cannot see the value itself.
+    match &result {
+        Err(ShoveError::Commit(failed)) => match &failed.kind {
+            CommitFailure::Deadline(deadline) => {
+                println!(
+                    "run returned Commit Deadline({deadline:?}) for {:?}",
+                    failed.offsets
+                )
+            }
+            other => println!("run returned Commit {other:?} for {:?}", failed.offsets),
+        },
+        other => println!("run returned {other:?}"),
+    }
     std::io::stdout().flush().unwrap();
-    // Return the way a service's `main` does. The commit thread is still
-    // blocked on the frozen broker; that this process nevertheless exits, which
-    // the parent waits for, is what proves the thread holds neither the
-    // runtime nor the process.
+    // Return the way a service's `main` does, the error included, so the
+    // process exits with a failure status. The commit thread is still
+    // blocked on the frozen broker; that this process nevertheless exits,
+    // which the parent waits for, is what proves the thread holds neither
+    // the runtime nor the process.
+    result.map_err(|e| e.to_string())
 }
 
 /// The final commit and the consumer's close run on a dedicated thread with a
@@ -4793,7 +4813,10 @@ async fn child_consumes_then_shuts_down_on_stdin() {
 /// exit: a child consumer is driven to have an uncommitted completion, the
 /// broker is paused, the child is told to shut down, and it must exit within
 /// the deadline plus a margin while the broker stays paused. The parent
-/// unpauses only after the exit.
+/// unpauses only after the exit. The commit that missed the deadline is not
+/// a clean exit: the child's run ends with `ShoveError::Commit` of the
+/// `Deadline` kind carrying that deadline, and the child's process status is
+/// a failure.
 // `test-support` gates the deadline seam this test reads; the Kafka coverage
 // row enables it, and the schema-registry row, which compiles this binary
 // without it, never runs this suite.
@@ -4886,11 +4909,14 @@ async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
         let status = tokio::time::timeout(deadline + MARGIN, child.wait()).await;
         // Drain the pipes after the exit so nothing here waits on a live child.
         let mut elapsed_ms = None;
+        let mut returned = None;
         while let Ok(Ok(Some(line))) =
             tokio::time::timeout(Duration::from_secs(5), stdout.next_line()).await
         {
             if let Some(ms) = line.strip_prefix("run returned after ") {
                 elapsed_ms = ms.trim_end_matches(" ms").parse::<u128>().ok();
+            } else if let Some(what) = line.strip_prefix("run returned ") {
+                returned = Some(what.to_owned());
             }
         }
         let mut stderr_text = String::new();
@@ -4899,22 +4925,31 @@ async fn shutdown_exits_the_process_while_the_broker_is_frozen() {
             tokio::io::AsyncReadExt::read_to_string(&mut BufReader::new(stderr), &mut stderr_text),
         )
         .await;
-        (status, elapsed_ms, stderr_text)
+        (status, elapsed_ms, returned, stderr_text)
     }
     .await;
     // Only now may the broker run again: the assertions below are about what
     // the child managed while it was frozen.
     tb.unpause().await;
 
-    let (status, elapsed_ms, stderr_text) = exit;
+    let (status, elapsed_ms, returned, stderr_text) = exit;
     let status = status
         .expect(
             "child must exit within the shutdown deadline plus margin while the broker is frozen",
         )
         .expect("child wait");
+    // The child's run ends with the typed error and returns it from its
+    // body, so its process status is a failure, as a service's would be.
     assert!(
-        status.success(),
-        "child exited with {status}, stderr: {stderr_text}"
+        !status.success(),
+        "the child must exit with a failure status after its final commit missed the deadline; \
+         exited with {status}, stderr: {stderr_text}"
+    );
+    let returned = returned.expect("child reports what run returned");
+    assert!(
+        returned.starts_with(&format!("Commit Deadline({deadline:?})")),
+        "run must end with ShoveError::Commit of the Deadline kind carrying the deadline: \
+         {returned}; stderr: {stderr_text}"
     );
     let elapsed_ms = elapsed_ms.expect("child reports how long run took to return");
     assert!(
@@ -6292,6 +6327,75 @@ async fn a_raised_commit_interval_raises_the_receive_loops_fence_threshold() {
     broker.close().await;
 }
 
+/// A consumer that received no record has no position to commit, so when no
+/// thread can be spawned for the final commit there is no commit to fail:
+/// the run ends clean, with no `Commit` error, and the close still moves off
+/// the runtime thread. The record-carrying case is
+/// `a_leaked_consumer_keeps_its_group_member_past_the_session_timeout`.
+// `test-support` gates the spawn switch this test reads.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_consumer_with_nothing_to_commit_ends_clean_when_no_thread_can_be_spawned() {
+    use shove::kafka::final_commit_spawn_probe;
+
+    shove::define_topic!(
+        NothingToCommitTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-nothing-to-commit").build()
+    );
+
+    impl MessageHandler<NothingToCommitTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    const GROUP: &str = "kafka-nothing-to-commit-consumer";
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<NothingToCommitTopic>()
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let run = tokio::spawn(async move {
+        consumer
+            .run::<NothingToCommitTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Kafka>::new().with_shutdown(sc),
+            )
+            .await
+    });
+    // The member has joined and holds its partitions; nothing was delivered.
+    wait_for_stable_group(tb.brokers(), GROUP, TIMEOUT).await;
+
+    // From here on no thread can be had, for the final commit or for the close.
+    final_commit_spawn_probe::refuse_threads(true);
+    let started = Instant::now();
+    shutdown.cancel();
+    let result = run.await.unwrap();
+    assert!(
+        result.is_ok(),
+        "with no position to commit, a refused thread is not a commit failure: {result:?}"
+    );
+    // The close blocks for as long as librdkafka takes to leave the group. A
+    // run that returns at once did not run it on the runtime thread.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown must return without closing the consumer here, took {:?}",
+        started.elapsed()
+    );
+}
+
 /// The last resort of the final-commit thread, N1: when no thread can be
 /// spawned for the commit or for the close, the handle is leaked rather than
 /// closed on the runtime thread. This pins, against a real broker, the cost
@@ -6299,7 +6403,9 @@ async fn a_raised_commit_interval_raises_the_receive_loops_fence_threshold() {
 /// instance keeps heartbeating, so the group keeps its member past the
 /// `session.timeout.ms` a crash would have freed it by. The member leaves
 /// only when `max.poll.interval.ms` (five minutes) passes without a poll,
-/// which this test does not wait for, or when the process exits.
+/// which this test does not wait for, or when the process exits. Nothing
+/// commits, and the run says so: it ends with `ShoveError::Commit` of the
+/// `NoThread` kind carrying the acknowledged record's position.
 // `test-support` gates the spawn switch and the timeout seam this test reads.
 #[cfg(feature = "test-support")]
 #[tokio::test]
@@ -6360,9 +6466,31 @@ async fn a_leaked_consumer_keeps_its_group_member_past_the_session_timeout() {
     final_commit_spawn_probe::refuse_threads(true);
     let started = Instant::now();
     shutdown.cancel();
-    run.await
-        .unwrap()
-        .expect("run returns Ok: the missing commit is settled as a rejected one");
+    let result = run.await.unwrap();
+    // Nothing committed, and the member says so instead of ending clean: the
+    // acknowledged record's exclusive position is in the error, with the
+    // `NoThread` kind.
+    let Err(ShoveError::Commit(failed)) = &result else {
+        panic!(
+            "run must end with ShoveError::Commit of the NoThread kind when no thread can be \
+             spawned for the final commit: {result:?}"
+        );
+    };
+    assert!(
+        matches!(failed.kind, CommitFailure::NoThread),
+        "the NoThread kind: {failed:?}"
+    );
+    let (topic, offsets) = (&failed.topic, &failed.offsets);
+    assert_eq!(topic, "kafka-leaked-close");
+    assert_eq!(
+        offsets.len(),
+        1,
+        "one partition held the record: {offsets:?}"
+    );
+    assert_eq!(
+        offsets[0].1, 1,
+        "the acknowledged record's exclusive position: {offsets:?}"
+    );
     // The close blocks for as long as librdkafka takes to leave the group. A
     // run that returns at once did not run it on the runtime thread.
     assert!(
