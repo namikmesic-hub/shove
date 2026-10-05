@@ -33,6 +33,8 @@ use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "metrics")]
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rdkafka::bindings::{
     rd_kafka_handle_mock_cluster, rd_kafka_mock_broker_push_request_error_rtts,
     rd_kafka_mock_get_requests, rd_kafka_mock_request_api_key, rd_kafka_mock_request_destroy_array,
@@ -1643,8 +1645,7 @@ async fn a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign
 /// `shove_messages_discarded_total` for `topic`, summed over its reasons,
 /// from one draining snapshot of the debugging recorder.
 #[cfg(feature = "metrics")]
-fn discarded_total(snapshotter: &metrics_util::debugging::Snapshotter, topic: &str) -> u64 {
-    use metrics_util::debugging::DebugValue;
+fn discarded_total(snapshotter: &Snapshotter, topic: &str) -> u64 {
     snapshotter
         .snapshot()
         .into_hashmap()
@@ -1665,8 +1666,8 @@ fn discarded_total(snapshotter: &metrics_util::debugging::Snapshotter, topic: &s
 /// Installs the debugging recorder as the process's global recorder; one
 /// per test process, which nextest gives every test.
 #[cfg(feature = "metrics")]
-fn install_recorder() -> metrics_util::debugging::Snapshotter {
-    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+fn install_recorder() -> Snapshotter {
+    let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     recorder.install().expect("install the debugging recorder");
     snapshotter

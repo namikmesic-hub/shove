@@ -10564,6 +10564,9 @@ mod broadcast_option_guard_tests {
 mod final_commit_thread_tests {
     use super::*;
     use std::thread::ThreadId;
+    use tracing::field::{Field, Visit};
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
     type Spawner = Box<dyn FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>>;
 
@@ -10638,8 +10641,8 @@ mod final_commit_thread_tests {
     /// The message of one WARN event.
     struct Message(String);
 
-    impl tracing::field::Visit for Message {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    impl Visit for Message {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
             if field.name() == "message" {
                 self.0 = format!("{value:?}");
             }
@@ -10650,12 +10653,8 @@ mod final_commit_thread_tests {
     #[derive(Clone, Default)]
     struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
-    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Warnings {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
+    impl<S: tracing::Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
             if *event.metadata().level() == tracing::Level::WARN {
                 let mut message = Message(String::new());
                 event.record(&mut message);
@@ -10962,11 +10961,8 @@ mod final_commit_thread_tests {
     /// follows that holder instead of claiming it ran.
     #[tokio::test]
     async fn a_drop_with_another_holder_left_reports_the_close_as_following_that_holder() {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let warnings = Warnings::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let _guard = set_default(tracing_subscriber::registry().with(warnings.clone()));
         let result = final_commit_on_thread(
             SharedProbe,
             Some(one_offset()),
@@ -10996,11 +10992,8 @@ mod final_commit_thread_tests {
     /// the real 20 s.
     #[tokio::test(start_paused = true)]
     async fn a_commit_past_the_deadline_is_reported_as_the_deadline() {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let warnings = Warnings::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let _guard = set_default(tracing_subscriber::registry().with(warnings.clone()));
         let (release_tx, release) = std_mpsc::channel::<()>();
         let result = final_commit_on_thread(
             BlockingProbe { release },
