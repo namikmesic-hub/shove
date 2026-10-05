@@ -346,11 +346,11 @@ pub mod kafka {
     pub use crate::markers::Kafka;
 
     pub use crate::backends::kafka::{
-        BatchConsumerOptions, KafkaAutoOffsetReset, KafkaAutoscalerBackend, KafkaClient,
-        KafkaConsumer, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
-        KafkaLagStatsProvider, KafkaOffsetReset, KafkaOffsetResetReport, KafkaPartitionOffsetReset,
-        KafkaPublisher, KafkaPublisherConfig, KafkaQueueStats, KafkaQueueStatsProvider,
-        KafkaTopologyDeclarer,
+        BatchConsumerOptions, CommitPolicy, KafkaAutoOffsetReset, KafkaAutoscalerBackend,
+        KafkaClient, KafkaConsumer, KafkaConsumerGroup, KafkaConsumerGroupConfig,
+        KafkaConsumerGroupRegistry, KafkaLagStatsProvider, KafkaOffsetReset,
+        KafkaOffsetResetReport, KafkaPartitionOffsetReset, KafkaPublisher, KafkaPublisherConfig,
+        KafkaQueueStats, KafkaQueueStatsProvider, KafkaTopologyDeclarer,
     };
     #[cfg(feature = "kafka-ssl")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]
@@ -377,6 +377,12 @@ pub mod kafka {
     #[doc(hidden)]
     pub use crate::backends::kafka::put_back_probe;
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::housekeeping_interval_for_test;
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::pending_commit_budget_for_test;
     /// Test-only counters (see the `test-support` feature) on the records the
     /// receive loop held while it waited for a prefetch permit, and on those
     /// the broadcast loop held for its slot, for tests that must have a
@@ -402,6 +408,9 @@ pub mod kafka {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub use crate::backends::kafka::final_commit_spawn_probe;
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub use crate::backends::kafka::per_record_probe;
 
     /// Test-only seam (see the `test-support` feature): the consumer
     /// `session.timeout.ms`, for tests that wait past it.

@@ -28,7 +28,7 @@ pub use consumer::permit_wait_probe;
 #[doc(hidden)]
 pub use consumer::put_back_probe;
 pub use consumer::{BatchConsumerOptions, KafkaConsumer};
-pub(crate) use consumer_group::validate_commit_interval;
+pub(crate) use consumer_group::validate_commit_policy;
 
 /// Test-only seam (see the `test-support` feature): the deadline the
 /// concurrent receive loop gives its final synchronous commit at shutdown,
@@ -40,6 +40,25 @@ pub fn shutdown_commit_deadline_for_test() -> std::time::Duration {
     constants::SHUTDOWN_COMMIT_DEADLINE
 }
 
+/// Test-only seam (see the `test-support` feature): the share of that
+/// deadline a `CommitPolicy::PerRecord` commit found in flight at shutdown
+/// is waited for, so a test asserts against the constant rather than a
+/// hand-derived fraction.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn pending_commit_budget_for_test() -> std::time::Duration {
+    constants::PENDING_COMMIT_BUDGET
+}
+
+/// Test-only seam (see the `test-support` feature): the interval of the
+/// receive loop's housekeeping tick, the one arm due on an idle member, so
+/// a test that waits for a pass to run reads the constant itself.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn housekeeping_interval_for_test() -> std::time::Duration {
+    consumer::HOUSEKEEPING_INTERVAL
+}
+
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::fence_probe;
@@ -47,6 +66,9 @@ pub use consumer::fence_probe;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use consumer::final_commit_spawn_probe;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use consumer::per_record_probe;
 
 /// Test-only seam (see the `test-support` feature): the `session.timeout.ms`
 /// every shove consumer is created with, so a test that waits past it asserts
@@ -57,7 +79,8 @@ pub fn session_timeout_for_test() -> std::time::Duration {
     std::time::Duration::from_millis(u64::from(constants::SESSION_TIMEOUT_MS))
 }
 pub use consumer_group::{
-    KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
+    CommitPolicy, KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig,
+    KafkaConsumerGroupRegistry,
 };
 pub use offset_reset::{KafkaOffsetReset, KafkaOffsetResetReport, KafkaPartitionOffsetReset};
 pub(crate) use offset_reset::{reset_group_offsets, resolved_reset_group_id};

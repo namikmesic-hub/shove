@@ -167,6 +167,21 @@ pub(super) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// finishes on its own.
 pub(super) const SHUTDOWN_COMMIT_DEADLINE: Duration = Duration::from_secs(20);
 
+/// The share of `SHUTDOWN_COMMIT_DEADLINE` the concurrent receive loop gives
+/// a `CommitPolicy::PerRecord` commit it finds in flight at shutdown: three
+/// quarters, so the final commit and the consumer's close always keep a
+/// slice of the deadline. Derived from the deadline, never written beside
+/// it.
+pub(super) const PENDING_COMMIT_BUDGET: Duration = {
+    // `Duration` has no const `Div`; `checked_div` is `None` for a divisor
+    // of zero only, so the fallback arm cannot be taken.
+    let quarter = match SHUTDOWN_COMMIT_DEADLINE.checked_div(4) {
+        Some(quarter) => quarter,
+        None => Duration::ZERO,
+    };
+    SHUTDOWN_COMMIT_DEADLINE.saturating_sub(quarter)
+};
+
 /// How long a consume loop waits before asking the schema registry again for
 /// a record whose schema id it could not resolve: a transport failure, or a
 /// 5xx after the client's own retries. The record is kept, not discarded, so

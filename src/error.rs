@@ -53,11 +53,14 @@ pub enum ShoveError {
     #[error("batch publish: {0}")]
     PartialBatch(Box<BatchFailure>),
 
-    /// The final offset commit of a stopping consumer was not confirmed.
+    /// An offset commit a stopping consumer could not get confirmed.
     ///
     /// The Kafka receive loop returns this from its shutdown arm when the
     /// synchronous commit it issues after the handler drain returns an
-    /// error, misses the shutdown deadline, or has no thread to run on. The member
+    /// error, misses the shutdown deadline, or has no thread to run on.
+    /// Under `CommitPolicy::PerRecord` it also returns this for the commit
+    /// in flight when the stop landed, when that commit has no answer within
+    /// its share of the deadline; no final commit follows it. The member
     /// ends with this error instead of a clean exit: a group run counts it
     /// under [`SupervisorOutcome::errors`](crate::SupervisorOutcome::errors),
     /// so [`exit_code`](crate::SupervisorOutcome::exit_code) is `1`, and the
@@ -93,14 +96,16 @@ pub enum ShoveError {
     Commit(Box<FailedCommit>),
 }
 
-/// A final offset commit that was not confirmed: what the commit carried
-/// and why it was not confirmed. The payload of [`ShoveError::Commit`].
+/// An offset commit at shutdown that was not confirmed, the final commit
+/// or under `CommitPolicy::PerRecord` the commit in flight when the stop
+/// landed: what the commit carried and why it was not confirmed. The
+/// payload of [`ShoveError::Commit`].
 ///
 /// `#[non_exhaustive]`: read the fields, and match with `..`, so a field
 /// can be added later.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "final offset commit on '{topic}' for {} was not confirmed: {kind}",
+    "offset commit at shutdown on '{topic}' for {} was not confirmed: {kind}",
     format_offsets(offsets)
 )]
 #[non_exhaustive]
@@ -117,8 +122,8 @@ pub struct FailedCommit {
     pub kind: CommitFailure,
 }
 
-/// Why the final offset commit of a stopping consumer was not confirmed;
-/// the `kind` of [`ShoveError::Commit`].
+/// Why an offset commit at shutdown was not confirmed; the `kind` of
+/// [`ShoveError::Commit`].
 ///
 /// `#[non_exhaustive]`: match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -140,9 +145,11 @@ pub enum CommitFailure {
     #[error("rejected: {0}")]
     Rejected(String),
     /// The commit had no answer within the time it carries: the shutdown
-    /// deadline, or the time waited when the commit thread ended without
-    /// reporting. The result is unknown: the detached commit thread may
-    /// still land it after the consumer has returned.
+    /// deadline for a final commit, its share of that deadline for a
+    /// `CommitPolicy::PerRecord` commit found in flight at the stop, or the
+    /// time waited when the commit thread ended without reporting. The
+    /// result is unknown: the detached commit thread may still land it after
+    /// the consumer has returned.
     #[error("no answer after waiting {0:?}; the result is unknown")]
     Deadline(Duration),
     /// No thread could be spawned to run the commit, so this commit was
@@ -255,7 +262,7 @@ mod tests {
     fn display_commit_error_names_the_topic_the_offsets_and_the_kind() {
         assert_eq!(
             commit_error().to_string(),
-            "final offset commit on 'orders' for [0@8, 3@12] was not confirmed: \
+            "offset commit at shutdown on 'orders' for [0@8, 3@12] was not confirmed: \
              rejected: Broker: Group authorization failed"
         );
         let deadline = ShoveError::Commit(Box::new(FailedCommit {
@@ -265,7 +272,7 @@ mod tests {
         }));
         assert_eq!(
             deadline.to_string(),
-            "final offset commit on 'orders' for [0@8] was not confirmed: no answer after \
+            "offset commit at shutdown on 'orders' for [0@8] was not confirmed: no answer after \
              waiting 20s; the result is unknown"
         );
         assert_eq!(

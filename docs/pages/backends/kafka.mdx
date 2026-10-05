@@ -262,13 +262,28 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
   A fresh drain therefore never skips a dead letter, and a restarted drain resumes from its commit.
 - **`with_commit_interval(Duration)`** - how often each consumer commits the offsets its handlers completed.
   The default is `500ms`.
-  The interval must be positive and at most one hour; the setter panics otherwise, so an unrepresentable commit deadline is refused at configuration time and never met in the receive loop.
-  The check runs again where the consumer starts, so a value written to the public `kafka_commit_interval` field past the setter is refused there.
+  The interval must be positive and at most one hour.
+  The setter panics otherwise, so an unrepresentable commit deadline is refused at configuration time and never met in the receive loop.
+  The check runs again where the consumer starts.
+  A value written to the public `kafka_commit_interval` field past the setter is refused there with `ShoveError::Topology`, never with a panic.
   A longer interval sends fewer OffsetCommit requests and widens the replay window after a crash or rebalance by the same amount.
   Standard groups only: a FIFO consumer commits each message as it settles, so `register_fifo` refuses a config that sets an interval.
   The DLQ drain commits each dead letter as it settles and refuses the setting on `ConsumerOptions::<Kafka>` for the same reason.
   See [Offset commit semantics](#offset-commit-semantics).
   The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
+  It is shorthand for `with_commit_policy(CommitPolicy::Interval(..))`, below.
+- **`with_commit_policy(CommitPolicy)`** - how each consumer commits the offsets its handlers completed.
+  `CommitPolicy::Interval(Duration)` is the default, at `500ms`, and `with_commit_interval(d)` is shorthand for it.
+  `CommitPolicy::PerRecord` commits every completion before the next record is handed out.
+  The commit runs synchronously on a thread of its own, and the consumer waits for the coordinator's answer while it keeps polling.
+  Every record costs a commit round trip and a fetch round trip, so throughput is bounded by that latency.
+  It is an opt-in for a handler that is not idempotent.
+  It needs one prefetch permit: `with_prefetch_count(1)`, or concurrent processing off, which clamps the count to one.
+  With more than one permit a completion above an unfinished lower offset confirms nothing.
+  `register` and `KafkaConsumer::run` therefore refuse such a configuration before anything is spawned.
+  The same setting is available on `ConsumerOptions::<Kafka>` for the direct and supervisor paths.
+  A FIFO consumer, the DLQ drain and a broadcast subscription refuse a policy as they refuse an interval.
+  See [Offset commit semantics](#offset-commit-semantics).
 
 ### Fan-out — a second reader on the same topic
 
@@ -348,7 +363,9 @@ subscriber.subscribe::<CacheInvalidations, _>(
 ```
 
 `BroadcastStart` is backend-neutral, and Kafka is the backend that honours all three variants on this version.
-A broadcast subscription refuses `with_commit_interval` and `with_auto_offset_reset` at `subscribe()`: it commits nothing and assigns every partition at an explicit offset, so neither setting would change anything, and a setting that changes nothing is refused rather than dropped.
+A broadcast subscription refuses `with_commit_policy`, its shorthand `with_commit_interval`, and `with_auto_offset_reset` at `subscribe()`.
+It commits nothing and assigns every partition at an explicit offset, so none of those settings would change anything.
+A setting that changes nothing is refused rather than dropped.
 The competing-consumer entry points refuse `with_broadcast_start` for the same reason.
 
 - **`BroadcastStart::Tail`**, and no call at all - every partition at its end offset: deliver-new, the broadcast contract.
@@ -434,13 +451,67 @@ That is an `Ack`, or a `Reject` or an exhausted retry budget that was dead-lette
 This closes the publish-then-commit race.
 A broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
 
-Completions are tracked in memory per partition and committed **asynchronously, at most once per commit interval**.
+Under `CommitPolicy::Interval`, the default, completions are tracked in memory per partition and committed **asynchronously, at most once per commit interval**.
 The interval is 500 ms by default, configurable with `with_commit_interval` on `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`.
 The gate keeps the number of in-flight commits O(1) however fast the consumer runs.
 A longer interval trades coordinator requests for a wider replay window.
 A commit the coordinator rejects is re-offered on a later drain.
 A consumer whose commits keep being rejected with no rebalance resolving them is treated as fenced and reconnects.
 That threshold grows with the interval, because the streak can only clear on a drain.
+
+Under `CommitPolicy::PerRecord`, set with `with_commit_policy` on the same two configs, every completion is committed at once.
+The next record is handed out only once the coordinator has accepted that commit.
+The commit runs synchronously on a thread of its own, so it never blocks the runtime thread.
+The consumer pauses its assignment the moment it takes a record, before anything decides its fate, and keeps polling.
+A schema registry stall on that record runs inside that pause, and the commit of the record resumes the assignment, not the stall.
+Rebalance callbacks are therefore served, and the member stays inside `max.poll.interval.ms`.
+A record dropped before the handler, oversize or undecodable, commits its position the same way.
+It holds the next record back until that commit is accepted.
+It resumes once the commit is accepted and refetches from the position, so every record costs a fetch round trip beside its commit.
+The wait for the answer ends on shutdown, and otherwise when librdkafka reports the result of the whole commit operation.
+librdkafka waits for that result without a timeout of its own (bundled librdkafka 2.12.1, `rdkafka_offset.c:403-406`).
+It retries a request unanswered for `socket.timeout.ms` up to two times (`rdkafka_buf.c:161-162`, `rdkafka_proto.h:47`, `rdkafka_request.c:1784-1787`).
+A commit with no coordinator waits for one up to `session.timeout.ms` (`rdkafka_cgrp.c:3744-3746`).
+The wait can therefore run for several socket timeouts before the commit counts as rejected.
+A rejected commit is re-offered as under `Interval`, spaced by the default 500 ms.
+The loop therefore polls between re-offers, and a rebalance behind a `REBALANCE_IN_PROGRESS` can complete.
+The assignment stays paused until a re-offer is accepted, so no record is handed out behind a rejected position.
+A partition revoked while paused and handed back later arrives paused, because librdkafka keeps a partition's pause flag across a revoke.
+The consumer re-applies its intent over the whole assignment on every assign event a pass drains.
+A record that comes through `recv()` needs no such step.
+The pause when it is taken and the resume when its commit lands cover the whole assignment.
+A returned partition is therefore paused or resumed with the rest, either way.
+Two commits on one connection cannot overtake each other.
+librdkafka sends a member's OffsetCommit requests to its coordinator over one connection and in order (bundled librdkafka 2.12.1, `rdkafka_cgrp.c:4209`, `rdkafka_broker.c:2763-2771`).
+The [Kafka protocol](https://kafka.apache.org/protocol#protocol_network) processes one connection's requests in the order they were sent.
+A request unanswered for `socket.timeout.ms` fails its connection and is retried on the next one (`rdkafka_broker.c:1010-1066`, `rdkafka_request.c:1757-1786`, `rdkafka_buf.c:392-416`).
+The broker may still hold that abandoned request, so it can apply it after the retry and after later commits, as under `Interval`.
+That moves the committed position back to the older one, and a crash before the next commit then replays every record since it.
+shove does not re-issue the position after such a reconnect: the next record's commit is what repairs it.
+The fenced consumer detector keeps its 60 s floor under `PerRecord`, because there is no interval to scale it by.
+A stop that lands while a commit is in flight waits for its answer inside the shutdown deadline.
+The shutdown section below says what happens when that answer is late.
+The policy needs one prefetch permit, and both `register` and `KafkaConsumer::run` refuse a configuration with more.
+See the option above.
+
+The pattern is a per-record acknowledgement, what Spring Kafka calls `AckMode.RECORD`: the position is committed after each record, before the next is taken.
+Kafka transactions close the replay window differently: `sendOffsetsToTransaction` commits the position together with the records a handler produces, and applies to a consume-then-produce handler only.
+An idempotent receiver removes the need for either, by making a replayed record a no-op, which is what `Interval` assumes of a handler.
+`PerRecord` trades throughput for the one-record replay bound where a handler cannot be made idempotent and produces nothing Kafka could tie to the commit.
+
+What the policy does, condition by condition, with the source line as of this change and the test that asserts it:
+
+| Condition | Effect | Source line | Conformance assertion |
+|---|---|---|---|
+| A completion under `PerRecord` | The position is committed synchronously on a thread, and the next record waits for the coordinator's answer. | `src/backends/kafka/consumer.rs:3467`, `commit_confirmed` | `per_record_issues_one_offset_commit_per_completion` |
+| A record is dropped before the handler | Its position is committed like a completion, and the next record waits the same way, through a refused thread or a rejection. | `src/backends/kafka/consumer.rs:5543-5556`, the pause when a record is taken | `a_record_dropped_before_the_handler_holds_the_next_record_until_its_commit_is_accepted`, `a_record_dropped_before_the_handler_holds_the_next_record_while_its_commit_is_rejected` |
+| A schema registry stall under `PerRecord` | The stall runs inside the pause the take holds, and its end leaves the resume to the commit, so no record is fetched and put back behind it. | `src/backends/kafka/consumer.rs:5616`, `RegistryStall::inside_pause` | `a_per_record_stall_leaves_the_resume_to_the_commit` |
+| The coordinator rejects the commit | The position is re-offered every 500 ms with the assignment paused, and the fence judges the streak at the 60 s floor. | `src/backends/kafka/consumer.rs:198`, `AsyncCommitGate::mark_rejected`, and `src/backends/kafka/consumer.rs:2895`, `fence_threshold_over` | `a_rejected_commit_is_re_offered_until_the_fence_fires`, `a_rejected_commit_recovers_on_a_re_offer_before_the_next_record_is_handed_out` |
+| The answer is late | The next record waits for it, and the member keeps polling meanwhile. | `src/backends/kafka/consumer.rs:3530`, the `recv()` arm of `commit_confirmed` | `a_late_answer_holds_the_next_record_while_the_member_keeps_polling` |
+| A `Retry` or `Defer` republish fails | The member ends with a connection error before the next record is handed out, and the reconnect redelivers the record. | `src/backends/kafka/consumer.rs:2024`, `run_delayed_republish` | `a_republish_that_fails_under_per_record_ends_the_member_before_the_next_record` |
+| A partition is handed back paused | A pass that drains the assign pauses or resumes it with the rest, and a record the receive arm takes covers it with its own pause and resume cycle. | `src/backends/kafka/consumer.rs:3387`, `reconcile_pause_after_assign`, and `src/backends/kafka/consumer.rs:5543-5556` | `a_partition_handed_back_paused_is_resumed_when_a_pass_drains_the_assign`, `a_partition_handed_back_paused_is_resumed_when_the_receive_arm_drains_the_assign` |
+| A stop finds a commit in flight | It is waited for up to `PENDING_COMMIT_BUDGET`; an accepted answer is followed by the final commit, a rejected one is re-offered by it, and no answer ends the stop with `ShoveError::Commit` of the `Deadline` kind. | `src/backends/kafka/consumer.rs:5243-5317`, the shutdown arm of `KafkaConsumer::run` | `a_stop_during_a_commit_waits_for_its_answer_and_leaves_the_group_before_returning`, `a_discard_behind_a_commit_rejected_at_the_stop_is_counted_once_by_the_final_commit`, `a_per_record_stop_against_a_frozen_coordinator_reports_the_commit_it_could_not_finish` |
+| A prefetch above one with concurrent processing on | Refused at `KafkaConsumer::run` and at `KafkaConsumerGroupRegistry::register`. | `src/backends/kafka/consumer.rs:2998`, `check_per_record_prefetch`, and `src/backends/kafka/consumer_group.rs:1221` | `run_rejects_per_record_commits_with_two_permits`, `register_rejects_per_record_commits_with_more_than_one_permit` |
 
 The commit position is derived from the offsets the broker actually delivered, never from a run of consecutive integers.
 A hole left by log compaction or by a transactional producer's control records does not hold the position back.
@@ -462,11 +533,19 @@ If no thread can be spawned, nothing commits and the close moves to a second, cl
 If that thread cannot be spawned either, the handle is leaked and logged at error level.
 The leaked consumer keeps heartbeating, so while the process lives its partitions stay assigned until `max.poll.interval.ms` (5 min) passes without a poll.
 Once the process exits, the broker drops the member after the session timeout, as after a crash.
-The consumer waits for that commit for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
+The consumer waits for at most 20 s (`SHUTDOWN_COMMIT_DEADLINE` in `kafka::constants`).
+That wait covers the commit and the close that follows it on the same thread, and the thread reports the two separately.
+A close that outlives the deadline is logged at warn level and is never reported as a failed commit.
+Under `CommitPolicy::PerRecord` a commit in flight when shutdown fires is waited for first, for at most three quarters of that deadline.
+If it is accepted, the final commit carries the position again, as every final commit does.
+If it is rejected, the final commit re-offers its position.
+If it has no answer in time, the stop ends with `ShoveError::Commit` of the `Deadline` kind carrying that share, and issues no second commit.
+The member then leaves its group once that commit returns on its thread, and a group run counts the member under `errors`.
 The deadline is chosen against the 30 s termination grace Kubernetes gives a Pod.
 The thread finishes on its own and never holds the runtime or the process, so a frozen coordinator cannot turn a deploy into a `SIGKILL`.
 
 A final commit the broker does not confirm ends the member with `ShoveError::Commit` instead of a clean exit.
+The error reads `offset commit at shutdown`, because under `CommitPolicy::PerRecord` the commit it names can be the one in flight when the stop landed.
 The error names the topic, the position the commit carried per partition, and a `CommitFailure`.
 `Rejected` carries the error the commit returned: the broker's answer, or a librdkafka local error.
 A broker's answer says this commit did not land.
@@ -490,8 +569,16 @@ Its tracker went with the partition, and the new owner picks the record up.
 What that means for replay:
 
 - After a crash, the records completed since the last accepted commit are redelivered.
-  That is about one interval's worth when commits are accepted and every earlier offset on the partition had completed.
-  A rejected commit that is still being re-offered, or an earlier record whose handler is still running, holds the position and widens that window.
+  Under `Interval` that is about one interval's worth when commits are accepted and every earlier offset on the partition had completed.
+  Under `PerRecord` it is every record since the commit the coordinator applied last.
+  On a stable coordinator connection that is one record.
+  That record is in the handler, in a `Retry` or `Defer` republish that had not landed, or in a commit still unanswered or rejected.
+  Nothing is handed out behind an unaccepted position, so no other record joins it.
+  It can be more when a commit was in flight across a coordinator reconnect.
+  The abandoned copy can then be applied after later commits, as the commit section above describes.
+  A `Retry` or `Defer` whose republish fails ends the member with a connection error, and the reconnect redelivers that record.
+  Under `Interval` a rejected commit still being re-offered holds the position and widens that window.
+  So does an earlier record whose handler is still running.
 - After a rebalance, a moved partition replays from its last accepted commit.
 - After a clean shutdown, a record whose handler returned a terminal outcome and whose offset reached the final commit is not redelivered.
   A record whose handler had not settled when shutdown fired stays uncommitted and is redelivered.
