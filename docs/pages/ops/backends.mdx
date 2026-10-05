@@ -106,7 +106,8 @@ shove tracks handler completions and commits them asynchronously every 500 ms by
 The next record is handed out only once the coordinator has accepted that commit, and the consumer keeps polling while it waits.
 It is an opt-in for a handler that is not idempotent, and it needs one prefetch permit.
 On clean shutdown, shove first waits for the in-flight handlers to finish.
-That wait is bounded by the handler timeout and by any in-place delays on an external topic.
+That wait is bounded by the handler timeout.
+An in-place delay on an external topic does not extend it: shutdown cuts the delay short, and the record stays uncommitted.
 It then commits the final position synchronously from a dedicated thread, which also closes the consumer.
 It waits at most 20 s for both, and the thread reports the two separately.
 That 20 s bound covers the concurrent consumer's final commit only.

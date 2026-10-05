@@ -69,6 +69,16 @@ define_topic!(
         .build()
 );
 
+// A stop during a deferred wait; see
+// `a_stop_during_a_deferred_wait_hands_nothing_over_behind_it`.
+define_topic!(
+    StopTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-stop")
+        .broadcast()
+        .build()
+);
+
 define_topic!(
     RetryTopic,
     Invalidate,
@@ -244,6 +254,76 @@ impl MessageHandler<DeferTopic> for DeferOnce {
         calls.push(msg.key);
         if seen_before == 0 {
             Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+/// A gate a handler waits at until the test opens it, so a test holds a
+/// handler in its running state for exactly as long as the scenario needs,
+/// and never for a fixed time.
+#[derive(Default)]
+struct Gate {
+    open: std::sync::atomic::AtomicBool,
+    opened: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn open(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.opened.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            // Register before the check: `notify_waiters` stores no permit,
+            // so an open landing between an unregistered check and the await
+            // would otherwise be lost.
+            let mut opened = std::pin::pin!(self.opened.notified());
+            opened.as_mut().enable();
+            if self.open.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+/// Records the key of every call. The first call waits at the gate and then
+/// returns `first`; every later one acks.
+#[derive(Clone)]
+struct GatedFirst {
+    calls: Arc<Mutex<Vec<String>>>,
+    gate: Arc<Gate>,
+    first: Outcome,
+}
+
+impl GatedFirst {
+    fn new(first: Outcome) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: Arc::new(Gate::default()),
+            first,
+        }
+    }
+
+    async fn calls(&self) -> Vec<String> {
+        self.calls.lock().await.clone()
+    }
+}
+
+impl MessageHandler<StopTopic> for GatedFirst {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+        let first = {
+            let mut calls = self.calls.lock().await;
+            calls.push(msg.key);
+            calls.len() == 1
+        };
+        if first {
+            self.gate.wait().await;
+            self.first.clone()
         } else {
             Outcome::Ack
         }
@@ -1451,6 +1531,145 @@ async fn defer_redelivers_in_place_before_later_records() {
     let _ = sub
         .run_until_timeout(std::future::pending(), Duration::from_secs(10))
         .await;
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// A stop during a deferred wait hands nothing over behind it. Two records
+/// sit on one partition. The first call holds the subscription's single
+/// slot at a gate while the second record is read and enters the slot wait
+/// behind it, which the probe on that wait shows. The stop lands then, and
+/// the gate opens: the first call defers into a wait the stop ends at once,
+/// which frees the slot in the same instant. The loop must read the stop
+/// first and drop the second record, so the handler saw exactly one call.
+/// The gate keeps the stop off the one-second delay's clock. At `7d392b6`
+/// the slot wait was a bare `acquire_owned().await`, so the second record
+/// reached the handler after the stop.
+#[tokio::test]
+async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
+    use shove::kafka::permit_wait_probe;
+
+    const TOPIC: &str = "kafka-broadcast-stop";
+    let tb = TestBroker::start().await;
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<StopTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+    // Both records are on the topic before the subscription assigns, on one
+    // partition so they are read in this order; a `Head` start reads them
+    // without a settle window.
+    for key in ["1", "2"] {
+        tb.publish_to_partition(TOPIC, 0, &Invalidate { key: key.into() })
+            .await;
+    }
+
+    let broker = tb.broker().await;
+    let handler = GatedFirst::new(Outcome::Defer);
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<StopTopic, _>(
+        handler.clone(),
+        ConsumerOptions::new()
+            .with_broadcast_start(BroadcastStart::Head)
+            .with_prefetch_count(1),
+    )
+    .expect("failed to subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while handler.calls().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(handler.calls().await, vec!["1".to_string()]);
+    // "1" runs at the gate holding the slot; "2" is in the loop's hand
+    // behind it once the loop has entered the slot wait.
+    while permit_wait_probe::broadcast_entered() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "record 2 never reached the slot wait behind the first record"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sub.cancellation_token().cancel();
+    handler.gate.open();
+    let outcome = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    assert_eq!(
+        handler.calls().await,
+        vec!["1".to_string()],
+        "the stop handed neither the deferred record nor the one behind it to the handler"
+    );
+    broker.close().await;
+    publisher_broker.close().await;
+}
+
+/// A stop that lands in the instant the slot is acquired, after the slot
+/// wait's own poll of the token. The loop reads the stop again with the slot
+/// in hand and drops the record. No order of broker events lands a stop in
+/// that window on cue, so the probe's hook cancels the token the moment the
+/// loop has the slot. The first call runs at a gate holding the slot while
+/// the second record is read and enters the slot wait behind it; the gate
+/// opens, the first call acks and frees the slot, the loop takes it and the
+/// hook fires. The handler saw one call. Without the check with the slot in
+/// hand, the second record reaches the handler during the drain.
+#[tokio::test]
+async fn a_stop_in_the_instant_the_slot_is_acquired_drops_the_record_in_hand() {
+    use shove::kafka::permit_wait_probe;
+
+    const TOPIC: &str = "kafka-broadcast-stop";
+    let tb = TestBroker::start().await;
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<StopTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+    for key in ["1", "2"] {
+        tb.publish_to_partition(TOPIC, 0, &Invalidate { key: key.into() })
+            .await;
+    }
+
+    let broker = tb.broker().await;
+    let handler = GatedFirst::new(Outcome::Ack);
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<StopTopic, _>(
+        handler.clone(),
+        ConsumerOptions::new()
+            .with_broadcast_start(BroadcastStart::Head)
+            .with_prefetch_count(1),
+    )
+    .expect("failed to subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while handler.calls().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(handler.calls().await, vec!["1".to_string()]);
+    while permit_wait_probe::broadcast_entered() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "record 2 never reached the slot wait behind the first record"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The stop lands the moment the loop has the slot the first call frees.
+    let stop = sub.cancellation_token();
+    permit_wait_probe::on_acquired(move || stop.cancel());
+    handler.gate.open();
+    let outcome = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    assert_eq!(
+        handler.calls().await,
+        vec!["1".to_string()],
+        "the second record, in the loop's hand when the stop landed, never reached the handler"
+    );
     broker.close().await;
     publisher_broker.close().await;
 }
