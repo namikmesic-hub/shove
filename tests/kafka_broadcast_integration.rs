@@ -17,6 +17,12 @@
 //!
 //! Run with:
 //! `cargo nextest run --features kafka --test kafka_broadcast_integration`
+//!
+//! The two stop tests read the `test-support` probe
+//! `shove::kafka::permit_wait_probe` and are gated on that feature, as the
+//! in-place order tests of `kafka_integration` are:
+//! `cargo nextest run --features kafka,test-support --test kafka_broadcast_integration`
+//! runs them too.
 
 use std::collections::HashSet;
 use std::io;
@@ -70,7 +76,10 @@ define_topic!(
 );
 
 // A stop during a deferred wait; see
-// `a_stop_during_a_deferred_wait_hands_nothing_over_behind_it`.
+// `a_stop_during_a_deferred_wait_hands_nothing_over_behind_it`. The stop
+// tests, their topic and their handler read the `test-support` probe and
+// follow it behind the feature.
+#[cfg(feature = "test-support")]
 define_topic!(
     StopTopic,
     Invalidate,
@@ -263,12 +272,14 @@ impl MessageHandler<DeferTopic> for DeferOnce {
 /// A gate a handler waits at until the test opens it, so a test holds a
 /// handler in its running state for exactly as long as the scenario needs,
 /// and never for a fixed time.
+#[cfg(feature = "test-support")]
 #[derive(Default)]
 struct Gate {
     open: std::sync::atomic::AtomicBool,
     opened: tokio::sync::Notify,
 }
 
+#[cfg(feature = "test-support")]
 impl Gate {
     fn open(&self) {
         self.open.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -292,6 +303,7 @@ impl Gate {
 
 /// Records the key of every call. The first call waits at the gate and then
 /// returns `first`; every later one acks.
+#[cfg(feature = "test-support")]
 #[derive(Clone)]
 struct GatedFirst {
     calls: Arc<Mutex<Vec<String>>>,
@@ -299,6 +311,7 @@ struct GatedFirst {
     first: Outcome,
 }
 
+#[cfg(feature = "test-support")]
 impl GatedFirst {
     fn new(first: Outcome) -> Self {
         Self {
@@ -313,6 +326,7 @@ impl GatedFirst {
     }
 }
 
+#[cfg(feature = "test-support")]
 impl MessageHandler<StopTopic> for GatedFirst {
     type Context = ();
     async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
@@ -1545,6 +1559,7 @@ async fn defer_redelivers_in_place_before_later_records() {
 /// The gate keeps the stop off the one-second delay's clock. At `7d392b6`
 /// the slot wait was a bare `acquire_owned().await`, so the second record
 /// reached the handler after the stop.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
     use shove::kafka::permit_wait_probe;
@@ -1615,6 +1630,7 @@ async fn a_stop_during_a_deferred_wait_hands_nothing_over_behind_it() {
 /// opens, the first call acks and frees the slot, the loop takes it and the
 /// hook fires. The handler saw one call. Without the check with the slot in
 /// hand, the second record reaches the handler during the drain.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_stop_in_the_instant_the_slot_is_acquired_drops_the_record_in_hand() {
     use shove::kafka::permit_wait_probe;
