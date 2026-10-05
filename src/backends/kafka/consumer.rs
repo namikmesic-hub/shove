@@ -77,7 +77,7 @@ use super::constants::{
     MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
     PENDING_COMMIT_BUDGET, RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS, SHUTDOWN_COMMIT_DEADLINE,
 };
-use super::consumer_group::{CommitPolicy, KafkaAutoOffsetReset, validate_commit_policy};
+use super::consumer_group::{CommitPolicy, KafkaAutoOffsetReset};
 use super::offset_reset::target_from_timestamp_lookup;
 
 // ---------------------------------------------------------------------------
@@ -3278,6 +3278,38 @@ pub(super) fn reject_fifo_commit_policy(queue: &str) -> ShoveError {
 /// `KafkaConsumerGroupRegistry::register` before a member is spawned.
 /// `prefetch_count` is the effective count, after the clamp concurrent
 /// processing off applies.
+/// The commit interval a consumer runs with, checked where the loop reads
+/// it. Both `with_commit_interval` setters refuse these values already, with
+/// a panic at configuration time, but `ConsumerOptions::kafka_commit_interval`
+/// is a public field, and a value written past the setter reaches the loop.
+/// A run path does not panic, so the loop refuses it with a `Topology`
+/// error instead. Zero would make every commit due at once, and an interval
+/// past `MAX_COMMIT_INTERVAL` is refused for the reasons on that constant.
+pub(super) fn check_commit_policy(policy: CommitPolicy, queue: &str) -> Result<()> {
+    let interval = match policy {
+        CommitPolicy::Interval(interval) => interval,
+        _ => return Ok(()),
+    };
+    let max = super::constants::MAX_COMMIT_INTERVAL;
+    if interval.is_zero() {
+        return Err(ShoveError::Topology(format!(
+            "topic '{queue}': `kafka_commit_interval` must be positive, and this consumer has \
+             {interval:?} written to the field. A zero interval would make every commit due at \
+             once. `KafkaConsumer::run` refuses it. Set `with_commit_interval` to a positive \
+             interval of at most {max:?}, or leave the field unset for the 500 ms default."
+        )));
+    }
+    if interval > max {
+        return Err(ShoveError::Topology(format!(
+            "topic '{queue}': `kafka_commit_interval` must be at most {max:?}, and this consumer \
+             has {interval:?} written to the field. The commit gate could not turn it into a \
+             deadline. `KafkaConsumer::run` refuses it. Set `with_commit_interval` to a positive \
+             interval of at most {max:?}, or leave the field unset for the 500 ms default."
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn check_per_record_prefetch(
     prefetch_count: u16,
     queue: &str,
@@ -5110,13 +5142,16 @@ impl KafkaConsumer {
         // where a deadline the `Instant` cannot represent reads as due now
         // while `due()` still says no, so the wake arm would fire on every
         // pass with commit work pending. This is the one place the receive
-        // loop reads the policy, so it is the one place to refuse it, and
-        // the one place every path passes through for the constraint a
-        // per-record policy carries; see `check_per_record_prefetch`.
+        // loop reads the policy, so it is the one place to refuse it, with
+        // a `Topology` error and never a panic, because this is a run path
+        // and the setters have refused the same values at configuration
+        // time already. It is also the one place every path passes through
+        // for the constraint a per-record policy carries; see
+        // `check_per_record_prefetch`.
         let commit_policy = options
             .kafka_commit_policy
             .unwrap_or(CommitPolicy::Interval(ASYNC_COMMIT_INTERVAL));
-        validate_commit_policy(commit_policy);
+        check_commit_policy(commit_policy, queue)?;
         let per_record = matches!(commit_policy, CommitPolicy::PerRecord);
         if per_record {
             check_per_record_prefetch(options.prefetch_count, queue, "KafkaConsumer::run")?;
@@ -12130,6 +12165,7 @@ mod final_commit_thread_tests {
 
 #[cfg(test)]
 mod commit_interval_funnel_tests {
+    use super::super::constants::MAX_COMMIT_INTERVAL;
     use super::*;
     use crate::topology::TopologyBuilder;
 
@@ -12161,42 +12197,62 @@ mod commit_interval_funnel_tests {
     /// the run never gets that far, and without it the receive loop returns
     /// from its first `select!` instead of reconnecting against the
     /// unreachable broker on port 1.
-    async fn run_with_field_interval(interval: Duration) {
-        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
-            .await
-            .expect("client construction is lazy");
-        let shutdown = CancellationToken::new();
-        shutdown.cancel();
-        let mut opts = crate::ConsumerOptions::<Kafka>::new().with_shutdown(shutdown);
+    async fn run_with_field_interval(interval: Duration) -> Result<()> {
+        let mut opts = crate::ConsumerOptions::<Kafka>::new();
         opts.kafka_commit_interval = Some(interval);
-        let _ = KafkaConsumer::new(client)
-            .run::<Plain, _>(NoopHandler, (), opts)
-            .await;
+        run_cancelled(opts).await
     }
 
-    /// Zero would make the gate always due; the setter refuses it, and so
-    /// must the one place the receive loop reads the field.
+    /// The `Topology` error the loop refuses a field-written interval with,
+    /// naming the topic, the field and the entry point.
+    fn refused_interval(result: Result<()>) -> String {
+        let err = result.expect_err("an interval the setter refuses must be refused by the loop");
+        let ShoveError::Topology(msg) = err else {
+            panic!("expected ShoveError::Topology, got {err:?}");
+        };
+        assert!(
+            msg.contains("commit-interval-funnel")
+                && msg.contains("kafka_commit_interval")
+                && msg.contains("KafkaConsumer::run"),
+            "message must name the topic, the field and the entry point: {msg}"
+        );
+        msg
+    }
+
+    /// Zero would make the gate always due. The setter refuses it with a
+    /// panic at configuration time, and the one place the receive loop
+    /// reads the field refuses it with a `Topology` error, never a panic:
+    /// an interval written straight into the public field skips the setter
+    /// and reaches a run path.
     #[tokio::test]
-    #[should_panic(expected = "commit_interval must be positive")]
     async fn run_rejects_a_zero_interval_written_to_the_field() {
-        run_with_field_interval(Duration::ZERO).await;
+        let msg = refused_interval(run_with_field_interval(Duration::ZERO).await);
+        assert!(msg.contains("must be positive"), "{msg}");
     }
 
     /// `Duration::MAX` makes `deadline` overflow to `now` while `due` stays
     /// false, so the wake arm would fire on every pass with commit work
     /// pending: the hot spin the gate's own doc warns about. Refused before
-    /// the gate is built.
+    /// the gate is built, with the same error, as is anything past
+    /// `MAX_COMMIT_INTERVAL`.
     #[tokio::test]
-    #[should_panic(expected = "commit_interval must be at most")]
     async fn run_rejects_an_unrepresentable_interval_written_to_the_field() {
-        run_with_field_interval(Duration::MAX).await;
+        let msg = refused_interval(run_with_field_interval(Duration::MAX).await);
+        assert!(msg.contains("must be at most"), "{msg}");
+        let over = MAX_COMMIT_INTERVAL.saturating_add(Duration::from_secs(1));
+        refused_interval(run_with_field_interval(over).await);
     }
 
     /// Control: an interval the setter admits passes the funnel's check too,
-    /// so the funnel refuses exactly what the setter refuses.
+    /// the bound itself included, so the funnel refuses exactly what the
+    /// setter refuses.
     #[tokio::test]
     async fn run_admits_a_bounded_interval_written_to_the_field() {
-        run_with_field_interval(Duration::from_secs(5)).await;
+        for interval in [Duration::from_secs(5), MAX_COMMIT_INTERVAL] {
+            run_with_field_interval(interval)
+                .await
+                .expect("an interval the setter admits passes the check");
+        }
     }
 
     /// Runs the direct path with `opts`, its shutdown token cancelled first
