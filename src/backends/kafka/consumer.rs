@@ -1376,7 +1376,14 @@ where
 #[cfg(feature = "kafka-schema-registry")]
 #[derive(Default)]
 struct RegistryStall {
+    /// Whether this stall paused the assignment itself, and so must resume
+    /// it in `end`.
     paused: bool,
+    /// Whether the loop holds a pause of its own over the stalled record,
+    /// as the concurrent loop does under `CommitPolicy::PerRecord`. The
+    /// stall then pauses nothing in `wait` and resumes nothing in `end`;
+    /// see `inside_pause`.
+    loop_holds_pause: bool,
     /// Whether the consumer never joins a group, as the broadcast
     /// subscription does not. Its inert group id still provokes a
     /// `GroupAuthorizationFailed` on every coordinator lookup under a
@@ -1391,7 +1398,26 @@ impl RegistryStall {
     fn groupless() -> Self {
         Self {
             paused: false,
+            loop_holds_pause: false,
             groupless: true,
+        }
+    }
+
+    /// A stall in the concurrent receive loop, which may already hold a
+    /// pause of its own: under `CommitPolicy::PerRecord` the assignment is
+    /// paused the moment a record is taken, before its decode. A stall
+    /// that starts inside that pause pauses nothing in `wait` and resumes
+    /// nothing in `end`; the commit of the record resumes the assignment,
+    /// see the resume at the top of the loop's pass. A stall that resumed
+    /// on its own there handed librdkafka a fetch for the next record while
+    /// the loop's `paused` still held, and the receive arm put that record
+    /// back and paused again: a fetch, a seek and a put-back per stall, and
+    /// a pause state the broker and the loop no longer agreed on.
+    fn inside_pause(loop_holds_pause: bool) -> Self {
+        Self {
+            paused: false,
+            loop_holds_pause,
+            groupless: false,
         }
     }
 
@@ -1419,7 +1445,7 @@ impl RegistryStall {
         id: SchemaId,
         error: &SchemaRegistryError,
     ) -> Result<bool> {
-        if !self.paused {
+        if !self.paused && !self.loop_holds_pause {
             consumer
                 .pause_assignment()
                 .map_err(|e| map_kafka_error("pause failed", e))?;
@@ -5900,8 +5926,11 @@ impl KafkaConsumer {
                                     Some(fmt) => {
                                         // An unavailable registry stalls this
                                         // record instead of discarding it; see
-                                        // `RegistryStall`.
-                                        let mut stall = RegistryStall::default();
+                                        // `RegistryStall`. Under `PerRecord`
+                                        // the take above paused the assignment
+                                        // already, and the stall leaves that
+                                        // pause, and its resume, to the commit.
+                                        let mut stall = RegistryStall::inside_pause(paused);
                                         let staged = loop {
                                             let Some(result) = decode_or_shutdown(
                                                 registry_decode::<T::Message, T::Codec>(

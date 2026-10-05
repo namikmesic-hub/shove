@@ -40,9 +40,11 @@ use shove::ShoveError;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::handler::{BatchMessageHandler, MessageHandler};
+#[cfg(feature = "test-support")]
+use shove::kafka::put_back_probe;
 use shove::kafka::{
-    BatchConsumerOptions, KafkaAutoOffsetReset, KafkaClient, KafkaConfig, KafkaConsumer,
-    KafkaLagStatsProvider, KafkaQueueStats, KafkaQueueStatsProvider,
+    BatchConsumerOptions, CommitPolicy, KafkaAutoOffsetReset, KafkaClient, KafkaConfig,
+    KafkaConsumer, KafkaLagStatsProvider, KafkaQueueStats, KafkaQueueStatsProvider,
 };
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -594,6 +596,16 @@ shove::define_topic!(
     Event,
     TopologyBuilder::new("kafka-sr-outage-assign").dlq().build()
 );
+// A per-record consumer's registry stall runs inside the pause the take
+// already holds; see `a_per_record_stall_leaves_the_resume_to_the_commit`.
+#[cfg(feature = "test-support")]
+shove::define_topic!(
+    PerRecordStallTopic,
+    Event,
+    TopologyBuilder::new("kafka-sr-outage-per-record-stall")
+        .dlq()
+        .build()
+);
 shove::define_topic!(
     BatchRewindPutBackTopic,
     Event,
@@ -759,20 +771,27 @@ impl GatedRecorder {
 }
 
 #[cfg(feature = "test-support")]
-impl MessageHandler<FreezeTopic> for GatedRecorder {
-    type Context = ();
-    async fn handle(&self, msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
-        self.seen.lock().unwrap().push(msg.id);
-        self.counter.increment();
-        loop {
-            let notified = self.gate.notified();
-            if self.released.load(Ordering::SeqCst) {
-                return Outcome::Ack;
+macro_rules! gated_recorder_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for GatedRecorder {
+            type Context = ();
+            async fn handle(&self, msg: Event, _meta: MessageMetadata, _: &()) -> Outcome {
+                self.seen.lock().unwrap().push(msg.id);
+                self.counter.increment();
+                loop {
+                    let notified = self.gate.notified();
+                    if self.released.load(Ordering::SeqCst) {
+                        return Outcome::Ack;
+                    }
+                    notified.await;
+                }
             }
-            notified.await;
         }
-    }
+    )+};
 }
+
+#[cfg(feature = "test-support")]
+gated_recorder_for!(FreezeTopic, PerRecordStallTopic);
 
 /// Records what the DLQ drain hands to `handle_dead`.
 #[derive(Clone)]
@@ -1001,6 +1020,104 @@ async fn an_unavailable_registry_stalls_the_record_and_resumes() {
         0,
         "an outage is not a validation failure"
     );
+}
+
+/// Under `CommitPolicy::PerRecord` the assignment is paused the moment a
+/// record is taken, before its decode, so a registry stall starts inside
+/// that pause. The stall must leave the resume to the commit of the record,
+/// see the resume at the top of the receive loop's pass: a stall that
+/// resumed on its own when the registry answered handed librdkafka a fetch
+/// for the next record while the loop still held its pause, and the
+/// receive arm put that record back and paused again. Every record behind
+/// a stall then paid a fetch, a seek and a put-back, and librdkafka's state
+/// disagreed with the loop's `paused`.
+///
+/// Two records, the first one stalled. Once the registry answers, the
+/// handler holds the first record for two seconds while the loop keeps
+/// polling: with the pause intact nothing is fetched, so the receive arm's
+/// put-back counter does not move, and the second record arrives once the
+/// first is committed. Red before the fix: the counter read 1 after the
+/// hold, the second record fetched behind the stall's resume and put back.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_per_record_stall_leaves_the_resume_to_the_commit() {
+    const TOPIC: &str = "kafka-sr-outage-per-record-stall";
+    const GROUP: &str = "kafka-sr-outage-per-record-stall-consumer";
+    /// Many fetch round trips to a local broker.
+    const HOLD: Duration = Duration::from_secs(2);
+
+    let tb = TestBroker::start().await;
+    create_single_partition_topic(&tb.brokers, TOPIC).await;
+    let (registry, status, hits) =
+        mock_registry("kafka-sr-outage-per-record-stall-value", 503).await;
+    let client = tb.client().await;
+    for id in [1u32, 2] {
+        let body = serde_json::to_vec(&Event { id }).unwrap();
+        let schema = if id == 1 { FLAKY_ID } else { HEALTHY_ID };
+        publish_raw(&tb.brokers, TOPIC, &frame_json(schema, &body)).await;
+    }
+
+    let put_back_before = put_back_probe::paused_receive();
+    let handler = GatedRecorder::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<PerRecordStallTopic, _>(
+                h,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_prefetch_count(1)
+                    .with_concurrent_processing(true)
+                    .with_commit_policy(CommitPolicy::PerRecord)
+                    .with_schema_registry(registry)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // At least one wait has passed on the stalled record.
+    wait_for_hits_above(&hits, 1, TIMEOUT).await;
+    assert!(
+        handler.seen.lock().unwrap().is_empty(),
+        "nothing may reach the handler during the stall"
+    );
+
+    status.store(200, Ordering::SeqCst);
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "the stalled record reaches the handler once the registry answers"
+    );
+    // The handler holds the record, and the loop polls through the hold
+    // with its pause intact, so no fetch brings the second record early.
+    tokio::time::sleep(HOLD).await;
+    assert_eq!(
+        put_back_probe::paused_receive(),
+        put_back_before,
+        "no record was fetched and put back behind the stall"
+    );
+    assert_eq!(handler.seen.lock().unwrap().clone(), vec![1]);
+
+    handler.release();
+    assert!(
+        handler.counter.wait_for(2, TIMEOUT).await,
+        "the second record arrives once the first is committed"
+    );
+    assert_eq!(handler.seen.lock().unwrap().clone(), vec![1, 2]);
+    wait_for_lag(&client, TOPIC, GROUP, 0, TIMEOUT).await;
+    assert_eq!(
+        put_back_probe::paused_receive(),
+        put_back_before,
+        "the second record was taken on the resume the commit made, not put back"
+    );
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task panicked")
+        .expect("consumer ended cleanly");
 }
 
 /// On the batch path the records ahead of the stalled one are flushed and
