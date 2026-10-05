@@ -1953,16 +1953,14 @@ impl Drop for InPlaceWait<'_> {
         // Underflow-checking: every count has exactly one uncount, so a zero
         // here is a broken invariant. It is reported, not wrapped round to
         // `usize::MAX`, which would read as waiting handlers for good and
-        // pause the assignment.
+        // pause the assignment. Reported only: this runs on every in-place
+        // exit path, and a runtime path never panics, in a debug build too.
         if self
             .0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_err()
         {
             tracing::error!("in-place waiter count underflow: a wait ended that was never counted");
-            if cfg!(debug_assertions) && !std::thread::panicking() {
-                panic!("in-place waiter count underflow");
-            }
         }
     }
 }
@@ -9677,6 +9675,40 @@ mod in_place_wait_accounting_tests {
         );
         assert_eq!(waiters.load(Ordering::SeqCst), 0);
         assert!(!shutdown.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod in_place_wait_guard_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// A guard counts one waiter for as long as it lives, and the drop
+    /// uncounts it. A drop that finds nothing to uncount is a broken
+    /// invariant: it is reported and the count stays at zero, neither
+    /// wrapped round to `usize::MAX`, which would pause the assignment for
+    /// good, nor turned into a panic, which a drop on a runtime path never
+    /// raises, in a debug build included.
+    #[test]
+    fn a_drop_without_a_count_is_reported_and_leaves_the_count_at_zero() {
+        let waiters = AtomicUsize::new(0);
+        {
+            let _waiting = InPlaceWait::begin(&waiters);
+            assert_eq!(waiters.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            0,
+            "the drop uncounts the wait"
+        );
+
+        drop(InPlaceWait(&waiters));
+        assert_eq!(
+            waiters.load(Ordering::SeqCst),
+            0,
+            "an uncount with nothing to uncount leaves zero in place"
+        );
     }
 }
 
