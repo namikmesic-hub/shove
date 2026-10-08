@@ -27,7 +27,7 @@ Every production backend issues a real round-trip. There are no local-state shor
 
 | Backend   | RPC                                                | Side effects             |
 |-----------|----------------------------------------------------|--------------------------|
-| Kafka     | `fetch_metadata(None, timeout)` on producer client | none                     |
+| Kafka     | `fetch_metadata(None, timeout)` on a metadata consumer the first probe builds and later probes reuse | none (the first probe opens that consumer's connection) |
 | Redis     | `PING` on the multiplexed connection               | none                     |
 | NATS      | subscribe + unsubscribe-after(1) + flush + publish + await echo on a unique inbox | none |
 | RabbitMQ  | transient channel open + close                     | none                     |
