@@ -1,17 +1,13 @@
 //! A client that only consumes builds no producer, proved against
 //! librdkafka's mock cluster (`rdkafka::mocking`), which needs no Docker.
 //!
-//! shove's producer is idempotent, and librdkafka requests its producer id
-//! 500 ms after such a producer is created, with an `InitProducerId`
-//! request the broker authorizes as `IdempotentWrite` on the cluster or
-//! `Write` on a topic, neither of which a consumer holds. The tests count
-//! the requests the mock broker receives, as `kafka_commit_policy_mock.rs`
-//! does, through `rdkafka::bindings`, because `rdkafka::mocking` wraps no
-//! request tracking, and they hold every zero assertion past that timer.
-//! The topic is bound with `external()` and created through the mock API,
-//! as infra would, and the record is produced through a raw rdkafka
-//! producer with idempotence off, which sends no `InitProducerId` of its
-//! own.
+//! librdkafka sends `InitProducerId` 500 ms after it creates an idempotent
+//! producer, so every zero assertion waits past that timer. The tests count
+//! the requests the mock broker receives by API key through
+//! `rdkafka::bindings`, as `kafka_commit_policy_mock.rs` does, because
+//! `rdkafka::mocking` wraps no request tracking. The topic is bound with
+//! `external()` and created through the mock API, and the record is produced
+//! by a raw rdkafka producer with idempotence off.
 
 #![cfg(feature = "kafka")]
 
@@ -44,11 +40,7 @@ use tokio_util::sync::CancellationToken;
 const TOPIC: &str = "kafka-consume-only-mock";
 /// A record reaches the handler on a mock cluster in well under this.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
-/// librdkafka arms a 500 ms timer when it creates an idempotent producer
-/// and sends `InitProducerId` when it fires, so a zero count taken earlier
-/// proves nothing. Every zero assertion waits this long after the last
-/// action that could have built a producer, which leaves the timer room on
-/// a slow machine.
+/// Past librdkafka's 500 ms producer-id timer, with room for a slow machine.
 const PRODUCER_ID_TIMER_MARGIN: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,14 +77,9 @@ impl MessageHandler<OrdersTopic> for Acking {
     }
 }
 
-/// One mock broker with the topic created, as infra would create it, and
-/// the request tracking `rdkafka::mocking` does not wrap, which counts the
-/// requests the broker received by API key.
-///
-/// The cluster is the one a producer configured with
-/// `test.mock.num.brokers` owns, so its raw handle is reachable through
-/// `rd_kafka_handle_mock_cluster` beside the safe wrapper the same client
-/// hands out. The producer produces nothing; it lives for the cluster.
+/// One mock broker with the topic created. The raw cluster handle comes from
+/// the producer that owns the cluster, beside the safe wrapper the same
+/// client hands out; the producer produces nothing.
 struct Mock {
     owner: BaseProducer,
     cluster: *mut RDKafkaMockCluster,
@@ -187,11 +174,10 @@ async fn produce(bootstrap: &str, id: &str) {
 }
 
 /// A client that connects, consumes a record and answers a health check
-/// sends no `InitProducerId`, held past the producer-id timer from the
-/// probe, the last action that could have built one: it has no producer. The probe's metadata request is the control that the tracking
-/// sees this client's requests. Its first publish then builds the producer,
-/// and the broker sees at least one `InitProducerId`, which is the control
-/// that the tracking counts that request at all.
+/// sends no `InitProducerId`, so it has no producer. The probe's metadata
+/// request is the control that the tracking sees this client, and the first
+/// publish, which builds the producer, is the control that it counts
+/// `InitProducerId` at all.
 #[tokio::test]
 async fn a_client_that_only_consumes_sends_no_init_producer_id() {
     let mock = Mock::start();
@@ -261,10 +247,8 @@ async fn a_client_that_only_consumes_sends_no_init_producer_id() {
     broker.close().await;
 }
 
-/// A client closed before any publish has no producer to flush: `shutdown`
-/// takes its empty arm, a publish after the close is refused instead of
-/// building one, and the broker sees no `InitProducerId` past the
-/// producer-id timer from that refused publish.
+/// A client closed before any publish has no producer to flush, and a
+/// publish after the close is refused instead of building one.
 #[tokio::test]
 async fn a_client_closed_before_any_publish_builds_no_producer() {
     let mock = Mock::start();
